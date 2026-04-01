@@ -144,7 +144,11 @@ func (w *channelWatcher) run() {
 			if !ok {
 				return
 			}
+			// Try the exact event path first (file-level watch), then the parent
+			// directory (directory-level watch — callers register the channel dir
+			// and fsnotify fires events with the path of the changed file within it).
 			w.fanOut(event.Name)
+			w.fanOut(filepath.Dir(event.Name))
 		case err, ok := <-w.fw.Errors():
 			if !ok {
 				return
@@ -186,18 +190,21 @@ func (w *channelWatcher) startPolling(path string) {
 }
 
 // poll watches path by statting every 100ms, used when fsnotify.Add fails.
-// It signals on either a ModTime change (normal case) or a Size change (catches
-// multiple writes within the same second on filesystems with 1s mtime resolution,
-// such as ext3 or some network shares).
+// path may be a channel directory (segment model) or a flat file.
+// For a directory, the active (last) segment's mtime/size is checked.
 func (w *channelWatcher) poll(path string) {
 	defer w.wg.Done()
 
-	// Take an initial stat so we only fire on changes that happen after Watch.
+	// Snapshot initial state to avoid a spurious notification on first tick.
+	initSegs, _ := listSegments(path)
+	var lastSegCount = len(initSegs)
 	var lastMod time.Time
 	var lastSize int64
-	if info, err := os.Stat(path); err == nil {
-		lastMod = info.ModTime()
-		lastSize = info.Size()
+	if len(initSegs) > 0 {
+		if info, err := os.Stat(initSegs[len(initSegs)-1].path); err == nil {
+			lastMod = info.ModTime()
+			lastSize = info.Size()
+		}
 	}
 
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -205,14 +212,26 @@ func (w *channelWatcher) poll(path string) {
 	for {
 		select {
 		case <-ticker.C:
-			info, err := os.Stat(path)
+			segs, err := listSegments(path)
 			if err != nil {
 				continue
 			}
-			mod, size := info.ModTime(), info.Size()
-			if mod != lastMod || size != lastSize {
-				lastMod = mod
-				lastSize = size
+			changed := len(segs) != lastSegCount
+			if !changed && len(segs) > 0 {
+				info, err := os.Stat(segs[len(segs)-1].path)
+				if err == nil {
+					mod, size := info.ModTime(), info.Size()
+					changed = mod != lastMod || size != lastSize
+				}
+			}
+			if changed {
+				lastSegCount = len(segs)
+				if len(segs) > 0 {
+					if info, err := os.Stat(segs[len(segs)-1].path); err == nil {
+						lastMod = info.ModTime()
+						lastSize = info.Size()
+					}
+				}
 				w.fanOut(path)
 			}
 		case <-w.stopCh:

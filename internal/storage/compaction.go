@@ -2,23 +2,15 @@ package storage
 
 import (
 	"fmt"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sync"
 )
 
-// pauseableWriter is satisfied by *channelWriter. It allows the compactor to
-// atomically rename the channel file and reopen the writer's file descriptor
-// without any writes occurring during the swap.
-type pauseableWriter interface {
-	PauseAndSwap(fn func() error) error
-}
-
-// Compactor tracks registered subscribers for a single channel and performs
-// file compaction once all subscribers have consumed past a configurable
-// threshold. It is not safe to share across channels.
+// Compactor tracks registered subscribers for a single channel and deletes
+// fully-consumed sealed segment files. Unlike the old copy-based approach,
+// compaction is a simple O(1)-per-segment file deletion with no writer pause.
 type Compactor struct {
 	mu          sync.Mutex
 	offsetDir   string
@@ -42,8 +34,7 @@ func NewCompactor(offsetDir string, maxLagBytes int64, log logger) *Compactor {
 	}
 }
 
-// RegisterSubscriber marks id as a subscriber whose offset must be considered
-// when computing the safe compaction boundary.
+// RegisterSubscriber marks id as a subscriber whose offset constrains deletion.
 func (c *Compactor) RegisterSubscriber(id string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -64,8 +55,7 @@ func (c *Compactor) DeregisterSubscriber(id string) error {
 }
 
 // MinOffset returns the smallest persisted offset across all registered
-// subscribers. Returns 0 if no subscribers are registered (conservative: do
-// not compact without a known consumer boundary).
+// subscribers. Returns 0 if no subscribers are registered.
 func (c *Compactor) MinOffset() (int64, error) {
 	c.mu.Lock()
 	ids := make([]string, 0, len(c.subscribers))
@@ -91,25 +81,24 @@ func (c *Compactor) MinOffset() (int64, error) {
 	return min, nil
 }
 
-// MaybeCompact compacts channelPath if the minimum subscriber offset exceeds
-// threshold. When compaction is triggered the writer pw is paused for the
-// duration of the file swap (copy → fsync → rename) and all subscriber offsets
-// are adjusted by subtracting the removed prefix. Returns nil without
-// modification when compaction is not needed.
+// MaybeCompact deletes any sealed segment files in channelDir whose contents
+// have been fully consumed by all registered subscribers. The active (newest)
+// segment is never deleted. No writer pause is needed — the writer only ever
+// appends to the active segment, and Unix allows open-fd reads of deleted files
+// to complete normally.
 //
-// Lag warnings are emitted for any subscriber whose unconsumed byte count
-// exceeds the maxLagBytes configured at construction.
-func (c *Compactor) MaybeCompact(channelPath string, threshold int64, pw pauseableWriter) error {
-	info, err := os.Stat(channelPath)
+// Lag warnings are logged for any subscriber whose unconsumed bytes exceed
+// maxLagBytes (if configured).
+func (c *Compactor) MaybeCompact(channelDir string) error {
+	segs, err := listSegments(channelDir)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("stat channel file: %w", err)
+		return fmt.Errorf("list segments: %w", err)
 	}
-	fileSize := info.Size()
+	if len(segs) == 0 {
+		return nil
+	}
 
-	// Snapshot subscriber set and read all offsets.
+	// Read subscriber offsets once.
 	c.mu.Lock()
 	ids := make([]string, 0, len(c.subscribers))
 	for id := range c.subscribers {
@@ -134,75 +123,37 @@ func (c *Compactor) MaybeCompact(channelPath string, threshold int64, pw pauseab
 		}
 	}
 
-	// Emit lag warnings before deciding whether to compact.
+	// Lag warnings: compute total stream size from last segment's end.
 	if c.maxLagBytes > 0 {
+		active := segs[len(segs)-1]
+		streamEnd := active.startOffset + active.size
 		for id, off := range offsets {
-			if lag := fileSize - off; lag > c.maxLagBytes {
+			if lag := streamEnd - off; lag > c.maxLagBytes {
 				c.log.Warn("subscriber is lagging behind channel file",
 					"subscriber", id, "lag_bytes", lag, "max_lag_bytes", c.maxLagBytes)
 			}
 		}
 	}
 
-	if minOffset <= threshold {
-		return nil // not enough consumed data to warrant compaction
+	// Nothing to delete if there is only the active segment.
+	if len(segs) <= 1 {
+		return nil
 	}
 
-	// Pause the writer, copy minOffset..EOF to a temp file, rename it over
-	// the channel file, then update all subscriber offsets. All of this
-	// happens inside the pause window so no writes occur during the swap.
-	err = pw.PauseAndSwap(func() error {
-		src, err := os.Open(channelPath)
-		if err != nil {
-			return fmt.Errorf("open channel file for compaction: %w", err)
-		}
-		defer src.Close()
-
-		if _, err := src.Seek(minOffset, io.SeekStart); err != nil {
-			return fmt.Errorf("seek to min offset during compaction: %w", err)
-		}
-
-		tmp, err := os.CreateTemp(filepath.Dir(channelPath), ".compact-*")
-		if err != nil {
-			return fmt.Errorf("create temp file for compaction: %w", err)
-		}
-		tmpName := tmp.Name()
-
-		if _, err := io.Copy(tmp, src); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return fmt.Errorf("copy channel data during compaction: %w", err)
-		}
-		if err := tmp.Sync(); err != nil {
-			tmp.Close()
-			os.Remove(tmpName)
-			return fmt.Errorf("fsync temp file during compaction: %w", err)
-		}
-		tmp.Close()
-
-		if err := os.Rename(tmpName, channelPath); err != nil {
-			os.Remove(tmpName)
-			return fmt.Errorf("rename compacted file: %w", err)
-		}
-
-		// Adjust all subscriber offsets by the amount removed.
-		for id, off := range offsets {
-			newOff := off - minOffset
-			if err := WriteOffset(filepath.Join(c.offsetDir, id+".offset"), newOff); err != nil {
-				// Log but continue — worst case is duplicate delivery on restart,
-				// which is acceptable under at-least-once semantics.
-				c.log.Error("adjust subscriber offset after compaction",
-					"subscriber", id, "err", err)
+	// Delete any sealed segment (not the last) whose entire content lies
+	// before minOffset. A segment is fully consumed when the next segment's
+	// start offset is <= minOffset.
+	for i := 0; i < len(segs)-1; i++ {
+		nextStart := segs[i+1].startOffset
+		if nextStart <= minOffset {
+			if err := os.Remove(segs[i].path); err != nil {
+				c.log.Error("delete segment", "path", segs[i].path, "err", err)
+			} else {
+				c.log.Warn("deleted consumed segment",
+					"path", segs[i].path, "bytes_freed", segs[i].size)
 			}
 		}
-
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("compaction failed: %w", err)
 	}
 
-	c.log.Warn("channel file compacted",
-		"path", channelPath, "bytes_removed", minOffset, "bytes_remaining", fileSize-minOffset)
 	return nil
 }

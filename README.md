@@ -5,7 +5,7 @@ Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is 
 ## Key Features
 
 - **At-Least-Once Delivery**: Messages are only committed (offset advanced) after successful handler execution.
-- **Durable Storage**: Every channel is an append-only file. Atomic writes ensure no record interleaving.
+- **Durable Storage**: Every channel is a directory of fixed-size segment files. Atomic appends ensure no record interleaving. Old segments are deleted once all subscribers have consumed them.
 - **Persistent Offset Tracking**: Subscribers resume exactly where they left off, even after a crash or restart.
 - **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
 - **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
@@ -72,20 +72,22 @@ func main() {
 Keyop Messenger follows a **Hub-and-Spoke** model:
 - **Clients**: Connect to a local Hub to publish or subscribe to channels.
 - **Hubs**: Manage local `.jsonl` files and coordinate with peer Hubs.
-- **Channels**: Each channel is a single file on disk. 
-- **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position.
+- **Channels**: Each channel is a directory of append-only `.jsonl` segment files. Once all subscribers consume a segment it is deleted — no copying, no writer pauses.
+- **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position across all segments.
 
 ## Project Status
 
-Keyop Messenger is currently in **Phase 5** of its development plan:
+Keyop Messenger is currently in **Phase 8** of its development plan:
 - [x] Phase 1: Module Scaffold & Configuration
 - [x] Phase 2: Message Envelope & Payload Registry
-- [x] Phase 3: Durable Writer Goroutine (Atomic Append)
+- [x] Phase 3: Durable Writer Goroutine (Atomic Append, Segment Rolling)
 - [x] Phase 4: Offset Tracking & File Watcher
 - [x] Phase 5: Subscriber Engine & Dead-Letter Queues
-- [ ] Phase 6: Storage Compaction (Next)
-- [ ] Phase 7-11: Security, Dedup, and Wire Protocol
-- [ ] Phase 12-15: Federation, CLI, and Integration
+- [x] Phase 6: Storage Compaction (Segment Deletion)
+- [x] Phase 7: Deduplication (LRU Seen-ID Set)
+- [ ] Phase 8: Audit Log (Next)
+- [ ] Phase 9-11: TLS Utilities, Wire Protocol, Policy Engine
+- [ ] Phase 12-15: Federation, Root API, CLI, and Integration
 
 See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 

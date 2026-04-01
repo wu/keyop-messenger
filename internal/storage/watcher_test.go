@@ -48,17 +48,19 @@ func receiveWithin(t *testing.T, ch <-chan struct{}, d time.Duration) bool {
 
 func TestWatcher_Integration(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "orders.jsonl")
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	channelDir := filepath.Join(dir, "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(segPath, nil, 0o644))
 
 	w, err := NewChannelWatcher(nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	ch, err := w.Watch(path)
+	ch, err := w.Watch(channelDir)
 	require.NoError(t, err)
 
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	_, err = f.WriteString(`{"v":1}` + "\n")
 	require.NoError(t, err)
@@ -70,18 +72,20 @@ func TestWatcher_Integration(t *testing.T) {
 
 func TestWatcher_Coalescing(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "orders.jsonl")
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	channelDir := filepath.Join(dir, "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(segPath, nil, 0o644))
 
 	w, err := NewChannelWatcher(nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = w.Close() })
 
-	ch, err := w.Watch(path)
+	ch, err := w.Watch(channelDir)
 	require.NoError(t, err)
 
 	// Write 100 times rapidly.
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	for i := 0; i < 100; i++ {
 		_, _ = f.WriteString("{}\n")
@@ -106,8 +110,10 @@ done:
 
 func TestWatcher_PollingFallback(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "orders.jsonl")
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	channelDir := filepath.Join(dir, "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(segPath, nil, 0o644))
 
 	// Inject a backend whose Add always fails — triggers polling fallback.
 	fake := newFakeFsnotify()
@@ -115,13 +121,13 @@ func TestWatcher_PollingFallback(t *testing.T) {
 	w := newChannelWatcherFromBackend(fake, nil)
 	t.Cleanup(func() { _ = w.Close() })
 
-	ch, err := w.Watch(path)
+	ch, err := w.Watch(channelDir)
 	require.NoError(t, err)
 
 	// Give the polling goroutine time to take its initial stat (sets lastMod),
 	// then modify the file so the next tick sees an mtime change.
 	time.Sleep(20 * time.Millisecond)
-	require.NoError(t, os.WriteFile(path, []byte("hello\n"), 0o644))
+	require.NoError(t, os.WriteFile(segPath, []byte("hello\n"), 0o644))
 
 	assert.True(t, receiveWithin(t, ch, 500*time.Millisecond),
 		"polling fallback must emit notification on file change")
@@ -129,8 +135,10 @@ func TestWatcher_PollingFallback(t *testing.T) {
 
 func TestWatcher_ErrorTriggersPollingFallback(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "orders.jsonl")
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	channelDir := filepath.Join(dir, "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(segPath, nil, 0o644))
 
 	// Use a backend whose Add succeeds (so no polling starts at Watch time),
 	// but then inject an error to simulate inotify exhaustion.
@@ -138,10 +146,10 @@ func TestWatcher_ErrorTriggersPollingFallback(t *testing.T) {
 	w := newChannelWatcherFromBackend(fake, nil)
 	t.Cleanup(func() { _ = w.Close() })
 
-	abs, err := filepath.Abs(path)
+	absDir, err := filepath.Abs(channelDir)
 	require.NoError(t, err)
 
-	ch, err := w.Watch(abs)
+	ch, err := w.Watch(absDir)
 	require.NoError(t, err)
 
 	// Inject a watcher error — run() should start polling for all watched paths.
@@ -150,8 +158,8 @@ func TestWatcher_ErrorTriggersPollingFallback(t *testing.T) {
 	// Give the error handler time to spawn the polling goroutine.
 	time.Sleep(20 * time.Millisecond)
 
-	// Modify the file — the polling goroutine must detect it.
-	require.NoError(t, os.WriteFile(path, []byte("hello\n"), 0o644))
+	// Modify the segment file — the polling goroutine must detect it.
+	require.NoError(t, os.WriteFile(segPath, []byte("hello\n"), 0o644))
 
 	assert.True(t, receiveWithin(t, ch, 500*time.Millisecond),
 		"polling fallback must emit notification after fsnotify error")
@@ -162,14 +170,17 @@ func TestWatcher_MultipleSubscribers(t *testing.T) {
 	w := newChannelWatcherFromBackend(fake, nil)
 	t.Cleanup(func() { _ = w.Close() })
 
-	path := "/tmp/orders.jsonl"
-	ch1, err := w.Watch(path)
+	// Watch a channel directory; inject fsnotify events with the segment file path.
+	channelDir := "/tmp/orders"
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	ch1, err := w.Watch(channelDir)
 	require.NoError(t, err)
-	ch2, err := w.Watch(path)
+	ch2, err := w.Watch(channelDir)
 	require.NoError(t, err)
 
-	// Inject an event via the fake backend.
-	fake.events <- fsnotify.Event{Name: path, Op: fsnotify.Write}
+	// Inject an event via the fake backend with the segment file path.
+	// The updated run() fans out to filepath.Dir(segPath) == channelDir.
+	fake.events <- fsnotify.Event{Name: segPath, Op: fsnotify.Write}
 
 	assert.True(t, receiveWithin(t, ch1, 200*time.Millisecond), "subscriber 1 must be notified")
 	assert.True(t, receiveWithin(t, ch2, 200*time.Millisecond), "subscriber 2 must be notified")
@@ -183,11 +194,14 @@ func TestWatcher_PathNormalization(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { os.RemoveAll(dir) })
 
-	path := filepath.Join(dir, "orders.jsonl")
-	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	channelDir := filepath.Join(dir, "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(segPath, nil, 0o644))
 
-	abs, err := filepath.Abs(path)
+	absDir, err := filepath.Abs(channelDir)
 	require.NoError(t, err)
+	absSegPath := filepath.Join(absDir, "00000000000000000000.jsonl")
 
 	fake := newFakeFsnotify()
 	w := newChannelWatcherFromBackend(fake, nil)
@@ -195,12 +209,13 @@ func TestWatcher_PathNormalization(t *testing.T) {
 
 	// Watch once via the absolute path, once via the relative path — must
 	// share one subs entry (both notified by a single event).
-	ch1, err := w.Watch(abs)
+	ch1, err := w.Watch(absDir)
 	require.NoError(t, err)
-	ch2, err := w.Watch(path) // relative-ish (via filepath.Abs internally)
+	ch2, err := w.Watch(channelDir) // relative-ish (via filepath.Abs internally)
 	require.NoError(t, err)
 
-	fake.events <- fsnotify.Event{Name: abs, Op: fsnotify.Write}
+	// Inject event with the segment file path; run() fans out to parent dir.
+	fake.events <- fsnotify.Event{Name: absSegPath, Op: fsnotify.Write}
 
 	assert.True(t, receiveWithin(t, ch1, 200*time.Millisecond), "absolute-path subscriber must be notified")
 	assert.True(t, receiveWithin(t, ch2, 200*time.Millisecond), "relative-path subscriber must be notified")

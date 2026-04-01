@@ -108,26 +108,28 @@ The `v` field allows future changes to the envelope schema. Readers must handle 
 
 ### 5.1 File Layout
 
-Each channel maps to a single append-only file:
+Each channel is a directory containing one or more segment files:
 
 ```
 {data_dir}/
   channels/
-    orders.jsonl
-    orders.dead-letter.jsonl
-    payments.jsonl
-    alerts.jsonl
+    orders/
+      00000000000000000000.jsonl   # segment 0 (sealed)
+      00000000000000065536.jsonl   # segment 1 (sealed)
+      00000000000000131072.jsonl   # segment 2 (active — writer appends here)
+    orders.dead-letter/
+      00000000000000000000.jsonl
+    payments/
+      00000000000000000000.jsonl
   subscribers/
     orders/
       {subscriber-id}.offset
     payments/
       {subscriber-id}.offset
   audit.jsonl
-  audit.jsonl.1
-  audit.jsonl.2
 ```
 
-One file per channel avoids cross-channel filtering on read and allows per-channel retention policies. Dead-letter channels follow the same file layout as regular channels.
+Each channel is a directory containing one or more segment files. Segment filenames encode the global byte offset at which that segment begins, zero-padded to 20 digits so lexicographic order equals offset order. The active segment is always the file with the highest start offset; all others are sealed. Dead-letter channels follow the same directory layout as regular channels.
 
 ### 5.2 Append Atomicity
 
@@ -159,7 +161,11 @@ This guarantees that a full disk causes the entire affected write path to stall 
 
 ### 5.4 Subscriber Offset Tracking
 
-Each subscriber has a durable offset file recording the byte offset of the next unread record in the channel file. The offset is written **after** the subscriber's handler returns successfully — this is the at-least-once contract.
+Each subscriber has a durable offset file recording the **global byte offset** of the next unread record in the channel's logical stream. The offset is written **after** the subscriber's handler returns successfully — this is the at-least-once contract.
+
+A new subscriber starts at the global offset of the stream end (last segment's start offset + last segment's size), skipping pre-existing history. A restarting subscriber resumes from the persisted offset.
+
+To find the right segment given a global offset: iterate the sorted segment list and find the segment where `seg.startOffset <= globalOffset < nextSeg.startOffset`. Seek within the file to `globalOffset - seg.startOffset`.
 
 If the process crashes after processing but before writing the offset, the message is redelivered on restart. Subscriber handlers must be idempotent.
 
@@ -206,13 +212,11 @@ Multiple notifications from overlapping sources (fsnotify and polling) are coale
 
 ### 5.7 File Rotation and Compaction
 
-A channel file may not be truncated or deleted while any subscriber's offset is less than the file's current size. The compaction process:
+**Segment rolling:** The writer rolls to a new segment when the current segment's size would exceed `max_segment_bytes` (default: 64 MB). Rolling is O(1): the current segment is synced and closed, a new file is created with a name encoding its start offset, and subsequent writes land in the new file. There is no pause, copy, or coordination with subscribers.
 
-1. Reads the minimum offset across all registered subscribers for a channel.
-2. If the minimum offset exceeds a configurable threshold (e.g., 256 MB), rotates the file: the consumed portion is archived or deleted, and offsets are adjusted.
-3. Rotation is performed under a brief write pause (the writer goroutine drains its inbox and holds the lock while rotation completes).
+**Compaction:** The compactor periodically scans the channel directory and deletes any sealed segment (all segments except the active one) whose entire content lies before the minimum subscriber offset — i.e., every registered subscriber has advanced past the segment's last byte. Deletion is a single `unlink` syscall. No writer pause is needed: the writer holds the active segment open, and Unix permits deletion of sealed segments even while subscribers hold open file descriptors to them (the inode persists until all readers close their fds).
 
-A subscriber that falls too far behind (configurable max lag in bytes) is logged as a warning. No automatic action is taken — operational policy determines whether to wait, alert, or drop the lagging subscriber.
+A subscriber that falls too far behind (configurable `max_subscriber_lag_bytes`) is logged as a warning. No automatic action is taken.
 
 ### 5.8 Subscriber Registration
 
@@ -442,16 +446,14 @@ writer goroutine (one per channel)
 ### 9.2 Read Path
 
 ```
-fsnotify event (or internal signal for same-process subscribers)
+fsnotify event on channel directory (or internal signal for same-process)
   └─ subscriber goroutine wakes
-  └─ probe-write current offset if offset writes have been failing (see §5.4)
-       → bail if probe fails; resume on success
-  └─ read from current offset to EOF (buffered scan, up to 10 MiB per line)
-  └─ split on newlines, unmarshal each record
-  └─ dispatch to handler with retry loop (exponential backoff between attempts)
-       → Stop() during backoff exits immediately; offset is not advanced
-  └─ on final retry failure: publish to dead-letter channel, advance offset
-  └─ write offset file after each successful handler return or dead-letter
+  └─ list segment files in channel directory (sorted by start offset)
+  └─ for each segment starting at or after subscriber's global offset:
+       └─ open segment, seek to (globalOffset - segmentStartOffset)
+       └─ scan lines to EOF; dispatch each with retry + backoff
+       └─ advance to next segment's start offset when current segment EOF reached
+  └─ write global offset file after each successful dispatch or dead-letter
        → on write failure: log error, leave in-memory offset unchanged
 ```
 
@@ -494,7 +496,7 @@ storage:
   sync_policy: "periodic"  # "none" | "periodic" | "always"
   sync_interval_ms: 200    # Used when sync_policy = "periodic"
   max_subscriber_lag_mb: 512   # Warn when a subscriber is this far behind
-  compaction_threshold_mb: 256 # Rotate channel file when consumed portion exceeds this size
+  max_segment_bytes: 67108864  # 64 MiB; writer rolls to new segment when active segment reaches this size
 
 subscribers:
   max_retries: 5           # Retry count before routing a message to the dead-letter channel.

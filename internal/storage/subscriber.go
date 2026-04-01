@@ -14,9 +14,8 @@ import (
 	"github.com/keyop/keyop-messenger/internal/envelope"
 )
 
-// defaultRetryDelay returns an exponential backoff delay for the given retry
-// attempt number (1-based: attempt 1 is the first retry after the initial
-// failure). The delay starts at 100ms and doubles each attempt, capped at 5s.
+// defaultRetryDelay returns exponential backoff delay for retry attempt n (1-based).
+// Starts at 100ms, doubles each attempt, capped at 5s.
 func defaultRetryDelay(attempt int) time.Duration {
 	const (
 		base = 100 * time.Millisecond
@@ -29,20 +28,20 @@ func defaultRetryDelay(attempt int) time.Duration {
 	return d
 }
 
-// HandlerFunc processes a decoded message. A non-nil return value or a panic
-// is treated as a delivery failure and triggers the retry / dead-letter logic.
+// HandlerFunc processes a decoded message. A non-nil return or a panic
+// triggers the retry / dead-letter logic.
 type HandlerFunc func(env *envelope.Envelope, payload any) error
 
-// Subscriber reads envelopes from a channel file, dispatches them to a
-// handler, and persists a byte-offset so delivery can resume after restart.
+// Subscriber reads envelopes from a channel's segment files, dispatches them
+// to a handler, and persists a global byte offset for at-least-once delivery.
 type Subscriber struct {
-	id          string
-	channelPath string
-	offsetPath  string
-	reg         payloadDecoder
-	maxRetries  int
-	dlWriter    ChannelWriter
-	log         logger
+	id         string
+	channelDir string
+	offsetPath string
+	reg        payloadDecoder
+	maxRetries int
+	dlWriter   ChannelWriter
+	log        logger
 
 	mu     sync.Mutex
 	offset int64
@@ -65,11 +64,11 @@ type Subscriber struct {
 }
 
 // NewSubscriber constructs a Subscriber and initialises its offset file.
-// If no offset file exists the subscriber starts from the current end-of-file
-// (new subscriber, skips history). Otherwise it resumes from the persisted
-// offset (restarting subscriber). log may be nil.
+// If no offset file exists the subscriber starts from the current end of the
+// channel (new subscriber, skips history). Otherwise it resumes from the
+// persisted offset (restarting subscriber). log may be nil.
 func NewSubscriber(
-	id, channelPath, offsetDir string,
+	id, channelDir, offsetDir string,
 	reg payloadDecoder,
 	maxRetries int,
 	dlWriter ChannelWriter,
@@ -91,9 +90,14 @@ func NewSubscriber(
 			return nil, fmt.Errorf("read offset for subscriber %q: %w", id, err)
 		}
 	} else {
-		// New subscriber: start from current EOF to avoid replaying history.
-		if info, err := os.Stat(channelPath); err == nil {
-			offset = info.Size()
+		// New subscriber: start from the current end to avoid replaying history.
+		segs, err := listSegments(channelDir)
+		if err != nil {
+			return nil, fmt.Errorf("list segments for subscriber %q: %w", id, err)
+		}
+		if len(segs) > 0 {
+			active := segs[len(segs)-1]
+			offset = active.startOffset + active.size
 		}
 		if err := WriteOffset(offsetPath, offset); err != nil {
 			return nil, fmt.Errorf("write initial offset for subscriber %q: %w", id, err)
@@ -102,7 +106,7 @@ func NewSubscriber(
 
 	return &Subscriber{
 		id:            id,
-		channelPath:   channelPath,
+		channelDir:    channelDir,
 		offsetPath:    offsetPath,
 		reg:           reg,
 		maxRetries:    maxRetries,
@@ -131,7 +135,6 @@ func (s *Subscriber) Stop() {
 
 func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	defer close(s.doneCh)
-	// Drain any messages that arrived before Start was called.
 	s.processAvailable(handler)
 	for {
 		select {
@@ -143,39 +146,24 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	}
 }
 
-// processAvailable seeks to the current offset and dispatches all complete
-// lines available in the channel file.
+// processAvailable reads all complete lines across all segment files starting
+// from the subscriber's current global offset and dispatches them.
 func (s *Subscriber) processAvailable(handler HandlerFunc) {
-	f, err := os.Open(s.channelPath)
+	segs, err := listSegments(s.channelDir)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			s.log.Error("open channel file", "path", s.channelPath, "err", err)
-		}
+		s.log.Error("list channel segments", "dir", s.channelDir, "err", err)
 		return
 	}
-	defer f.Close()
+	if len(segs) == 0 {
+		return
+	}
 
 	s.mu.Lock()
 	offset := s.offset
 	s.mu.Unlock()
 
-	// After compaction the channel file is shorter than our in-memory offset.
-	// Detect this and reload from the offset file (which the compactor already
-	// updated) so we seek to the correct position in the new file.
-	if info, statErr := f.Stat(); statErr == nil && offset > info.Size() {
-		if diskOff, err := ReadOffset(s.offsetPath); err == nil {
-			s.mu.Lock()
-			s.offset = diskOff
-			s.mu.Unlock()
-			offset = diskOff
-		}
-	}
-
 	// If offset writes have been failing repeatedly, attempt a probe write
-	// before processing more messages. Pausing here prevents unbounded
-	// duplicate delivery on restart. If the probe succeeds the counter is
-	// reset and processing continues normally; if it fails we bail and wait
-	// for the next notification to try again.
+	// before processing more messages.
 	if s.consecutiveOffsetErrs >= maxConsecutiveOffsetErrs {
 		if err := s.writeOffsetFn(s.offsetPath, offset); err != nil {
 			s.log.Error("offset writes still failing; pausing delivery to limit duplicates",
@@ -185,48 +173,69 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 		s.consecutiveOffsetErrs = 0
 	}
 
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		s.log.Error("seek channel file", "offset", offset, "err", err)
-		return
-	}
+	const maxLineSize = 10 * 1024 * 1024 // 10 MiB per line
 
-	const maxLineSize = 10 * 1024 * 1024 // 10 MiB
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		nextOffset := offset + int64(len(line)) + 1 // +1 for the '\n'
-
-		env, err := envelope.Unmarshal(line)
-		if err != nil {
-			s.log.Error("unmarshal envelope", "err", err)
-			s.advanceOffset(nextOffset)
-			offset = nextOffset
-			continue
+	for i, seg := range segs {
+		segEnd := seg.startOffset + seg.size
+		if segEnd <= offset {
+			continue // subscriber is already past this entire segment
 		}
 
-		payload, err := s.reg.Decode(env.PayloadType, env.Payload)
+		f, err := os.Open(seg.path)
 		if err != nil {
-			s.log.Error("decode payload", "type", env.PayloadType, "err", err)
-			s.advanceOffset(nextOffset)
-			offset = nextOffset
-			continue
+			s.log.Error("open segment", "path", seg.path, "err", err)
+			return
 		}
 
-		s.dispatch(handler, &env, payload, nextOffset)
-		offset = nextOffset
-	}
-	if err := scanner.Err(); err != nil {
-		s.log.Error("scan channel file", "err", err)
+		localOffset := offset - seg.startOffset
+		if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
+			s.log.Error("seek in segment", "path", seg.path, "local_offset", localOffset, "err", err)
+			f.Close()
+			return
+		}
+
+		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			nextOffset := offset + int64(len(line)) + 1 // +1 for '\n'
+
+			env, err := envelope.Unmarshal(line)
+			if err != nil {
+				s.log.Error("unmarshal envelope", "err", err)
+				s.advanceOffset(nextOffset)
+				offset = nextOffset
+				continue
+			}
+
+			payload, err := s.reg.Decode(env.PayloadType, env.Payload)
+			if err != nil {
+				s.log.Error("decode payload", "type", env.PayloadType, "err", err)
+				s.advanceOffset(nextOffset)
+				offset = nextOffset
+				continue
+			}
+
+			s.dispatch(handler, &env, payload, nextOffset)
+			offset = nextOffset
+		}
+		if err := scanner.Err(); err != nil {
+			s.log.Error("scan segment", "path", seg.path, "err", err)
+		}
+		f.Close()
+
+		// If there is a next segment, advance to its start offset. This handles
+		// the gap between a sealed segment's end and the next segment's start
+		// (in the normal case these are equal, so this is a no-op on offset).
+		if i+1 < len(segs) {
+			offset = segs[i+1].startOffset
+		}
 	}
 }
 
-// dispatch calls handler with up to maxRetries+1 total attempts. Between each
-// retry the backoff delay from s.retryDelay is observed; if Stop is called
-// during a backoff sleep the function returns immediately without advancing the
-// offset (the message will be re-delivered on next start). On failure after all
-// attempts, routes to the dead-letter channel — unless the channel is itself a
-// dead-letter channel, in which case the error is logged and delivery advances.
+// dispatch calls handler with up to maxRetries+1 total attempts with
+// exponential backoff. If Stop is called during a backoff the function returns
+// immediately without advancing the offset (message re-delivered on restart).
 func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, payload any, nextOffset int64) {
 	var lastErr error
 	for attempt := 0; attempt < s.maxRetries+1; attempt++ {
@@ -246,7 +255,6 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 		}
 	}
 
-	// All attempts exhausted.
 	if strings.HasSuffix(env.Channel, ".dead-letter") {
 		s.log.Error("dead-letter handler failed, skipping",
 			"channel", env.Channel, "id", env.ID, "err", lastErr)
@@ -289,15 +297,13 @@ func (s *Subscriber) sendToDeadLetter(orig *envelope.Envelope, lastErr error) {
 	}
 }
 
-// maxConsecutiveOffsetErrs is the number of successive offset-write failures
-// after which the subscriber pauses delivery to prevent excessive duplicates
-// on restart. Delivery resumes automatically once a probe write succeeds.
+// maxConsecutiveOffsetErrs is the number of successive WriteOffset failures
+// after which delivery is paused.
 const maxConsecutiveOffsetErrs = 3
 
 // advanceOffset persists newOffset to disk and updates the in-memory value.
-// On failure the in-memory offset is left unchanged (conservative: the message
-// will be re-delivered on restart) and consecutiveOffsetErrs is incremented.
-// On success the counter is reset.
+// On failure the in-memory offset is left unchanged (conservative: message
+// will be re-delivered on restart).
 func (s *Subscriber) advanceOffset(newOffset int64) {
 	if err := s.writeOffsetFn(s.offsetPath, newOffset); err != nil {
 		s.consecutiveOffsetErrs++

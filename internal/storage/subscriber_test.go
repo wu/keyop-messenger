@@ -18,7 +18,6 @@ import (
 
 // ---- helpers ----------------------------------------------------------------
 
-// mapDecoder is a minimal payloadDecoder that returns map[string]any for every type.
 type mapDecoder struct{}
 
 func (mapDecoder) Decode(_ string, raw json.RawMessage) (any, error) {
@@ -29,12 +28,30 @@ func (mapDecoder) Decode(_ string, raw json.RawMessage) (any, error) {
 	return v, nil
 }
 
-// writeTestEnvelope marshals env and appends it as a JSONL line to path.
-func writeTestEnvelope(t *testing.T, path string, env envelope.Envelope) {
+// activeSegmentPath returns the path to the active (only) segment in
+// channelDir, creating the directory and segment file if they don't exist yet.
+func activeSegmentPath(t *testing.T, channelDir string) string {
 	t.Helper()
+	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	if len(segs) > 0 {
+		return segs[len(segs)-1].path
+	}
+	// Create the first segment.
+	path := filepath.Join(channelDir, segmentName(0))
+	require.NoError(t, os.WriteFile(path, nil, 0o644))
+	return path
+}
+
+// writeTestEnvelope marshals env and appends it as a JSONL line to the active
+// segment in channelDir.
+func writeTestEnvelope(t *testing.T, channelDir string, env envelope.Envelope) {
+	t.Helper()
+	segPath := activeSegmentPath(t, channelDir)
 	data, err := envelope.Marshal(env)
 	require.NoError(t, err)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer f.Close()
 	_, err = fmt.Fprintf(f, "%s\n", data)
@@ -65,23 +82,22 @@ func collectN(t *testing.T, ch <-chan *envelope.Envelope, n int, timeout time.Du
 	return out
 }
 
-// newTestSub creates a Subscriber backed by a FakeChannelWatcher, returning
-// the subscriber, its notification channel (from watcher.Watch), and a
-// FakeChannelWriter for dead-letter assertions.
+// newTestSub creates a Subscriber backed by a FakeChannelWatcher.
+// channelDir is the channel directory (not a file path).
 func newTestSub(
 	t *testing.T,
-	id, channelPath, offsetDir string,
+	id, channelDir, offsetDir string,
 	maxRetries int,
 ) (*Subscriber, <-chan struct{}, *testutil.FakeChannelWriter) {
 	t.Helper()
 	watcher := &testutil.FakeChannelWatcher{}
-	notifyC, err := watcher.Watch(channelPath)
+	notifyC, err := watcher.Watch(channelDir)
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
-	sub, err := NewSubscriber(id, channelPath, offsetDir, mapDecoder{}, maxRetries, dlWriter, log)
+	sub, err := NewSubscriber(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log)
 	require.NoError(t, err)
-	sub.retryDelay = func(int) time.Duration { return 0 } // no backoff in tests
+	sub.retryDelay = func(int) time.Duration { return 0 }
 	return sub, notifyC, dlWriter
 }
 
@@ -91,15 +107,15 @@ const testTimeout = 2 * time.Second
 
 func TestSubscriber_HappyPath(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	// Create subscriber before writing — new subscriber starts at offset 0
-	// when the file does not yet exist.
-	sub, notifyC, _ := newTestSub(t, "s", channelPath, offsetDir, 3)
+	// when the directory does not yet exist.
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 3)
 
 	for i := 0; i < 3; i++ {
-		writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]int{"n": i}))
+		writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]int{"n": i}))
 	}
 
 	received := make(chan *envelope.Envelope, 10)
@@ -116,14 +132,14 @@ func TestSubscriber_HappyPath(t *testing.T) {
 
 func TestSubscriber_AtLeastOnce(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	// First run: process 3 messages.
-	sub1, notifyC1, _ := newTestSub(t, "s", channelPath, offsetDir, 3)
+	sub1, notifyC1, _ := newTestSub(t, "s", channelDir, offsetDir, 3)
 
 	for i := 0; i < 3; i++ {
-		writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]int{"n": i}))
+		writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]int{"n": i}))
 	}
 
 	var firstRunCount atomic.Int64
@@ -139,7 +155,7 @@ func TestSubscriber_AtLeastOnce(t *testing.T) {
 	assert.Equal(t, int64(3), firstRunCount.Load())
 
 	// Second run with same id: must not re-deliver already-processed messages.
-	sub2, notifyC2, _ := newTestSub(t, "s", channelPath, offsetDir, 3)
+	sub2, notifyC2, _ := newTestSub(t, "s", channelDir, offsetDir, 3)
 
 	var secondRunCount atomic.Int64
 	sub2.Start(notifyC2, func(_ *envelope.Envelope, _ any) error {
@@ -157,11 +173,11 @@ func TestSubscriber_AtLeastOnce(t *testing.T) {
 func TestSubscriber_Retry(t *testing.T) {
 	const maxRetries = 3
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
-	sub, notifyC, dlWriter := newTestSub(t, "s", channelPath, offsetDir, maxRetries)
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "v"}))
+	sub, notifyC, dlWriter := newTestSub(t, "s", channelDir, offsetDir, maxRetries)
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "v"}))
 
 	var callCount atomic.Int64
 	done := make(chan struct{})
@@ -191,14 +207,14 @@ func TestSubscriber_Retry(t *testing.T) {
 func TestSubscriber_DeadLetter(t *testing.T) {
 	const maxRetries = 3
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
-	sub, notifyC, dlWriter := newTestSub(t, "s", channelPath, offsetDir, maxRetries)
+	sub, notifyC, dlWriter := newTestSub(t, "s", channelDir, offsetDir, maxRetries)
 
 	// Write 2 messages; both should fail and go to dead-letter.
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "a"}))
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "b"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "a"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "b"}))
 
 	var deliveries atomic.Int64
 	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
@@ -225,17 +241,17 @@ func TestSubscriber_DeadLetter(t *testing.T) {
 
 func TestSubscriber_PanicRecovery(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	// Use a LocalNotifier so we can push a notification after writing the second message.
 	notifier := NewLocalNotifier()
 	dlWriter := &testutil.FakeChannelWriter{}
-	sub, err := NewSubscriber("s", channelPath, offsetDir, mapDecoder{}, 1, dlWriter, &testutil.FakeLogger{})
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, &testutil.FakeLogger{})
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "v"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "v"}))
 
 	sub.Start(notifier.C(), func(_ *envelope.Envelope, _ any) error {
 		panic("deliberate test panic")
@@ -248,7 +264,7 @@ func TestSubscriber_PanicRecovery(t *testing.T) {
 	}, testTimeout, 10*time.Millisecond, "expected dead-letter after panic")
 
 	// Write a second message and notify to confirm the goroutine is still running.
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "v2"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "v2"}))
 	notifier.Notify()
 	require.Eventually(t, func() bool {
 		return len(dlWriter.Written()) == 2
@@ -257,19 +273,19 @@ func TestSubscriber_PanicRecovery(t *testing.T) {
 
 func TestSubscriber_DeadLetterChannel_NoRecursion(t *testing.T) {
 	dir := t.TempDir()
-	// Channel path ends in .dead-letter.jsonl — subscriber must not DLQ on failure.
-	channelPath := filepath.Join(dir, "orders.dead-letter.jsonl")
+	// Channel dir ends in .dead-letter — subscriber must not DLQ on failure.
+	channelDir := filepath.Join(dir, "orders.dead-letter")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	watcher := &testutil.FakeChannelWatcher{}
-	notifyC, _ := watcher.Watch(channelPath)
+	notifyC, _ := watcher.Watch(channelDir)
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelPath, offsetDir, mapDecoder{}, 1, dlWriter, log)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log)
 	require.NoError(t, err)
 
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders.dead-letter", map[string]string{"k": "v"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders.dead-letter", map[string]string{"k": "v"}))
 
 	var callCount atomic.Int64
 	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
@@ -292,17 +308,17 @@ func TestSubscriber_DeadLetterChannel_NoRecursion(t *testing.T) {
 
 func TestSubscriber_ResumesFromOffset(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	// Write 2 envelopes before creating the subscriber.
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "old1"}))
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "old2"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "old1"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "old2"}))
 
 	// New subscriber starts at current EOF — old messages are skipped.
-	sub, notifyC, _ := newTestSub(t, "s", channelPath, offsetDir, 1)
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 1)
 
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "new"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "new"}))
 
 	received := make(chan *envelope.Envelope, 10)
 	sub.Start(notifyC, func(env *envelope.Envelope, _ any) error {
@@ -321,13 +337,13 @@ func TestSubscriber_ResumesFromOffset(t *testing.T) {
 
 func TestSubscriber_LargePayload(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	// Build a payload that exceeds bufio.Scanner's default 64KB limit.
 	largeValue := strings.Repeat("x", 200*1024) // 200 KiB string
-	sub, notifyC, _ := newTestSub(t, "s", channelPath, offsetDir, 1)
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"blob": largeValue}))
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 1)
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"blob": largeValue}))
 
 	received := make(chan *envelope.Envelope, 1)
 	sub.Start(notifyC, func(env *envelope.Envelope, _ any) error {
@@ -343,21 +359,21 @@ func TestSubscriber_LargePayload(t *testing.T) {
 
 func TestSubscriber_RetryBackoff(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	watcher := &testutil.FakeChannelWatcher{}
-	notifyC, err := watcher.Watch(channelPath)
+	notifyC, err := watcher.Watch(channelDir)
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 
-	sub, err := NewSubscriber("s", channelPath, offsetDir, mapDecoder{}, 2, dlWriter, &testutil.FakeLogger{})
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, &testutil.FakeLogger{})
 	require.NoError(t, err)
 
 	const minDelay = 20 * time.Millisecond
 	sub.retryDelay = func(int) time.Duration { return minDelay }
 
-	writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]string{"k": "v"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "v"}))
 
 	var attempts []time.Time
 	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
@@ -383,14 +399,14 @@ func TestSubscriber_RetryBackoff(t *testing.T) {
 
 func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	dir := t.TempDir()
-	channelPath := filepath.Join(dir, "orders.jsonl")
+	channelDir := filepath.Join(dir, "orders")
 	offsetDir := filepath.Join(dir, "offsets")
 
 	notifier := NewLocalNotifier()
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelPath, offsetDir, mapDecoder{}, 1, dlWriter, log)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -408,7 +424,7 @@ func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	// without offset persistence; after the probe write succeeds the remaining
 	// message(s) should be delivered.
 	for i := 0; i < 3; i++ {
-		writeTestEnvelope(t, channelPath, makeEnv(t, "orders", map[string]int{"n": i}))
+		writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]int{"n": i}))
 	}
 
 	received := make(chan *envelope.Envelope, 10)
