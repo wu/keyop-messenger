@@ -114,3 +114,39 @@ func (f *FakeChannelWriter) IsClosed() bool {
 	defer f.mu.Unlock()
 	return f.closed
 }
+
+// ---- FakeChannelWatcher -----------------------------------------------------
+
+// FakeChannelWatcher implements ChannelWatcher for tests. Call Notify(path) to
+// manually push a notification to all subscribers watching that path.
+type FakeChannelWatcher struct {
+	mu   sync.Mutex
+	subs map[string][]chan struct{}
+}
+
+// Watch registers path and returns a notification channel.
+func (f *FakeChannelWatcher) Watch(path string) (<-chan struct{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.subs == nil {
+		f.subs = make(map[string][]chan struct{})
+	}
+	ch := make(chan struct{}, 1)
+	f.subs[path] = append(f.subs[path], ch)
+	return ch, nil
+}
+
+// Close is a no-op.
+func (f *FakeChannelWatcher) Close() error { return nil }
+
+// Notify sends a non-blocking notification to all subscribers for path.
+func (f *FakeChannelWatcher) Notify(path string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ch := range f.subs[path] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}

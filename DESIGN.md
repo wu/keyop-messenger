@@ -131,9 +131,9 @@ One file per channel avoids cross-channel filtering on read and allows per-chann
 
 ### 5.2 Append Atomicity
 
-All writes to a `.jsonl` file are serialized through a single writer goroutine per channel. `Publish()` sends a write request to the writer goroutine and then **blocks until the writer confirms the write is complete**. There is no in-memory queue between the publisher and the writer — a message is not considered published until it has been handed to the OS. This ensures no messages are silently discarded if the process restarts while work is pending.
+All writes to a `.jsonl` file are serialized through a single writer goroutine per channel. `Publish()` hands a write request to the writer goroutine via an **unbuffered** channel (rendezvous) and then **blocks until the writer confirms the write is complete**. There is no in-memory queue — a message is not considered published until it has been handed to the OS. This ensures no messages are silently discarded if the process restarts while work is pending.
 
-Multiple goroutines calling `Publish()` concurrently on the same channel serialize through the writer goroutine; each waits for its own write to be confirmed before returning.
+Multiple goroutines calling `Publish()` concurrently on the same channel serialize through the writer goroutine; each blocks on the rendezvous until its own write is confirmed before returning.
 
 The writer appends with `O_APPEND` and issues a single `write()` syscall per record, which is atomic for records under `PIPE_BUF` on POSIX systems. For larger records, the writer holds an advisory `flock` for the duration of the write.
 
@@ -145,14 +145,15 @@ What "write confirmed" means depends on the sync policy:
 | `periodic` | `write()` syscall returns; fsync runs on a background timer | Application restart; OS crash only between fsync intervals |
 | `always` | `fsync()` completes | OS crash, power failure |
 
+For `sync_policy=always`, an fsync failure is returned as an error to the caller. For `sync_policy=periodic`, fsync failures are logged as warnings and retried on the next timer tick; `Publish()` is not affected.
+
 ### 5.3 Backpressure on Disk Full
 
 If the channel writer goroutine encounters a write error (disk full, I/O error), it does **not** drop the message or return an error to the caller. Instead:
 
-1. The write is retried on a short interval until it succeeds.
-2. The writer goroutine's inbox channel fills up because no new records are being consumed.
-3. Once full, `Publish()` blocks the calling goroutine until the writer can accept the record.
-4. For federated messages arriving over WebSocket: the hub's per-peer receiver goroutine blocks on `Publish()`, which stops it from reading further WebSocket frames. TCP flow control propagates this backpressure to the sending peer's OS send buffer, which in turn blocks the sending goroutine on the remote hub.
+1. The write is retried every 10ms until it succeeds.
+2. Because the writer goroutine is busy in the retry loop, it is not reading from the (unbuffered) rendezvous channel. Any concurrent `Publish()` call blocks immediately when it tries to hand its request to the writer.
+3. For federated messages arriving over WebSocket: the hub's per-peer receiver goroutine blocks on `Publish()`, which stops it from reading further WebSocket frames. TCP flow control propagates this backpressure to the sending peer's OS send buffer, which in turn blocks the sending goroutine on the remote hub.
 
 This guarantees that a full disk causes the entire affected write path to stall rather than silently lose messages. The operator must resolve the disk condition; no messages are dropped.
 
@@ -162,7 +163,7 @@ Each subscriber has a durable offset file recording the byte offset of the next 
 
 If the process crashes after processing but before writing the offset, the message is redelivered on restart. Subscriber handlers must be idempotent.
 
-The offset file is fsynced on every update. This is not configurable — relaxing this guarantee would break at-least-once semantics.
+Offset files are written atomically: the new value is written to a `.tmp` sibling file, fsynced, then renamed over the real file. This ensures the offset file is never left in a half-written state. The fsync is not configurable — relaxing it would break at-least-once semantics.
 
 ### 5.5 Dead-Letter Queue
 
@@ -189,7 +190,17 @@ Dead-letter channels are regular channels. They can be subscribed to for monitor
 
 Subscribers use `fsnotify` (inotify on Linux, kqueue on macOS) to receive push notification when new data is appended to a channel file. On notification, the subscriber reads from its current offset to EOF in a single buffered read.
 
-Polling is not used in normal operation. If `fsnotify` is unavailable for a channel, the subscriber falls back to polling with a 100ms interval and logs a warning.
+**Same-process fast path:** Subscribers in the same process as the publisher receive notifications via a `LocalNotifier` — a capacity-1 `chan struct{}` that the writer goroutine signals directly after each successful write. This bypasses the filesystem watcher entirely for lower latency.
+
+**Path normalisation:** All watched paths are resolved to their absolute form via `filepath.Abs` before registration. This ensures that a relative path and an absolute path referring to the same file share a single watch entry rather than creating duplicate goroutines.
+
+**Polling fallback:** A 100ms polling goroutine is started per path in two situations:
+1. `fsnotify.Add` fails at `Watch` time (e.g., inotify watch limit reached).
+2. A runtime error is received from the fsnotify backend (e.g., inotify queue overflow). In this case, polling is started for every currently-watched path that is not already being polled.
+
+The polling goroutine detects changes by comparing both `ModTime` **and** `Size` against their values at the previous tick. Checking size as well as mtime ensures changes are detected on filesystems with coarse mtime resolution (e.g., ext3 at 1-second granularity, some network shares) when multiple writes occur within the same second.
+
+Multiple notifications from overlapping sources (fsnotify and polling) are coalesced: the notification channel has a capacity of 1 and uses a non-blocking send, so the subscriber sees at most one pending wake-up regardless of how many events fire.
 
 ### 5.7 File Rotation and Compaction
 
@@ -213,7 +224,7 @@ Deregistering a subscriber removes its offset file and allows compaction to proc
 
 ### 6.1 Instance Identity
 
-Each instance is identified by a human-readable **instance name**, which defaults to the OS hostname. If multiple instances run on the same physical host (e.g., on different ports), the name should be set explicitly in config to `hostname:port` to ensure uniqueness.
+Each instance is identified by a human-readable **instance name**, which defaults to the OS hostname. If multiple instances run on the same physical host (e.g., on different ports), the name should be set explicitly in config to `hostname:port` to ensure uniqueness. If the name is empty after applying defaults (e.g., `os.Hostname()` fails), startup is rejected with a validation error.
 
 The instance name is embedded in the TLS certificate as the Common Name and as a DNS Subject Alternative Name. It is used for:
 - Allowlist authorization (hub checks connecting instance name against its config)
@@ -225,7 +236,7 @@ The message `id` field (UUID v4) is separate from the instance name. It is gener
 
 ### 6.2 WebSocket Connection
 
-Federation uses WebSocket over TLS (`wss://`). The TLS configuration requires TLS 1.3 minimum. Both sides present certificates; both sides verify the peer cert against the shared CA.
+Federation uses WebSocket over TLS (`wss://`). Both sides present certificates; both sides verify the peer cert against the shared CA. The `tls.min_version` config field accepts only `"1.2"` or `"1.3"` and defaults to `"1.3"`; any other value is rejected at startup.
 
 After the TLS handshake, the application-level handshake exchanges:
 
@@ -480,7 +491,10 @@ storage:
   compaction_threshold_mb: 256 # Rotate channel file when consumed portion exceeds this size
 
 subscribers:
-  max_retries: 5           # Retry count before routing a message to the dead-letter channel
+  max_retries: 5           # Retry count before routing a message to the dead-letter channel.
+                           # Omitting the field (nil) applies the default of 5.
+                           # Setting it explicitly to 0 routes to dead-letter immediately on
+                           # the first failure with no retries.
 
 hub:
   enabled: false

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(go mod:*)",
       "Bash(go test:*)",
-      "Bash(GOPROXY=direct go mod tidy 2>&1)"
+      "Bash(GOPROXY=direct go mod tidy 2>&1)",
+      "Bash(GOPROXY=direct go get github.com/fsnotify/fsnotify@v1.7.0)"
     ]
   }
 }
