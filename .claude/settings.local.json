@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(go mod:*)",
-      "Bash(go test:*)"
+      "Bash(go test:*)",
+      "Bash(GOPROXY=direct go mod tidy 2>&1)"
     ]
   }
 }
