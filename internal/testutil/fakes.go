@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+
+	"github.com/keyop/keyop-messenger/internal/envelope"
 )
 
 // FakeLogger records log calls for assertion in tests.
@@ -57,4 +59,58 @@ func (f *FakeLogger) Reset() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.logs = f.logs[:0]
+}
+
+// ---- FakeChannelWriter -------------------------------------------------------
+
+// FakeChannelWriter records Write calls for assertion in tests. It implements
+// the same interface as storage.ChannelWriter via structural compatibility.
+type FakeChannelWriter struct {
+	mu       sync.Mutex
+	written  []*envelope.Envelope
+	writeErr error // if non-nil, Write returns this error
+	closed   bool
+}
+
+// Write appends a copy of env to the recorded list, or returns writeErr if set.
+func (f *FakeChannelWriter) Write(env *envelope.Envelope) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	cp := *env
+	f.written = append(f.written, &cp)
+	return nil
+}
+
+// Close marks the writer as closed.
+func (f *FakeChannelWriter) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = true
+	return nil
+}
+
+// Written returns a snapshot of all envelopes written so far.
+func (f *FakeChannelWriter) Written() []*envelope.Envelope {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]*envelope.Envelope, len(f.written))
+	copy(out, f.written)
+	return out
+}
+
+// SetError configures Write to return err on every subsequent call.
+func (f *FakeChannelWriter) SetError(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writeErr = err
+}
+
+// IsClosed reports whether Close has been called.
+func (f *FakeChannelWriter) IsClosed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.closed
 }
