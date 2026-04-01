@@ -91,4 +91,4 @@ See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./
 
 ## License
 
-[License Type, e.g., MIT/Apache 2.0]
+BSD 2-Clause License. See [LICENSE](./LICENSE) for details.
