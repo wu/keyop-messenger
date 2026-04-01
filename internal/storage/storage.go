@@ -5,6 +5,8 @@
 // systems (Linux, macOS) only.
 package storage
 
+import "encoding/json"
+
 // logger is the minimum logging interface required by this package.
 // Structurally compatible with the root messenger.Logger and testutil.FakeLogger.
 type logger interface {
@@ -16,3 +18,9 @@ type nopLogger struct{}
 
 func (nopLogger) Warn(string, ...any)  {}
 func (nopLogger) Error(string, ...any) {}
+
+// payloadDecoder decodes raw JSON payloads into registered Go types.
+// Structurally compatible with registry.PayloadRegistry.
+type payloadDecoder interface {
+	Decode(typeStr string, raw json.RawMessage) (any, error)
+}

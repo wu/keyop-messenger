@@ -165,9 +165,11 @@ If the process crashes after processing but before writing the offset, the messa
 
 Offset files are written atomically: the new value is written to a `.tmp` sibling file, fsynced, then renamed over the real file. This ensures the offset file is never left in a half-written state. The fsync is not configurable — relaxing it would break at-least-once semantics.
 
+**Persistent offset write failures:** If `WriteOffset` fails (e.g., the offset partition is full), the in-memory offset is **not** advanced — the conservative choice that ensures the message will be re-delivered on the next restart rather than silently skipped. The error is logged. After three consecutive failures, delivery is **paused**: the subscriber goroutine continues running and listening for change notifications, but on each wakeup it first attempts a probe write of the current offset. If the probe succeeds, the failure counter is reset and normal delivery resumes. If it fails, delivery remains paused and the subscriber waits for the next notification before trying again. This prevents unbounded duplicate delivery when the offset partition is persistently unavailable.
+
 ### 5.5 Dead-Letter Queue
 
-When a subscriber's handler returns an error or panics, the message is retried up to a configurable maximum (`max_retries`, default: 5). Retries are immediate — there is no delay between attempts within the same delivery cycle. On the final retry failure:
+When a subscriber's handler returns an error or panics, the message is retried up to a configurable maximum (`max_retries`, default: 5). Between retry attempts the subscriber observes an **exponential backoff** delay: the first retry waits 100ms, doubling on each subsequent attempt and capping at 5s. If `Stop()` is called during a backoff sleep the subscriber exits immediately without advancing the offset — the message will be re-delivered on the next start. On the final retry failure:
 
 1. The original message is wrapped in a dead-letter envelope and published to `{channel}.dead-letter`.
 2. The subscriber's offset is advanced past the failed message so delivery continues.
@@ -442,14 +444,18 @@ writer goroutine (one per channel)
 ```
 fsnotify event (or internal signal for same-process subscribers)
   └─ subscriber goroutine wakes
-  └─ read from current offset to EOF in one buffered read
+  └─ probe-write current offset if offset writes have been failing (see §5.4)
+       → bail if probe fails; resume on success
+  └─ read from current offset to EOF (buffered scan, up to 10 MiB per line)
   └─ split on newlines, unmarshal each record
-  └─ dispatch to handler (with retry loop up to max_retries)
+  └─ dispatch to handler with retry loop (exponential backoff between attempts)
+       → Stop() during backoff exits immediately; offset is not advanced
   └─ on final retry failure: publish to dead-letter channel, advance offset
   └─ write offset file after each successful handler return or dead-letter
+       → on write failure: log error, leave in-memory offset unchanged
 ```
 
-Subscribers within the same process use an internal notification channel bypassing the filesystem watcher for lower latency.
+Subscribers within the same process use an internal notification channel bypassing the filesystem watcher for lower latency. The per-line scanner buffer is capped at 10 MiB; envelopes larger than this are skipped with an error logged and the offset advanced past them.
 
 ### 9.3 Serialization
 

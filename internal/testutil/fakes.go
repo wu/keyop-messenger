@@ -45,6 +45,18 @@ func (f *FakeLogger) HasWarn(substr string) bool {
 	return false
 }
 
+// HasError reports whether any ERROR-level log entry contains substr.
+func (f *FakeLogger) HasError(substr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.logs {
+		if strings.HasPrefix(e, "ERROR") && strings.Contains(e, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // Entries returns a snapshot of all recorded log entries.
 func (f *FakeLogger) Entries() []string {
 	f.mu.Lock()
