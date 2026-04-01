@@ -4,7 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Design phase. See `DESIGN.md` for the full architecture. No source code yet.
+Implementation in progress. Phase 1 (module scaffold and configuration) is complete.
+See `DESIGN.md` for the full architecture and `IMPLEMENTATION.md` for the phase plan.
+
+## Build / Test Commands
+
+```bash
+go test -race ./...          # run all unit tests
+go test -race -v ./...       # verbose
+go mod tidy                  # sync dependencies
+```
 
 ## Architecture Summary
 
