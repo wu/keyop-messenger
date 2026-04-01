@@ -159,6 +159,18 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 	offset := s.offset
 	s.mu.Unlock()
 
+	// After compaction the channel file is shorter than our in-memory offset.
+	// Detect this and reload from the offset file (which the compactor already
+	// updated) so we seek to the correct position in the new file.
+	if info, statErr := f.Stat(); statErr == nil && offset > info.Size() {
+		if diskOff, err := ReadOffset(s.offsetPath); err == nil {
+			s.mu.Lock()
+			s.offset = diskOff
+			s.mu.Unlock()
+			offset = diskOff
+		}
+	}
+
 	// If offset writes have been failing repeatedly, attempt a probe write
 	// before processing more messages. Pausing here prevents unbounded
 	// duplicate delivery on restart. If the probe succeeds the counter is

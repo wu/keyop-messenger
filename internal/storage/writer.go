@@ -50,12 +50,22 @@ type writeRequest struct {
 	done chan<- error // buffered (cap 1) — goroutine never blocks on send
 }
 
+// pauseRequest is sent by PauseAndSwap to the writer goroutine.
+// The goroutine calls fn(), then (if successful and channelPath is set)
+// reopens the channel file before signalling done.
+type pauseRequest struct {
+	fn   func() error
+	done chan<- error // buffered (cap 1)
+}
+
 type channelWriter struct {
-	requests  chan writeRequest // unbuffered — rendezvous with writer goroutine
-	stopCh    chan struct{}
-	doneCh    chan struct{}
-	closeOnce sync.Once
-	log       logger
+	channelPath string           // set by NewChannelWriter; empty for fake writers in tests
+	requests    chan writeRequest // unbuffered — rendezvous with writer goroutine
+	pauseReqs   chan pauseRequest // unbuffered — rendezvous with writer goroutine
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+	closeOnce   sync.Once
+	log         logger
 }
 
 // NewChannelWriter opens channelPath (O_APPEND|O_CREATE|O_WRONLY) and starts
@@ -66,20 +76,24 @@ func NewChannelWriter(channelPath string, policy SyncPolicy, syncInterval time.D
 	if err != nil {
 		return nil, fmt.Errorf("open channel file %q: %w", channelPath, err)
 	}
-	return newChannelWriterFromFile(f, policy, syncInterval, notifyFn, log), nil
+	w := newChannelWriterFromFile(f, policy, syncInterval, notifyFn, log)
+	w.channelPath = channelPath
+	return w, nil
 }
 
 // newChannelWriterFromFile is the testable constructor that accepts an
-// arbitrary fileWriter instead of a real *os.File.
+// arbitrary fileWriter instead of a real *os.File. channelPath is left empty,
+// so PauseAndSwap skips the file-reopen step (tests never call it).
 func newChannelWriterFromFile(f fileWriter, policy SyncPolicy, syncInterval time.Duration, notifyFn func(), log logger) *channelWriter {
 	if log == nil {
 		log = nopLogger{}
 	}
 	w := &channelWriter{
-		requests: make(chan writeRequest), // unbuffered — rendezvous
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
-		log:      log,
+		requests:  make(chan writeRequest), // unbuffered — rendezvous
+		pauseReqs: make(chan pauseRequest), // unbuffered — rendezvous
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		log:       log,
 	}
 	go w.run(f, policy, syncInterval, notifyFn)
 	return w
@@ -112,11 +126,27 @@ func (w *channelWriter) Close() error {
 	return nil
 }
 
+// PauseAndSwap pauses the writer goroutine, calls fn, then (if fn succeeds and
+// the writer was created with a real path) reopens the channel file before
+// resuming. fn is typically a file rename performed by the compactor. If fn
+// fails the writer continues with its existing file descriptor unchanged.
+// Returns ErrWriterClosed if the writer has already been stopped.
+func (w *channelWriter) PauseAndSwap(fn func() error) error {
+	done := make(chan error, 1)
+	select {
+	case w.pauseReqs <- pauseRequest{fn: fn, done: done}:
+		return <-done
+	case <-w.stopCh:
+		return ErrWriterClosed
+	}
+}
+
 // run is the writer goroutine. It owns the file descriptor for the lifetime of
-// the channelWriter.
+// the channelWriter. The defer uses a closure so that if f is reassigned
+// during a PauseAndSwap the correct (new) file is closed on exit.
 func (w *channelWriter) run(f fileWriter, policy SyncPolicy, syncInterval time.Duration, notifyFn func()) {
 	defer close(w.doneCh)
-	defer f.Close()
+	defer func() { f.Close() }()
 
 	var tickCh <-chan time.Time
 	if policy == SyncPolicyPeriodic && syncInterval > 0 {
@@ -133,6 +163,24 @@ func (w *channelWriter) run(f fileWriter, policy SyncPolicy, syncInterval time.D
 			if err := f.Sync(); err != nil {
 				w.log.Warn("periodic fsync failed", "err", err)
 			}
+		case req := <-w.pauseReqs:
+			// Call fn (typically a compaction rename) while no writes are in flight.
+			if err := req.fn(); err != nil {
+				req.done <- err
+				// fn failed; original fd is still valid — continue processing.
+				continue
+			}
+			// Reopen the channel file so the writer appends to the new inode.
+			if w.channelPath != "" {
+				newFile, err := os.OpenFile(w.channelPath, os.O_APPEND|os.O_WRONLY, 0o644)
+				if err != nil {
+					req.done <- fmt.Errorf("reopen channel file after compaction: %w", err)
+					return // fatal — cannot continue without a valid fd
+				}
+				f.Close()
+				f = newFile
+			}
+			req.done <- nil
 		case <-w.stopCh:
 			return
 		}
