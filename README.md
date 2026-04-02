@@ -28,43 +28,69 @@ Unlike memory-based message brokers, Keyop Messenger treats the filesystem as th
 go get github.com/keyop/keyop-messenger
 ```
 
-### Basic Usage (Coming Soon)
-
-The library is currently in active development. Below is the intended API for Phase 13+:
+### Basic Usage
 
 ```go
 package main
 
 import (
     "context"
-    "github.com/keyop/keyop-messenger"
+    "log/slog"
+
+    messenger "github.com/keyop/keyop-messenger"
 )
 
-type MyPayload struct {
+type Alert struct {
     Message string `json:"message"`
 }
 
 func main() {
-    ctx := context.Background()
-    
-    // 1. Initialize with config
-    cfg := messenger.DefaultConfig()
-    m, _ := messenger.New(cfg)
+    cfg := &messenger.Config{
+        Name: "my-instance",
+        Storage: messenger.StorageConfig{
+            DataDir: "/var/keyop/my-instance",
+        },
+    }
+    cfg.ApplyDefaults()
+
+    m, err := messenger.New(cfg, messenger.WithLogger(slog.Default()))
+    if err != nil {
+        panic(err)
+    }
     defer m.Close()
 
-    // 2. Register your types
-    m.RegisterPayloadType("com.example.Alert", MyPayload{})
+    // Register payload types for typed decoding.
+    m.RegisterPayloadType("com.example.Alert", Alert{})
 
-    // 3. Subscribe to a channel
+    ctx := context.Background()
+
+    // Subscribe before publishing so the handler sees the message.
     m.Subscribe(ctx, "alerts", "worker-1", func(ctx context.Context, msg messenger.Message) error {
-        payload := msg.Payload.(MyPayload)
-        println("Received:", payload.Message)
+        a := msg.Payload.(Alert)
+        slog.Info("received", "message", a.Message, "origin", msg.Origin)
         return nil
     })
 
-    // 4. Publish a message
-    m.Publish(ctx, "alerts", "com.example.Alert", MyPayload{Message: "System Heat!"})
+    // Publish blocks until the write is confirmed to disk.
+    m.Publish(ctx, "alerts", "com.example.Alert", Alert{Message: "system heat!"})
 }
+```
+
+### Certificate Generation (for Federation)
+
+```bash
+# Install the CLI
+go install github.com/keyop/keyop-messenger/cmd/keyop-messenger@latest
+
+# Generate a CA (once per cluster)
+keyop-messenger keygen ca --out-cert ca.crt --out-key ca.key
+
+# Generate a per-instance certificate
+keyop-messenger keygen instance \
+  --ca ca.crt --ca-key ca.key \
+  --name billing-host \
+  --out-cert billing-host.crt \
+  --out-key  billing-host.key
 ```
 
 ## Architecture
@@ -77,7 +103,8 @@ Keyop Messenger follows a **Hub-and-Spoke** model:
 
 ## Project Status
 
-Keyop Messenger is currently in **Phase 12** of its development plan:
+Keyop Messenger is currently in **Phase 14** of its development plan — the core library and CLI are complete and tested:
+
 - [x] Phase 1: Module Scaffold & Configuration
 - [x] Phase 2: Message Envelope & Payload Registry
 - [x] Phase 3: Durable Writer Goroutine (Atomic Append, Segment Rolling)
@@ -90,9 +117,9 @@ Keyop Messenger is currently in **Phase 12** of its development plan:
 - [x] Phase 10: Federation Wire Framing & Handshake
 - [x] Phase 11: Federation Policy Engine & Hot-Reload
 - [x] Phase 12: Federation Hub, Client & Peer Goroutines
-- [ ] Phase 13: Root Messenger API (Next)
-- [ ] Phase 14: CLI (`keygen` subcommands)
-- [ ] Phase 15: Hardening, Benchmarks & Integration Tests
+- [x] Phase 13: Root Messenger API
+- [x] Phase 14: CLI (`keygen` subcommands)
+- [ ] Phase 15: Hardening, Benchmarks & Integration Tests (Next)
 
 See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 

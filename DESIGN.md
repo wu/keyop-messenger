@@ -126,7 +126,10 @@ Each channel is a directory containing one or more segment files:
       {subscriber-id}.offset
     payments/
       {subscriber-id}.offset
-  audit.jsonl
+  audit/
+    audit.jsonl
+    audit.jsonl.1                  # rotated (most recent)
+    audit.jsonl.2                  # rotated (older)
 ```
 
 Each channel is a directory containing one or more segment files. Segment filenames encode the global byte offset at which that segment begins, zero-padded to 20 digits so lexicographic order equals offset order. The active segment is always the file with the highest start offset; all others are sealed. Dead-letter channels follow the same directory layout as regular channels.
@@ -387,7 +390,7 @@ Channel `.jsonl` files and offset files should be readable only by the user runn
 
 ## 8. Audit Log
 
-All cross-hub message forwarding is recorded in `{data_dir}/audit.jsonl`. Each audit record is a JSON line:
+All cross-hub message forwarding is recorded in `{data_dir}/audit/audit.jsonl`. Each audit record is a JSON line:
 
 ```json
 {
