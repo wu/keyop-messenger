@@ -377,13 +377,21 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	}
 
 	// Start receiver. Also start sender if the peer hub has a forward list.
-	receiver := NewPeerReceiver(conn, policy, h.dedup, h.localWriter,
-		h.auditL, h.log, peerName, h.maxBatchBytes)
-
-	var sender *PeerSender
+	// When both share a conn, route acks via an internal channel so the
+	// PeerReceiver owns all reads and avoids a concurrent-read race.
 	fp := policy.p.Load()
-	if fp != nil && len(fp.Forward) > 0 {
-		sender = NewPeerSender(conn, h.sendBufSize, h.maxBatchBytes, h.log)
+	needSender := fp != nil && len(fp.Forward) > 0
+
+	var receiver *PeerReceiver
+	var sender *PeerSender
+	if needSender {
+		ackCh := make(chan AckMsg, 4)
+		receiver = newPeerReceiverWithAck(conn, policy, h.dedup, h.localWriter,
+			h.auditL, h.log, peerName, h.maxBatchBytes, ackCh)
+		sender = newPeerSenderWithAck(conn, h.sendBufSize, h.maxBatchBytes, h.log, ackCh)
+	} else {
+		receiver = NewPeerReceiver(conn, policy, h.dedup, h.localWriter,
+			h.auditL, h.log, peerName, h.maxBatchBytes)
 	}
 
 	entry := &peerEntry{

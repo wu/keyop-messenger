@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -267,6 +268,23 @@ func (c *Config) ApplyDefaults() {
 	if c.Audit.MaxFiles == 0 {
 		c.Audit.MaxFiles = 10
 	}
+}
+
+// EnsureDirectories creates the directory layout required by a Messenger under
+// cfg.Storage.DataDir. It is called automatically by New; callers rarely need
+// it directly.
+func EnsureDirectories(cfg *Config) error {
+	dirs := []string{
+		filepath.Join(cfg.Storage.DataDir, "channels"),
+		filepath.Join(cfg.Storage.DataDir, "subscribers"),
+		filepath.Join(cfg.Storage.DataDir, "audit"),
+	}
+	for _, d := range dirs {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return fmt.Errorf("create directory %q: %w", d, err)
+		}
+	}
+	return nil
 }
 
 // Validate returns an error describing all configuration problems found.

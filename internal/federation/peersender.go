@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"errors"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -15,6 +16,11 @@ type PeerSender struct {
 	conn          *websocket.Conn
 	maxBatchBytes int
 	log           logger
+
+	// ackCh is non-nil when a PeerReceiver owns all reads on the same conn.
+	// receiveAck() reads from this channel instead of the connection directly,
+	// avoiding a concurrent-read race.
+	ackCh <-chan AckMsg
 
 	buf  chan *envelope.Envelope // bounded outbound buffer
 	stop chan struct{}
@@ -38,6 +44,36 @@ func NewPeerSender(conn *websocket.Conn, bufSize, maxBatchBytes int, log logger)
 	}
 	go ps.run()
 	return ps
+}
+
+// newPeerSenderWithAck creates a PeerSender that reads acks from ackCh instead
+// of the connection directly. Use this when a PeerReceiver also reads from conn
+// to avoid concurrent reads violating gorilla/websocket's single-reader rule.
+func newPeerSenderWithAck(conn *websocket.Conn, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
+	ps := &PeerSender{
+		conn:          conn,
+		maxBatchBytes: maxBatchBytes,
+		log:           log,
+		ackCh:         ackCh,
+		buf:           make(chan *envelope.Envelope, bufSize),
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
+	}
+	go ps.run()
+	return ps
+}
+
+// receiveAck reads the next ack from the shared ackCh (if set) or directly
+// from the connection.
+func (ps *PeerSender) receiveAck() (AckMsg, error) {
+	if ps.ackCh != nil {
+		ack, ok := <-ps.ackCh
+		if !ok {
+			return AckMsg{}, errors.New("federation: ack channel closed (connection lost)")
+		}
+		return ack, nil
+	}
+	return ReceiveAck(ps.conn)
 }
 
 // Enqueue adds env to the outbound buffer. Returns false (and logs a warning)
@@ -148,7 +184,7 @@ func (ps *PeerSender) run() {
 		ps.mu.Unlock()
 
 		// Block until ack arrives from the remote receiver.
-		ack, err := ReceiveAck(ps.conn)
+		ack, err := ps.receiveAck()
 		if err != nil {
 			ps.log.Error("federation: sender receive ack", "err", err)
 			return

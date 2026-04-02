@@ -103,12 +103,17 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 		return nil, fmt.Errorf("federation: client receive handshake: %w", err)
 	}
 
-	sender := NewPeerSender(conn, c.sendBufSize, c.maxBatchBytes, c.log)
-
-	// Optional receiver: if the hub will push messages to this client.
+	// When the hub pushes messages back to this client both a PeerSender and a
+	// PeerReceiver share the same conn. Route acks through an internal channel
+	// so the PeerReceiver owns all reads and avoids a concurrent-read race.
+	var sender *PeerSender
 	if c.localWriter != nil {
-		NewPeerReceiver(conn, c.policy, c.dedup, c.localWriter,
-			c.auditL, c.log, hubAddr, c.maxBatchBytes)
+		ackCh := make(chan AckMsg, 4)
+		newPeerReceiverWithAck(conn, c.policy, c.dedup, c.localWriter,
+			c.auditL, c.log, hubAddr, c.maxBatchBytes, ackCh)
+		sender = newPeerSenderWithAck(conn, c.sendBufSize, c.maxBatchBytes, c.log, ackCh)
+	} else {
+		sender = NewPeerSender(conn, c.sendBufSize, c.maxBatchBytes, c.log)
 	}
 
 	c.mu.Lock()

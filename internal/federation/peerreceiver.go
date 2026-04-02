@@ -1,6 +1,9 @@
 package federation
 
 import (
+	"encoding/json"
+	"io"
+
 	"github.com/gorilla/websocket"
 	"github.com/keyop/keyop-messenger/internal/audit"
 	"github.com/keyop/keyop-messenger/internal/envelope"
@@ -16,6 +19,10 @@ type Deduplicator interface {
 // receive policy, and hands each accepted envelope to localWriter. After each
 // batch it sends a text-frame ack. Blocking in localWriter propagates TCP
 // backpressure to the sender — this is intentional.
+//
+// When ackRouteCh is non-nil this receiver owns ALL reads on the connection;
+// text-frame acks destined for a co-located PeerSender are forwarded to
+// ackRouteCh. ackRouteCh is closed when the receiver exits.
 type PeerReceiver struct {
 	conn          *websocket.Conn
 	policy        *AtomicPolicy // may be nil (accept everything)
@@ -25,6 +32,7 @@ type PeerReceiver struct {
 	log           logger
 	peerName      string
 	maxBatchBytes int
+	ackRouteCh    chan<- AckMsg // non-nil when sharing conn with a PeerSender
 
 	stop chan struct{}
 	done chan struct{}
@@ -57,6 +65,38 @@ func NewPeerReceiver(
 	return pr
 }
 
+// newPeerReceiverWithAck creates a PeerReceiver that owns all reads on conn and
+// routes text-frame acks to ackRouteCh. Use this when a PeerSender also uses
+// the same conn to avoid concurrent reads. ackRouteCh is closed when the
+// receiver goroutine exits, which will unblock the paired PeerSender.
+func newPeerReceiverWithAck(
+	conn *websocket.Conn,
+	policy *AtomicPolicy,
+	dedup Deduplicator,
+	localWriter func(*envelope.Envelope) error,
+	auditL audit.AuditLogger,
+	log logger,
+	peerName string,
+	maxBatchBytes int,
+	ackRouteCh chan<- AckMsg,
+) *PeerReceiver {
+	pr := &PeerReceiver{
+		conn:          conn,
+		policy:        policy,
+		dedup:         dedup,
+		localWriter:   localWriter,
+		auditL:        auditL,
+		log:           log,
+		peerName:      peerName,
+		maxBatchBytes: maxBatchBytes,
+		ackRouteCh:    ackRouteCh,
+		stop:          make(chan struct{}),
+		done:          make(chan struct{}),
+	}
+	go pr.run()
+	return pr
+}
+
 // Done returns a channel closed when the receiver goroutine exits.
 func (pr *PeerReceiver) Done() <-chan struct{} { return pr.done }
 
@@ -73,6 +113,9 @@ func (pr *PeerReceiver) Close() {
 
 func (pr *PeerReceiver) run() {
 	defer close(pr.done)
+	if pr.ackRouteCh != nil {
+		defer close(pr.ackRouteCh)
+	}
 
 	for {
 		msgType, r, err := pr.conn.NextReader()
@@ -85,7 +128,23 @@ func (pr *PeerReceiver) run() {
 			return
 		}
 		if msgType != websocket.BinaryMessage {
-			pr.log.Warn("federation: receiver unexpected frame type", "type", msgType)
+			// When sharing a conn with a PeerSender, text frames are acks
+			// destined for that sender — route them via ackRouteCh.
+			if pr.ackRouteCh != nil && msgType == websocket.TextMessage {
+				data, readErr := io.ReadAll(r)
+				if readErr == nil {
+					var ack AckMsg
+					if jsonErr := json.Unmarshal(data, &ack); jsonErr == nil {
+						select {
+						case pr.ackRouteCh <- ack:
+						case <-pr.stop:
+							return
+						}
+					}
+				}
+			} else {
+				pr.log.Warn("federation: receiver unexpected frame type", "type", msgType)
+			}
 			continue
 		}
 
