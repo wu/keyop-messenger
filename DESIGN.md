@@ -420,6 +420,15 @@ The audit log is rotated automatically by the library. When `audit.jsonl` reache
 
 Rotation is performed by the audit writer goroutine under a brief pause. No audit records are lost during rotation.
 
+### 8.2 Backpressure and Drop Behavior
+
+The audit writer uses an internal channel (capacity 1,000) to decouple callers from disk I/O. If the channel is full, the event is dropped rather than blocking the caller — audit logging must never impede message delivery.
+
+Drops are surfaced via two mechanisms:
+
+1. **Immediate:** a message is written to `stderr` for each dropped event.
+2. **Periodic (structured):** the audit writer goroutine tracks a running drop counter atomically. Every 5 seconds, if the counter is non-zero, it is swapped to zero and a `WARN`-level entry is emitted through the injected `Logger` interface (which feeds into the operator's log aggregation pipeline) with the count of drops since the last report. Any remaining drops are also reported on `Close()`.
+
 ---
 
 ## 9. Performance Design

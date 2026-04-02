@@ -77,7 +77,7 @@ Keyop Messenger follows a **Hub-and-Spoke** model:
 
 ## Project Status
 
-Keyop Messenger is currently in **Phase 8** of its development plan:
+Keyop Messenger is currently in **Phase 12** of its development plan:
 - [x] Phase 1: Module Scaffold & Configuration
 - [x] Phase 2: Message Envelope & Payload Registry
 - [x] Phase 3: Durable Writer Goroutine (Atomic Append, Segment Rolling)
@@ -85,9 +85,14 @@ Keyop Messenger is currently in **Phase 8** of its development plan:
 - [x] Phase 5: Subscriber Engine & Dead-Letter Queues
 - [x] Phase 6: Storage Compaction (Segment Deletion)
 - [x] Phase 7: Deduplication (LRU Seen-ID Set)
-- [ ] Phase 8: Audit Log (Next)
-- [ ] Phase 9-11: TLS Utilities, Wire Protocol, Policy Engine
-- [ ] Phase 12-15: Federation, Root API, CLI, and Integration
+- [x] Phase 8: Audit Log
+- [x] Phase 9: TLS Utilities & Certificate Generation
+- [x] Phase 10: Federation Wire Framing & Handshake
+- [x] Phase 11: Federation Policy Engine & Hot-Reload
+- [ ] Phase 12: Federation Hub, Client & Peer Goroutines (Next)
+- [ ] Phase 13: Root Messenger API
+- [ ] Phase 14: CLI (`keygen` subcommands)
+- [ ] Phase 15: Hardening, Benchmarks & Integration Tests
 
 See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 
