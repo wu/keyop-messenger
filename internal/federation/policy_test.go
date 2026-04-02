@@ -35,8 +35,10 @@ func TestAllowReceiveExactMatch(t *testing.T) {
 
 func TestAllowForwardEmptyList(t *testing.T) {
 	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{})
+	// Forward: empty list means "don't forward to anyone".
 	assert.False(t, ap.AllowForward("anything"))
-	assert.False(t, ap.AllowReceive("anything"))
+	// Receive: empty list means "accept from anyone" (no allowlist = unrestricted).
+	assert.True(t, ap.AllowReceive("anything"))
 }
 
 func TestAtomicPolicySwapRace(t *testing.T) {

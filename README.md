@@ -89,8 +89,8 @@ Keyop Messenger is currently in **Phase 12** of its development plan:
 - [x] Phase 9: TLS Utilities & Certificate Generation
 - [x] Phase 10: Federation Wire Framing & Handshake
 - [x] Phase 11: Federation Policy Engine & Hot-Reload
-- [ ] Phase 12: Federation Hub, Client & Peer Goroutines (Next)
-- [ ] Phase 13: Root Messenger API
+- [x] Phase 12: Federation Hub, Client & Peer Goroutines
+- [ ] Phase 13: Root Messenger API (Next)
 - [ ] Phase 14: CLI (`keygen` subcommands)
 - [ ] Phase 15: Hardening, Benchmarks & Integration Tests
 

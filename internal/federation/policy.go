@@ -46,11 +46,11 @@ func (a *AtomicPolicy) AllowForward(channel string) bool {
 }
 
 // AllowReceive reports whether channel is in the Receive allowlist.
-// Returns false for an empty or nil list.
+// An empty or nil list means "accept all channels" (returns true).
 func (a *AtomicPolicy) AllowReceive(channel string) bool {
 	fp := a.p.Load()
-	if fp == nil {
-		return false
+	if fp == nil || len(fp.Receive) == 0 {
+		return true
 	}
 	for _, ch := range fp.Receive {
 		if ch == channel {

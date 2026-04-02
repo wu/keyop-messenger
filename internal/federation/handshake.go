@@ -11,8 +11,9 @@ import (
 // by both hub peers and clients.
 type HandshakeMsg struct {
 	InstanceName string `json:"instance_name"`
-	Role         string `json:"role"`    // "hub" or "client"
-	Version      string `json:"version"` // wire protocol version, currently "1"
+	Role         string `json:"role"`              // "hub" or "client"
+	Version      string `json:"version"`           // wire protocol version, currently "1"
+	LastID       string `json:"last_id,omitempty"` // last acked ID; non-empty on reconnect
 }
 
 // AckMsg is sent by the receiver after processing a batch of data frames.

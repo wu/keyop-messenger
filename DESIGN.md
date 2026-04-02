@@ -40,10 +40,10 @@ Clients connect only to hubs. Hubs connect to peer hubs. Clients never connect d
 ```
 Private Network                        External Network
 ────────────────                       ────────────────
-Instance A ─┐                          Instance D ─┐
+Instance A ─┐                         Instance D ─┐
 Instance B ─┼──→ Hub 1 ──(selected)──→ Hub 2 ←────┤ Instance E
-Instance C ─┘    channels only         └──(selected)──→ Instance F
-                                           channels only
+Instance C ─┘          channels only              └──(selected)──→ Instance F
+                                                   channels only
 ```
 
 A single instance may simultaneously accept client connections (hub role) and dial outbound to peer hubs (client role). In this case it acts as a relay between its local clients and the wider federation.
@@ -294,6 +294,8 @@ The peer hub is identified by the hostname in `addr`. The hub verifies that the 
 **Forward policy (outbound):** When a message arrives on a channel in `forward`, the hub enqueues it for transmission to the peer hub. Messages on channels not in `forward` are never sent to that peer.
 
 **Receive policy (inbound):** When a message arrives from a peer hub, the hub checks `receive`. If the channel is not in `receive`, the message is discarded and recorded in the audit log as a policy violation. This is defense-in-depth — it protects against peer misconfiguration.
+
+An **empty `receive` list** means "accept all channels" — no inbound filter is applied. This is the default for regular client connections (non-peer-hub), which always have an empty receive policy and therefore accept any channel from the client. A non-empty `receive` list acts as an explicit allowlist; all other channels are rejected.
 
 Forwarding is independent of whether any local subscriber currently exists for the channel. Messages are written to the local `.jsonl` file regardless of local subscriber presence.
 
