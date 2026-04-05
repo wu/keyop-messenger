@@ -48,6 +48,14 @@ type StorageConfig struct {
 	// CompactionThresholdMB triggers file rotation when the consumed (already-read-by-all-
 	// subscribers) portion of a channel file exceeds this size. Default: 256.
 	CompactionThresholdMB int `yaml:"compaction_threshold_mb"`
+
+	// OffsetFlushIntervalMS is the minimum time between subscriber offset file
+	// flushes (fsync + atomic rename). 0 flushes after every delivered message,
+	// which is the strictest at-least-once guarantee but slowest on high-latency
+	// storage. Values > 0 batch flushes for higher throughput; on a crash the
+	// subscriber may replay up to this many milliseconds of already-delivered
+	// messages. Default: 0 (flush every message).
+	OffsetFlushIntervalMS int `yaml:"offset_flush_interval_ms"`
 }
 
 // SubscribersConfig controls subscriber delivery behaviour.

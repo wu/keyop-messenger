@@ -10,7 +10,7 @@ Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is 
 - **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
 - **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
 - **Reliable Retries & DLQ**: Configurable retry logic with automatic routing to `.dead-letter` channels.
-- **Secure Federation**: Designed for star-topology federation using mTLS over WebSockets (Phase 12+).
+- **Secure Federation**: Star-topology federation over mTLS WebSockets; hubs forward select channels to peer hubs under explicit, hot-reloadable policy.
 - **Observability**: File-based offsets and JSONL records allow operators to use standard Unix tools (`cat`, `grep`, `tail`) for debugging.
 
 ## Why Keyop Messenger?
@@ -101,9 +101,28 @@ Keyop Messenger follows a **Hub-and-Spoke** model:
 - **Channels**: Each channel is a directory of append-only `.jsonl` segment files. Once all subscribers consume a segment it is deleted — no copying, no writer pauses.
 - **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position across all segments.
 
+## Development Commands
+
+```bash
+make test               # unit tests with race detector
+make test-integration   # integration tests (build tag: integration)
+make bench              # benchmarks
+make lint               # golangci-lint
+make build              # verify compilation
+```
+
+Or directly:
+
+```bash
+go test -race ./...
+go test -race -tags integration -timeout 60s ./...
+go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
+golangci-lint run ./...
+```
+
 ## Project Status
 
-Keyop Messenger is currently in **Phase 14** of its development plan — the core library and CLI are complete and tested:
+All 15 phases are complete. The library is feature-complete and integration-tested.
 
 - [x] Phase 1: Module Scaffold & Configuration
 - [x] Phase 2: Message Envelope & Payload Registry
@@ -119,7 +138,7 @@ Keyop Messenger is currently in **Phase 14** of its development plan — the cor
 - [x] Phase 12: Federation Hub, Client & Peer Goroutines
 - [x] Phase 13: Root Messenger API
 - [x] Phase 14: CLI (`keygen` subcommands)
-- [ ] Phase 15: Hardening, Benchmarks & Integration Tests (Next)
+- [x] Phase 15: Hardening, Benchmarks & Integration Tests
 
 See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 

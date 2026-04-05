@@ -363,6 +363,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		*m.cfg.Subscribers.MaxRetries,
 		dlState.writer,
 		m.log,
+		time.Duration(m.cfg.Storage.OffsetFlushIntervalMS)*time.Millisecond,
 	)
 	if err != nil {
 		cancel()

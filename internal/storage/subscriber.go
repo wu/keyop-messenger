@@ -44,7 +44,15 @@ type Subscriber struct {
 	log        logger
 
 	mu     sync.Mutex
-	offset int64
+	offset int64 // in-memory cursor; may be ahead of flushedOffset
+
+	// flushInterval is the minimum time between offset file flushes.
+	// 0 flushes after every message (strictest at-least-once).
+	flushInterval time.Duration
+	// flushedOffset and lastFlush track what has actually been written to disk.
+	// Both are only accessed from the subscriber goroutine — no mutex needed.
+	flushedOffset int64
+	lastFlush     time.Time
 
 	stopCh    chan struct{}
 	doneCh    chan struct{}
@@ -73,6 +81,7 @@ func NewSubscriber(
 	maxRetries int,
 	dlWriter ChannelWriter,
 	log logger,
+	flushInterval time.Duration,
 ) (*Subscriber, error) {
 	if log == nil {
 		log = nopLogger{}
@@ -113,6 +122,9 @@ func NewSubscriber(
 		dlWriter:      dlWriter,
 		log:           log,
 		offset:        offset,
+		flushInterval: flushInterval,
+		flushedOffset: offset,
+		lastFlush:     time.Now(),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
 		retryDelay:    defaultRetryDelay,
@@ -135,6 +147,9 @@ func (s *Subscriber) Stop() {
 
 func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	defer close(s.doneCh)
+	// On clean shutdown flush any in-memory offset that hasn't reached disk yet,
+	// so a restart doesn't needlessly replay already-delivered messages.
+	defer s.flushOnStop()
 	s.processAvailable(handler)
 	for {
 		select {
@@ -143,6 +158,17 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 		case <-s.stopCh:
 			return
 		}
+	}
+}
+
+// flushOnStop writes the in-memory offset to disk if it is ahead of the last
+// flushed value. Called once from the subscriber goroutine as it exits.
+func (s *Subscriber) flushOnStop() {
+	s.mu.Lock()
+	offset := s.offset
+	s.mu.Unlock()
+	if offset != s.flushedOffset {
+		s.flushToDisk(offset)
 	}
 }
 
@@ -171,6 +197,8 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 			return
 		}
 		s.consecutiveOffsetErrs = 0
+		s.flushedOffset = offset
+		s.lastFlush = time.Now()
 	}
 
 	const maxLineSize = 10 * 1024 * 1024 // 10 MiB per line
@@ -301,10 +329,24 @@ func (s *Subscriber) sendToDeadLetter(orig *envelope.Envelope, lastErr error) {
 // after which delivery is paused.
 const maxConsecutiveOffsetErrs = 3
 
-// advanceOffset persists newOffset to disk and updates the in-memory value.
-// On failure the in-memory offset is left unchanged (conservative: message
-// will be re-delivered on restart).
+// advanceOffset updates the in-memory offset and flushes to disk either
+// immediately (flushInterval == 0) or when the flush interval has elapsed.
+// The in-memory offset is always updated so the subscriber cursor advances
+// even when the disk flush is deferred.
 func (s *Subscriber) advanceOffset(newOffset int64) {
+	s.mu.Lock()
+	s.offset = newOffset
+	s.mu.Unlock()
+
+	if s.flushInterval > 0 && time.Since(s.lastFlush) < s.flushInterval {
+		return // defer flush; will be written on the next interval or on stop
+	}
+	s.flushToDisk(newOffset)
+}
+
+// flushToDisk writes newOffset to the offset file. Only called from the
+// subscriber goroutine.
+func (s *Subscriber) flushToDisk(newOffset int64) {
 	if err := s.writeOffsetFn(s.offsetPath, newOffset); err != nil {
 		s.consecutiveOffsetErrs++
 		s.log.Error("persist offset",
@@ -312,7 +354,6 @@ func (s *Subscriber) advanceOffset(newOffset int64) {
 		return
 	}
 	s.consecutiveOffsetErrs = 0
-	s.mu.Lock()
-	s.offset = newOffset
-	s.mu.Unlock()
+	s.flushedOffset = newOffset
+	s.lastFlush = time.Now()
 }

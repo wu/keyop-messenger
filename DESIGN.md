@@ -317,15 +317,24 @@ Policy reload does not restart the hub, drop existing connections mid-message, o
 
 Every instance (hub and client alike) maintains an in-memory LRU set of recently-seen message IDs. The set holds the last 100,000 IDs (configurable). TTL-based expiry is not used; the LRU eviction bound is sufficient for the expected message rates.
 
-On receiving a message (from any source — local publish, peer hub, or reconnect replay):
+On receiving a message via federation (PeerReceiver):
 
 1. Check the seen-ID set.
 2. If present: discard silently.
-3. If absent: add to set, write to local file, notify local subscribers, forward to eligible peer hubs.
+3. If absent: add to set, write to local file, notify local subscribers.
 
-This handles:
-- A client connected to multiple hubs receiving the same message twice
-- Hub ring topologies (Hub 1 → Hub 2 → Hub 1)
+On `Publish()` (local origin):
+
+1. Add the message ID to the seen-ID set before writing to disk.
+2. If the message later arrives back via a federation path (e.g., because a peer hub reflects it), step 2 above catches it.
+
+The dedup set is shared across all PeerReceivers on the same Messenger instance. This ensures that if the same envelope arrives via two simultaneous incoming connections (dual-path forwarding), only the first arrival triggers a local write.
+
+**Note on ring topologies:** Received federated messages are written to local storage by `writeLocalEnvelope` but are not automatically re-enqueued for outbound forwarding. This means Hub1 → Hub2 → Hub1 loops cannot form with the current implementation. The dedup is in place as a defence-in-depth measure: if forwarding semantics change in the future such that received messages can be re-sent, the LRU set will prevent delivery loops and duplicate local writes.
+
+Practical scenarios the dedup handles today:
+- Two client connections from the same publisher both deliver the same envelope to a hub (dual-path test)
+- A publisher's own message arrives back via a federated receive path (self-loop prevention)
 - Reconnect replay delivering messages already written in a previous session
 
 ### 6.8 Reconnection and Replay
@@ -378,9 +387,11 @@ Generated certs have a configurable validity period (default: 2 years). The mess
 
 ### 7.3 Certificate Rotation
 
-Instances reload their own cert and key from disk when the files change (watched via `fsnotify`). The new cert is applied to the TLS config for new connections only. Existing connections are not renegotiated. The CA cert is reloaded the same way.
+To rotate a certificate, replace the cert and key files on disk and restart the instance. The new cert is loaded at startup; existing long-lived connections from before the restart are replaced by fresh connections that use the new cert.
 
-Revoking an instance: remove it from all hub allowlists (takes effect on next reload for new connections; existing connections drain before closing).
+Revoking an instance: remove it from all hub allowlists (takes effect on next policy reload for new connections; existing connections drain before closing).
+
+**Note:** Automatic hot-reload of TLS certificates (without restart) is not currently implemented. The library validates certificate expiry at startup and logs a warning when a cert is within `tls.expiry_warn_days` of expiry.
 
 ### 7.4 Local File Security
 
@@ -475,10 +486,10 @@ Subscribers within the same process use an internal notification channel bypassi
 
 ### 9.3 Serialization
 
-JSON is used throughout for debuggability. To minimize allocation:
-- The envelope is pre-marshaled by the publisher using `encoding/json` with a preallocated buffer from `sync.Pool`.
-- Subscriber reads use a streaming decoder that reuses its internal buffer.
-- Payload type registration uses pre-generated codec functions where possible (e.g., via `easyjson` or `json-iterator`).
+JSON is used throughout for debuggability. The standard library `encoding/json` is the only serialization dependency. To minimise allocation:
+- The envelope is marshaled by the publisher with a preallocated byte-slice buffer.
+- Subscriber reads use `bufio.Scanner` which reuses its internal buffer across lines.
+- The payload registry stores a prototype value per type string; `json.Unmarshal` decodes into a fresh copy of that prototype on each message delivery.
 
 The wire format between hubs uses the same JSON envelope, length-prefixed within a binary WebSocket frame.
 

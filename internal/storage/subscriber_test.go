@@ -95,7 +95,7 @@ func newTestSub(
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
-	sub, err := NewSubscriber(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log)
+	sub, err := NewSubscriber(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 	return sub, notifyC, dlWriter
@@ -247,7 +247,7 @@ func TestSubscriber_PanicRecovery(t *testing.T) {
 	// Use a LocalNotifier so we can push a notification after writing the second message.
 	notifier := NewLocalNotifier()
 	dlWriter := &testutil.FakeChannelWriter{}
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, &testutil.FakeLogger{})
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -282,7 +282,7 @@ func TestSubscriber_DeadLetterChannel_NoRecursion(t *testing.T) {
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
 	require.NoError(t, err)
 
 	writeTestEnvelope(t, channelDir, makeEnv(t, "orders.dead-letter", map[string]string{"k": "v"}))
@@ -367,7 +367,7 @@ func TestSubscriber_RetryBackoff(t *testing.T) {
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, &testutil.FakeLogger{})
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 
 	const minDelay = 20 * time.Millisecond
@@ -406,7 +406,7 @@ func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 

@@ -1,0 +1,58 @@
+run:
+  timeout: 5m
+  go: "1.22"
+
+linters:
+  disable-all: true
+  enable:
+    - revive
+    - govet
+    - staticcheck
+    - gosec
+    - errcheck
+    - exhaustive
+
+linters-settings:
+  revive:
+    rules:
+      - name: exported
+      - name: unexported-return
+      - name: var-naming
+      - name: indent-error-flow
+      - name: empty-block
+      - name: superfluous-else
+
+  govet:
+    enable-all: true
+    disable:
+      - shadow  # too noisy in test files
+
+  staticcheck:
+    checks: ["all"]
+
+  gosec:
+    excludes:
+      - G115  # integer overflow conversion — common in test helpers
+
+  errcheck:
+    check-type-assertions: false
+    check-blank: false
+
+  exhaustive:
+    default-signifies-exhaustive: true
+
+issues:
+  exclude-rules:
+    # Test files get relaxed rules.
+    - path: "_test\\.go$"
+      linters:
+        - gosec
+        - errcheck
+        - exhaustive
+    # Generated or vendored code.
+    - path: "vendor/"
+      linters:
+        - all
+  # Show all issues, not just the first few per linter.
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -1,4 +1,4 @@
-.PHONY: all build test clean lint help
+.PHONY: all build test test-integration test-fast test-coverage bench lint clean help
 
 # Default target
 all: test build
@@ -12,6 +12,10 @@ build:
 test:
 	go test -race -v ./...
 
+# Run integration tests (requires build tag)
+test-integration:
+	go test -race -v -tags integration -timeout 60s ./...
+
 # Run tests without race detection (faster)
 test-fast:
 	go test -v ./...
@@ -20,6 +24,10 @@ test-fast:
 test-coverage:
 	go test -race -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out
+
+# Run benchmarks
+bench:
+	go test -run='^$$' -bench=. -benchmem -benchtime=3s ./...
 
 # Lint the project
 # This assumes golangci-lint is installed.
@@ -34,11 +42,13 @@ clean:
 # Display help information
 help:
 	@echo "Available targets:"
-	@echo "  all           - Run tests and build (default)"
-	@echo "  build         - Verify compilation of all packages"
-	@echo "  test          - Run all tests with race detection"
-	@echo "  test-fast     - Run all tests without race detection"
-	@echo "  test-coverage - Run all tests and show coverage"
-	@echo "  lint          - Run golangci-lint"
-	@echo "  clean         - Clean build artifacts and coverage files"
-	@echo "  help          - Show this help message"
+	@echo "  all              - Run tests and build (default)"
+	@echo "  build            - Verify compilation of all packages"
+	@echo "  test             - Run all unit tests with race detection"
+	@echo "  test-integration - Run integration tests (build tag: integration)"
+	@echo "  test-fast        - Run all tests without race detection"
+	@echo "  test-coverage    - Run all tests and show coverage"
+	@echo "  bench            - Run benchmarks"
+	@echo "  lint             - Run golangci-lint"
+	@echo "  clean            - Clean build artifacts and coverage files"
+	@echo "  help             - Show this help message"

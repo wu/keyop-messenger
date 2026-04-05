@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phases 1–14 complete. Phase 15 (hardening, benchmarks, integration tests) is next.
+Phases 1–15 complete.
 See `DESIGN.md` for the full architecture and `IMPLEMENTATION.md` for the phase plan.
 
 ## Build / Test / Install Commands
@@ -12,10 +12,30 @@ See `DESIGN.md` for the full architecture and `IMPLEMENTATION.md` for the phase 
 ```bash
 go test -race ./...                                              # run all unit tests
 go test -race -v ./...                                          # verbose
+go test -race -tags integration -timeout 60s ./...              # run integration tests
+go test -run='^$' -bench=. -benchmem -benchtime=3s ./...        # run benchmarks
 go build ./...                                                  # build library + CLI
 go install ./cmd/keyop-messenger                                # install CLI binary
 go mod tidy                                                     # sync dependencies
+golangci-lint run ./...                                         # lint (requires golangci-lint)
 ```
+
+Or via `make`:
+
+```bash
+make test               # unit tests with race detector
+make test-integration   # integration tests (build tag: integration)
+make bench              # benchmarks
+make lint               # golangci-lint
+make build              # verify compilation
+```
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `KEYOP_MESSENGER_DATA_DIR` | Override the data directory at runtime (alternative to config file) |
+| `KEYOP_MESSENGER_CONFIG` | Path to a YAML config file (overrides built-in defaults) |
 
 ## Architecture Summary
 

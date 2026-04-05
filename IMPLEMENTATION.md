@@ -93,7 +93,7 @@ Everything under `internal/` is unexported to callers of the library. The root p
 | `github.com/fsnotify/fsnotify` v1.7.x | File change notification | Standard Go file-watch library; cross-platform (inotify/kqueue/FSEvents) |
 | `github.com/google/uuid` v1.6.x | UUID v4 generation | Zero external C dependencies; correct random-based UUID generation |
 | `gopkg.in/yaml.v3` v3.0.x | Config file parsing | Supports struct tags; round-trips cleanly |
-| `encoding/json` (stdlib) | Envelope and audit serialization | Sufficient for correctness; `sync.Pool`-backed buffers handle allocation. `easyjson` or `json-iterator` can be added as an optimization pass once the API is stable |
+| `encoding/json` (stdlib) | Envelope and audit serialization | Sufficient for correctness; `sync.Pool`-backed buffers handle allocation. No additional JSON library was added — the stdlib overhead is acceptable given the file-I/O-bound write path. |
 | `github.com/hashicorp/golang-lru/v2` v2.0.x | LRU seen-ID set | Typed, fixed-capacity LRU with atomic `ContainsOrAdd`; well-maintained |
 | `github.com/spf13/cobra` v1.10.x | CLI framework | Standard for multi-command CLIs in Go |
 | `github.com/stretchr/testify` v1.11.x | Test assertions | `require` + `assert` reduce test boilerplate significantly |
@@ -463,14 +463,14 @@ type PeerSender interface {
 
 ---
 
-### Phase 15 — Hardening, Benchmarks, and Integration Tests
+### Phase 15 — Hardening, Benchmarks, and Integration Tests ✓
 
 **Depends on:** Phases 13, 14
 
 **Deliverables:**
 
 - `messenger_bench_test.go`: benchmark `Publish` throughput (single channel, no federation), `Subscribe` read latency (time from `Publish` return to handler invocation), federation round-trip latency.
-- `integration_test.go` (build tag `//go:build integration`): hub + 2 clients; hub ring dedup (Hub1→Hub2→Hub1); policy hot-reload mid-stream; disk-full backpressure; compaction during active subscribers.
+- `integration_test.go` (build tag `//go:build integration`): hub + 2 clients; dedup via dual-path forwarding; policy hot-reload mid-stream; disk-full backpressure; compaction during active subscribers.
 - `Makefile`: targets `build`, `test`, `test-integration`, `bench`, `lint`.
 - `.golangci.yml`: enable `revive`, `govet`, `staticcheck`, `gosec`, `errcheck`, `exhaustive`.
 - `CLAUDE.md` update: build/run/test commands, architecture overview, environment variables (`KEYOP_MESSENGER_DATA_DIR`, `KEYOP_MESSENGER_CONFIG`).
@@ -478,9 +478,14 @@ type PeerSender interface {
 **Test strategy:**
 
 - All unit tests pass: `go test -race ./...`
-- Integration tests pass: `go test -race -tags integration ./...`
-- Benchmarks run without failure: `go test -bench=. -benchtime=5s`
+- Integration tests pass: `go test -race -tags integration -timeout 60s ./...`
+- Benchmarks run without failure: `go test -run='^$' -bench=. -benchmem -benchtime=3s ./...`
 - `golangci-lint run` and `go vet ./...` produce zero warnings.
+
+**Implementation notes:**
+
+- The dedup integration test (`TestIntegrationRingDedup`) uses a dual-client topology rather than a Hub1→Hub2→Hub1 ring, because `writeLocalEnvelope` does not re-enqueue received messages for outbound forwarding. Two `ClientHubRef` entries with the same address create two simultaneous connections from one Messenger to another; both enqueue the same envelope, and the shared dedup LRU on the receiving hub accepts only the first.
+- JSON numbers in `map[string]any` payloads are decoded as `float64` by the standard library, not `int`. Tests that assert on specific integer payload values must cast via `float64`.
 
 ---
 
