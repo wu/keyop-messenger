@@ -1,4 +1,4 @@
-module github.com/keyop/keyop-messenger
+module github.com/wu/keyop-messenger
 
 go 1.22
 

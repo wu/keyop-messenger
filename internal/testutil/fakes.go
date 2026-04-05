@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/keyop/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // FakeLogger records log calls for assertion in tests.

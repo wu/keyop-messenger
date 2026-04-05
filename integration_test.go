@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/keyop/keyop-messenger/internal/federation"
-	"github.com/keyop/keyop-messenger/internal/tlsutil"
+	"github.com/wu/keyop-messenger/internal/federation"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"

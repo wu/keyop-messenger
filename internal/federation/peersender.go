@@ -5,7 +5,7 @@ import (
 	"sync"
 
 	"github.com/gorilla/websocket"
-	"github.com/keyop/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // PeerSender manages outbound delivery to one peer over a WebSocket connection.

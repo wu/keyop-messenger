@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/keyop/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // SyncPolicy controls when channel file writes are flushed to stable storage.

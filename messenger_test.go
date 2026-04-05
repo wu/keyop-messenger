@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/keyop/keyop-messenger/internal/tlsutil"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

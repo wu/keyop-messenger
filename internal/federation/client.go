@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/keyop/keyop-messenger/internal/audit"
-	"github.com/keyop/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/audit"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // Client dials a hub, runs a PeerSender for outbound messages, and reconnects

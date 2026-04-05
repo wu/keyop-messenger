@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/keyop/keyop-messenger/internal/audit"
-	"github.com/keyop/keyop-messenger/internal/dedup"
-	"github.com/keyop/keyop-messenger/internal/envelope"
-	"github.com/keyop/keyop-messenger/internal/federation"
-	"github.com/keyop/keyop-messenger/internal/registry"
-	"github.com/keyop/keyop-messenger/internal/storage"
-	"github.com/keyop/keyop-messenger/internal/tlsutil"
+	"github.com/wu/keyop-messenger/internal/audit"
+	"github.com/wu/keyop-messenger/internal/dedup"
+	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/federation"
+	"github.com/wu/keyop-messenger/internal/registry"
+	"github.com/wu/keyop-messenger/internal/storage"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
 // ----- Public errors ---------------------------------------------------------

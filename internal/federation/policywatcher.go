@@ -6,7 +6,7 @@ import (
 	"sync"
 
 	"github.com/fsnotify/fsnotify"
-	"github.com/keyop/keyop-messenger/internal/audit"
+	"github.com/wu/keyop-messenger/internal/audit"
 	"gopkg.in/yaml.v3"
 )
 

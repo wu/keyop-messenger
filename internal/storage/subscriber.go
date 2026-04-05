@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/keyop/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // defaultRetryDelay returns exponential backoff delay for retry attempt n (1-based).

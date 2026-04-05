@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/keyop/keyop-messenger/internal/envelope"
-	"github.com/keyop/keyop-messenger/internal/testutil"
+	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
