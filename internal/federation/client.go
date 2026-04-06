@@ -16,15 +16,16 @@ import (
 // with exponential backoff on disconnect. A PeerReceiver can be optionally
 // started for hubs that also push messages back to the client.
 type Client struct {
-	instanceName  string
-	tlsCfg        *tls.Config
-	policy        *AtomicPolicy
-	localWriter   func(*envelope.Envelope) error
-	dedup         Deduplicator
-	auditL        audit.AuditLogger
-	log           logger
-	sendBufSize   int
-	maxBatchBytes int
+	instanceName      string
+	tlsCfg            *tls.Config
+	policy            *AtomicPolicy
+	localWriter       func(*envelope.Envelope) error
+	dedup             Deduplicator
+	auditL            audit.AuditLogger
+	log               logger
+	sendBufSize       int
+	maxBatchBytes     int
+	subscribeChannels []string // channels this client wants to receive from the hub
 
 	// Reconnect parameters.
 	reconnectBase   time.Duration
@@ -40,6 +41,8 @@ type Client struct {
 
 // NewClient constructs a Client that is ready to dial. Call Dial or
 // ConnectWithReconnect to establish a connection.
+// subscribeChannels is the list of channels to request from the hub; the hub
+// may deliver a subset based on its access control policy.
 func NewClient(
 	instanceName string,
 	tlsCfg *tls.Config,
@@ -51,21 +54,23 @@ func NewClient(
 	sendBufSize, maxBatchBytes int,
 	reconnectBase, reconnectMax time.Duration,
 	reconnectJitter float64,
+	subscribeChannels []string,
 ) *Client {
 	return &Client{
-		instanceName:    instanceName,
-		tlsCfg:          tlsCfg,
-		policy:          policy,
-		localWriter:     localWriter,
-		dedup:           dedup,
-		auditL:          auditL,
-		log:             log,
-		sendBufSize:     sendBufSize,
-		maxBatchBytes:   maxBatchBytes,
-		reconnectBase:   reconnectBase,
-		reconnectMax:    reconnectMax,
-		reconnectJitter: reconnectJitter,
-		stop:            make(chan struct{}),
+		instanceName:      instanceName,
+		tlsCfg:            tlsCfg,
+		policy:            policy,
+		localWriter:       localWriter,
+		dedup:             dedup,
+		auditL:            auditL,
+		log:               log,
+		sendBufSize:       sendBufSize,
+		maxBatchBytes:     maxBatchBytes,
+		reconnectBase:     reconnectBase,
+		reconnectMax:      reconnectMax,
+		reconnectJitter:   reconnectJitter,
+		subscribeChannels: subscribeChannels,
+		stop:              make(chan struct{}),
 	}
 }
 
@@ -93,6 +98,7 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 		Role:         "client",
 		Version:      wireVersion,
 		LastID:       lastID,
+		Subscribe:    c.subscribeChannels,
 	}); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("federation: client send handshake: %w", err)

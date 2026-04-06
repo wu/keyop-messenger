@@ -73,6 +73,9 @@ type SubscribersConfig struct {
 type AllowedClient struct {
 	// Name is the instance name embedded in the client's TLS certificate CN.
 	Name string `yaml:"name"`
+	// AllowChannels lists the channels this client is permitted to subscribe to.
+	// An empty list means the client may subscribe to any channel.
+	AllowChannels []string `yaml:"allow_channels"`
 }
 
 // PeerHubConfig describes a peer hub connection and the channels forwarded over it.
@@ -109,6 +112,9 @@ type HubConfig struct {
 type ClientHubRef struct {
 	// Addr is the host:port of the hub to dial.
 	Addr string `yaml:"addr"`
+	// Subscribe lists the channels to request from the hub.
+	// The hub may deliver a subset based on its access control policy.
+	Subscribe []string `yaml:"subscribe"`
 }
 
 // ClientConfig controls outbound hub connections.

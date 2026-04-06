@@ -235,6 +235,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				time.Duration(cfg.Federation.ReconnectBaseMS)*time.Millisecond,
 				time.Duration(cfg.Federation.ReconnectMaxMS)*time.Millisecond,
 				cfg.Federation.ReconnectJitter,
+				ref.Subscribe,
 			)
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)
@@ -625,7 +626,7 @@ func (m *Messenger) checkCertExpiry(tlsCfg *tls.Config, cfg *Config) {
 func toFedHubConfig(cfg HubConfig) federation.HubConfig {
 	clients := make([]federation.AllowedClient, len(cfg.AllowedClients))
 	for i, c := range cfg.AllowedClients {
-		clients[i] = federation.AllowedClient{Name: c.Name}
+		clients[i] = federation.AllowedClient{Name: c.Name, AllowChannels: c.AllowChannels}
 	}
 	peers := make([]federation.PeerHubConfig, len(cfg.PeerHubs))
 	for i, p := range cfg.PeerHubs {

@@ -9,7 +9,7 @@ This document describes the phased implementation plan for the `keyop-messenger`
 ### 1.1 Go Module Name
 
 ```
-github.com/keyop/keyop-messenger
+github.com/wu/keyop-messenger
 ```
 
 ### 1.2 Directory Layout
@@ -81,7 +81,7 @@ keyop-messenger/
 
 ### 1.3 Public vs Internal
 
-Everything under `internal/` is unexported to callers of the library. The root package (`github.com/keyop/keyop-messenger`) is the sole public surface. The `cmd/` subtree is a standalone binary, not part of the library API.
+Everything under `internal/` is unexported to callers of the library. The root package (`github.com/wu/keyop-messenger`) is the sole public surface. The `cmd/` subtree is a standalone binary, not part of the library API.
 
 ---
 

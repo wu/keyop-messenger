@@ -20,11 +20,12 @@ const wireVersion = "1"
 
 // peerEntry tracks an active peer connection on the hub.
 type peerEntry struct {
-	name     string
-	sender   *PeerSender   // may be nil if this peer only sends to us
-	receiver *PeerReceiver // may be nil if we only send to this peer
-	policy   *AtomicPolicy
-	conn     *websocket.Conn
+	name               string
+	sender             *PeerSender   // may be nil if this peer only sends to us
+	receiver           *PeerReceiver // may be nil if we only send to this peer
+	policy             *AtomicPolicy
+	conn               *websocket.Conn
+	subscribedChannels []string // channels the peer requested; used for policy reload
 }
 
 // Hub accepts incoming WebSocket connections, enforces the allowlist and receive
@@ -136,36 +137,29 @@ func (h *Hub) ApplyPolicy(newCfg HubConfig) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Build set of new peer addrs.
-	newPeerSet := make(map[string]PeerHubConfig, len(newCfg.PeerHubs))
-	for _, ph := range newCfg.PeerHubs {
-		newPeerSet[ph.Addr] = ph
-	}
-
 	// Update or remove existing peers.
 	for name, entry := range h.peers {
-		ph, ok := newPeerSet[name]
-		if !ok {
-			// Peer removed: drain-then-close.
+		stillAllowed := false
+		for _, ph := range newCfg.PeerHubs {
+			if hostnameOf(ph.Addr) == name || ph.Addr == name {
+				stillAllowed = true
+				break
+			}
+		}
+		if !stillAllowed {
+			stillAllowed = newCfg.IsClientAllowed(name)
+		}
+		if !stillAllowed {
 			go h.drainAndClose(entry)
 			delete(h.peers, name)
 			continue
 		}
-		// Update channel lists atomically.
+		// Re-intersect the peer's subscribe list with the updated config.
 		if entry.policy != nil {
 			entry.policy.Store(ForwardPolicy{
-				Forward: ph.Forward,
-				Receive: ph.Receive,
+				Forward: effectiveForwardChannels(entry.subscribedChannels, name, newCfg),
+				Receive: receiveChannelsFor(name, newCfg),
 			})
-		}
-	}
-
-	// Remove allowlist-evicted clients.
-	for name, entry := range h.peers {
-		_, isPeer := newPeerSet[name]
-		if !isPeer && !newCfg.IsClientAllowed(name) {
-			go h.drainAndClose(entry)
-			delete(h.peers, name)
 		}
 	}
 
@@ -367,20 +361,19 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		return
 	}
 
-	// Determine forward/receive policy for this peer (if it's a configured peer hub).
-	policy := NewAtomicPolicy(ForwardPolicy{})
-	for _, ph := range cfg.PeerHubs {
-		if hostnameOf(ph.Addr) == peerName || ph.Addr == peerName {
-			policy.Store(ForwardPolicy{Forward: ph.Forward, Receive: ph.Receive})
-			break
-		}
-	}
+	// Compute the effective channels this hub will send to the peer:
+	// intersection of the peer's Subscribe request and the hub's allowlist.
+	fwdChannels := effectiveForwardChannels(hs.Subscribe, peerName, cfg)
+	recvChannels := receiveChannelsFor(peerName, cfg)
+	policy := NewAtomicPolicy(ForwardPolicy{
+		Forward: fwdChannels,
+		Receive: recvChannels,
+	})
 
-	// Start receiver. Also start sender if the peer hub has a forward list.
+	// Start receiver. Also start a sender if the peer subscribed to any channels.
 	// When both share a conn, route acks via an internal channel so the
 	// PeerReceiver owns all reads and avoids a concurrent-read race.
-	fp := policy.p.Load()
-	needSender := fp != nil && len(fp.Forward) > 0
+	needSender := len(fwdChannels) > 0
 
 	var receiver *PeerReceiver
 	var sender *PeerSender
@@ -395,11 +388,12 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	}
 
 	entry := &peerEntry{
-		name:     peerName,
-		sender:   sender,
-		receiver: receiver,
-		policy:   policy,
-		conn:     conn,
+		name:               peerName,
+		sender:             sender,
+		receiver:           receiver,
+		policy:             policy,
+		conn:               conn,
+		subscribedChannels: hs.Subscribe,
 	}
 
 	h.mu.Lock()
@@ -410,12 +404,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	h.log.Info("federation: hub accepted connection", "peer", peerName)
 
 	// Handle replay for reconnecting peers.
-	if hs.LastID != "" {
-		fp := policy.p.Load()
-		var fwdChannels []string
-		if fp != nil {
-			fwdChannels = fp.Forward
-		}
+	if hs.LastID != "" && len(fwdChannels) > 0 {
 		go func() {
 			for env := range h.ReplayFrom(hs.LastID, fwdChannels) {
 				if sender != nil {

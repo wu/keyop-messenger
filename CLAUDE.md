@@ -43,7 +43,8 @@ Keyop Messenger is a Go pub-sub library with:
 - Append-only `.jsonl` segment files as the durable message store (one directory per channel)
 - Per-subscriber byte-offset tracking for at-least-once delivery
 - Federation via mTLS WebSocket connections between instances
-- Star topology: clients connect to hubs; hub-to-hub forwarding is policy-driven (explicit channel lists, hot-reloaded)
+- Star topology: clients connect to hubs; clients declare which channels they want via `subscribe` in the handshake; hubs enforce per-client channel allowlists (`allow_channels`) and compute the effective set as `subscribe ∩ allowlist`
+- Hub `peer_hubs[].forward` is the allowlist for peer hub subscriptions (not an auto-push list)
 - Audit log (`{data_dir}/audit/audit.jsonl`) for all cross-hub forwarding events
 - `keyop-messenger keygen ca` / `keygen instance` CLI for certificate generation
 
@@ -51,7 +52,7 @@ Keyop Messenger is a Go pub-sub library with:
 
 | Package | Role |
 |---|---|
-| `github.com/keyop/keyop-messenger` | Public API (`Messenger`, `New`, `Publish`, `Subscribe`, `Close`) |
+| `github.com/wu/keyop-messenger` | Public API (`Messenger`, `New`, `Publish`, `Subscribe`, `Close`) |
 | `internal/storage` | Writer goroutine, subscriber goroutine, offset files, compaction |
 | `internal/federation` | Hub, Client, PeerSender, PeerReceiver, policy hot-reload |
 | `internal/envelope` | Envelope struct, marshal/unmarshal, payload registry |

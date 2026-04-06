@@ -2,6 +2,7 @@ package federation
 
 import (
 	"fmt"
+	"net"
 	"sync/atomic"
 )
 
@@ -72,6 +73,9 @@ type PeerHubConfig struct {
 // AllowedClient describes a client instance permitted to connect to this hub.
 type AllowedClient struct {
 	Name string `yaml:"name"`
+	// AllowChannels lists the channels this client is permitted to subscribe to.
+	// An empty list means the client may subscribe to any channel.
+	AllowChannels []string `yaml:"allow_channels"`
 }
 
 // HubConfig is the runtime policy configuration for a hub instance. It is
@@ -89,6 +93,79 @@ func (c HubConfig) IsClientAllowed(name string) bool {
 		}
 	}
 	return false
+}
+
+// effectiveForwardChannels returns the channels the hub should send to peerName,
+// computed as the intersection of the peer's Subscribe request and the hub's
+// allowlist for that peer.
+//
+//   - For peer hubs (in PeerHubs): PeerHubConfig.Forward is the allowlist.
+//   - For allowed clients (in AllowedClients): AllowedClient.AllowChannels is the
+//     allowlist; an empty AllowChannels means "permit all subscribed channels".
+//
+// Returns nil when the intersection is empty or requested is empty.
+func effectiveForwardChannels(requested []string, peerName string, cfg HubConfig) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	for _, ph := range cfg.PeerHubs {
+		if hostnameMatch(ph.Addr, peerName) {
+			return intersectChannels(requested, ph.Forward)
+		}
+	}
+	for _, ac := range cfg.AllowedClients {
+		if ac.Name == peerName {
+			if len(ac.AllowChannels) == 0 {
+				out := make([]string, len(requested))
+				copy(out, requested)
+				return out
+			}
+			return intersectChannels(requested, ac.AllowChannels)
+		}
+	}
+	return nil
+}
+
+// receiveChannelsFor returns the Receive allowlist for peerName if it is a
+// configured peer hub, otherwise nil (accept all inbound channels).
+func receiveChannelsFor(peerName string, cfg HubConfig) []string {
+	for _, ph := range cfg.PeerHubs {
+		if hostnameMatch(ph.Addr, peerName) {
+			return ph.Receive
+		}
+	}
+	return nil
+}
+
+// hostnameMatch reports whether addr (a "host:port" or bare hostname) matches name.
+func hostnameMatch(addr, name string) bool {
+	if addr == name {
+		return true
+	}
+	// Extract hostname from addr and compare.
+	if h, _, err := net.SplitHostPort(addr); err == nil {
+		return h == name
+	}
+	return false
+}
+
+// intersectChannels returns elements of a that also appear in b.
+// Returns nil when the result would be empty.
+func intersectChannels(a, b []string) []string {
+	if len(b) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(b))
+	for _, s := range b {
+		set[s] = true
+	}
+	var result []string
+	for _, s := range a {
+		if set[s] {
+			result = append(result, s)
+		}
+	}
+	return result
 }
 
 // validate checks that the HubConfig is internally consistent:

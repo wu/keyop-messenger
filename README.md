@@ -10,7 +10,7 @@ Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is 
 - **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
 - **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
 - **Reliable Retries & DLQ**: Configurable retry logic with automatic routing to `.dead-letter` channels.
-- **Secure Federation**: Star-topology federation over mTLS WebSockets; hubs forward select channels to peer hubs under explicit, hot-reloadable policy.
+- **Secure Federation**: Star-topology federation over mTLS WebSockets. Clients subscribe to specific channels; hubs enforce per-client channel allowlists under explicit, hot-reloadable policy.
 - **Observability**: File-based offsets and JSONL records allow operators to use standard Unix tools (`cat`, `grep`, `tail`) for debugging.
 
 ## Why Keyop Messenger?
@@ -25,7 +25,7 @@ Unlike memory-based message brokers, Keyop Messenger treats the filesystem as th
 ### Installation
 
 ```bash
-go get github.com/keyop/keyop-messenger
+go get github.com/wu/keyop-messenger
 ```
 
 ### Basic Usage
@@ -37,7 +37,7 @@ import (
     "context"
     "log/slog"
 
-    messenger "github.com/keyop/keyop-messenger"
+    messenger "github.com/wu/keyop-messenger"
 )
 
 type Alert struct {
@@ -80,7 +80,7 @@ func main() {
 
 ```bash
 # Install the CLI
-go install github.com/keyop/keyop-messenger/cmd/keyop-messenger@latest
+go install github.com/wu/keyop-messenger/cmd/keyop-messenger@latest
 
 # Generate a CA (once per cluster)
 keyop-messenger keygen ca --out-cert ca.crt --out-key ca.key
