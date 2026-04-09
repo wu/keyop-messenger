@@ -1,3 +1,4 @@
+//nolint:gosec // G301/G302/G304/G306: data file operations with trusted paths
 package storage
 
 import (
@@ -32,21 +33,21 @@ func WriteOffset(path string, offset int64) error {
 		return fmt.Errorf("create tmp offset file: %w", err)
 	}
 	if _, err = fmt.Fprintf(f, "%d\n", offset); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("write offset: %w", err)
 	}
 	if err = f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("fsync offset file: %w", err)
 	}
 	if err = f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("close offset file: %w", err)
 	}
 	if err = os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return fmt.Errorf("rename offset file: %w", err)
 	}
 	return nil

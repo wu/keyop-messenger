@@ -1,3 +1,4 @@
+//nolint:gosec // G304: reads cert/CA files from trusted config paths
 package tlsutil
 
 import (

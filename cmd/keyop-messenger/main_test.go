@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G304
 package main
 
 import (

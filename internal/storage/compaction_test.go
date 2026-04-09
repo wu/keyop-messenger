@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G301/G304
 package storage
 
 import (
@@ -19,7 +20,7 @@ func writeSegment(t *testing.T, channelDir string, startOffset int64, n int) int
 	path := filepath.Join(channelDir, segmentName(startOffset))
 	f, err := os.Create(path)
 	require.NoError(t, err)
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	line := []byte(`{"v":1,"channel":"orders","id":"x","ts":"2026-01-01T00:00:00Z","origin":"h","payload_type":"t","payload":{}}` + "\n")
 	for i := 0; i < n; i++ {
@@ -152,9 +153,9 @@ func TestCompactor_DeregisterRemovesOffsetFile(t *testing.T) {
 	require.NoError(t, c.DeregisterSubscriber("sub1"))
 	assert.False(t, OffsetFileExists(offsetPath))
 
-	min, err := c.MinOffset()
+	minOff, err := c.MinOffset()
 	require.NoError(t, err)
-	assert.Equal(t, int64(0), min)
+	assert.Equal(t, int64(0), minOff)
 }
 
 // TestCompactor_LagWarning verifies that a subscriber lagging beyond the

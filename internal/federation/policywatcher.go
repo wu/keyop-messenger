@@ -1,3 +1,4 @@
+//nolint:gosec // G304: reads policy file from trusted config path
 package federation
 
 import (

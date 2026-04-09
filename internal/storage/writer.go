@@ -1,3 +1,4 @@
+//nolint:gosec // G301/G302/G304/G315: data file operations with trusted paths
 package storage
 
 import (
@@ -15,6 +16,7 @@ import (
 // SyncPolicy controls when channel file writes are flushed to stable storage.
 type SyncPolicy string
 
+// SyncPolicy constants.
 const (
 	SyncPolicyNone     SyncPolicy = "none"
 	SyncPolicyPeriodic SyncPolicy = "periodic"
@@ -81,6 +83,8 @@ type channelWriter struct {
 // maxSegmentBytes controls when the writer rolls to a new segment file; 0 means
 // never roll (all data goes into one segment). notifyFn is called after each
 // successful write; it may be nil. log may be nil.
+//
+//nolint:revive // unexported-return is acceptable for unexported implementation of exported interface
 func NewChannelWriter(channelDir string, maxSegmentBytes int64, policy SyncPolicy, syncInterval time.Duration, notifyFn func(), log logger) (*channelWriter, error) {
 	if err := os.MkdirAll(channelDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create channel directory %q: %w", channelDir, err)
@@ -144,7 +148,7 @@ func (w *channelWriter) run(policy SyncPolicy, syncInterval time.Duration, notif
 		w.log.Error("open active segment on startup", "err", err)
 		return
 	}
-	defer func() { f.Close() }()
+	defer func() { _ = f.Close() }()
 
 	var tickCh <-chan time.Time
 	if policy == SyncPolicyPeriodic && syncInterval > 0 {
@@ -162,7 +166,7 @@ func (w *channelWriter) run(policy SyncPolicy, syncInterval time.Duration, notif
 				if err := f.Sync(); err != nil {
 					w.log.Warn("fsync before segment roll", "err", err)
 				}
-				f.Close()
+				_ = f.Close()
 				newStart := segStart + segSize
 				newPath := filepath.Join(w.channelDir, segmentName(newStart))
 				newF, err := w.sf.createSegment(newPath)

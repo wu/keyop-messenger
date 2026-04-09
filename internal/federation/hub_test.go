@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G301/G304/G306
 package federation_test
 
 import (
@@ -30,7 +31,7 @@ type countingWriter struct {
 	delay time.Duration
 }
 
-func (c *countingWriter) write(env *envelope.Envelope) error {
+func (c *countingWriter) write(_ *envelope.Envelope) error {
 	if c.delay > 0 {
 		time.Sleep(c.delay)
 	}
@@ -290,7 +291,7 @@ func TestReplayFrom(t *testing.T) {
 		_, err = fmt.Fprintf(f, "%s\n", data)
 		require.NoError(t, err)
 	}
-	f.Close()
+	_ = f.Close()
 
 	auditL := &fakeAuditLog{}
 	dd, _ := dedup.NewLRUDedup(1000)
@@ -405,7 +406,7 @@ func TestMTLSRejection(t *testing.T) {
 	hub := federation.NewHub("hub", federation.HubConfig{}, hubTLS,
 		func(*envelope.Envelope) error { return nil }, dd, auditL, log, 100, 65536, "")
 	require.NoError(t, hub.Listen("127.0.0.1:0"))
-	defer hub.Close()
+	defer func() { _ = hub.Close() }()
 
 	// Client cert signed by CA2, which hub doesn't trust.
 	clientCert, clientKey, err := tlsutil.GenerateInstance(caCertPEM2, caKeyPEM2, "client", 90)

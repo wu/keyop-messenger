@@ -1,3 +1,4 @@
+// Package dedup provides deduplication of envelope IDs.
 package dedup
 
 import (

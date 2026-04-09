@@ -18,12 +18,12 @@ import (
 // Starts at 100ms, doubles each attempt, capped at 5s.
 func defaultRetryDelay(attempt int) time.Duration {
 	const (
-		base = 100 * time.Millisecond
-		cap  = 5 * time.Second
+		base       = 100 * time.Millisecond
+		maxBackoff = 5 * time.Second
 	)
 	d := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
-	if d > cap {
-		return cap
+	if d > maxBackoff {
+		return maxBackoff
 	}
 	return d
 }
@@ -86,6 +86,7 @@ func NewSubscriber(
 	if log == nil {
 		log = nopLogger{}
 	}
+	//nolint:gosec // G301: 0o755 is appropriate for shared data directories
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create offset dir %q: %w", offsetDir, err)
 	}
@@ -218,7 +219,7 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 		localOffset := offset - seg.startOffset
 		if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
 			s.log.Error("seek in segment", "path", seg.path, "local_offset", localOffset, "err", err)
-			f.Close()
+			_ = f.Close()
 			return
 		}
 
@@ -250,7 +251,7 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 		if err := scanner.Err(); err != nil {
 			s.log.Error("scan segment", "path", seg.path, "err", err)
 		}
-		f.Close()
+		_ = f.Close()
 
 		// If there is a next segment, advance to its start offset. This handles
 		// the gap between a sealed segment's end and the next segment's start

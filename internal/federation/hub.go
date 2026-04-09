@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -100,6 +101,7 @@ func (h *Hub) Listen(addr string) error {
 			tlsState := r.TLS
 			h.serveConn(conn, tlsState)
 		}),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	h.mu.Lock()
 	h.listener = ln
@@ -239,11 +241,11 @@ func (h *Hub) ReplayFrom(lastID string, channels []string) <-chan *envelope.Enve
 					}
 					if env.ID == lastID {
 						found = true
-						f.Close()
+						_ = f.Close()
 						break outer
 					}
 				}
-				f.Close()
+				_ = f.Close()
 			}
 		}
 
@@ -283,11 +285,11 @@ func (h *Hub) ReplayFrom(lastID string, channels []string) <-chan *envelope.Enve
 				select {
 				case out <- &envCopy:
 				case <-h.stop:
-					f.Close()
+					_ = f.Close()
 					return
 				}
 			}
-			f.Close()
+			_ = f.Close()
 		}
 	}()
 	return out
@@ -316,7 +318,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	hs, err := ReceiveHandshake(conn)
 	if err != nil {
 		h.log.Error("federation: hub receive handshake", "err", err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 
@@ -357,7 +359,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		Version:      wireVersion,
 	}); err != nil {
 		h.log.Error("federation: hub send handshake", "err", err)
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 

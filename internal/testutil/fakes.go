@@ -18,8 +18,13 @@ type FakeLogger struct {
 	logs []string
 }
 
+// Debug records a debug-level log entry.
 func (f *FakeLogger) Debug(msg string, args ...any) { f.record("DEBUG", msg, args) }
-func (f *FakeLogger) Info(msg string, args ...any)  { f.record("INFO", msg, args) }
+
+// Info records an info-level log entry.
+func (f *FakeLogger) Info(msg string, args ...any) { f.record("INFO", msg, args) }
+
+// Warn records a warn-level log entry.
 func (f *FakeLogger) Warn(msg string, args ...any)  { f.record("WARN", msg, args) }
 func (f *FakeLogger) Error(msg string, args ...any) { f.record("ERROR", msg, args) }
 

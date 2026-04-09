@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G306
 package federation_test
 
 import (
@@ -41,7 +42,7 @@ func TestAllowForwardEmptyList(t *testing.T) {
 	assert.True(t, ap.AllowReceive("anything"))
 }
 
-func TestAtomicPolicySwapRace(t *testing.T) {
+func TestAtomicPolicySwapRace(_ *testing.T) {
 	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{
 		Forward: []string{"ch1"},
 	})
@@ -190,7 +191,7 @@ func TestPolicyWatcherReload(t *testing.T) {
 
 	pw, err := federation.NewPolicyWatcher(cfgPath, hub, auditLog, log)
 	require.NoError(t, err)
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 
 	// Overwrite with updated config to trigger reload.
 	writeConfig(t, cfgPath, validConfig2)
@@ -222,7 +223,7 @@ func TestPolicyWatcherInvalidConfig(t *testing.T) {
 
 	pw, err := federation.NewPolicyWatcher(cfgPath, hub, auditLog, log)
 	require.NoError(t, err)
-	defer pw.Close()
+	defer func() { _ = pw.Close() }()
 
 	// Write an invalid config (peer with empty addr).
 	writeConfig(t, cfgPath, invalidConfig)
@@ -250,7 +251,7 @@ func TestPolicyWatcherClose(t *testing.T) {
 	require.NoError(t, err)
 
 	done := make(chan struct{})
-	go func() { pw.Close(); close(done) }()
+	go func() { _ = pw.Close(); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):

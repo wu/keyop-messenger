@@ -18,8 +18,8 @@ import (
 // fakeAuditLogger2 for client tests
 type fakeAuditLogger2 struct{}
 
-func (f *fakeAuditLogger2) Log(event audit.Event) error { return nil }
-func (f *fakeAuditLogger2) Close() error                { return nil }
+func (f *fakeAuditLogger2) Log(_ audit.Event) error { return nil }
+func (f *fakeAuditLogger2) Close() error            { return nil }
 
 // TestClient_Dial_Success connects to a mock hub server.
 func TestClient_Dial_Success(t *testing.T) {
@@ -27,7 +27,7 @@ func TestClient_Dial_Success(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Receive client handshake
 		var hs HandshakeMsg
@@ -54,7 +54,7 @@ func TestClient_Dial_Success(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,
@@ -82,7 +82,7 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.ReadJSON(&HandshakeMsg{})
 		_ = conn.WriteJSON(HandshakeMsg{
 			InstanceName: "hub",
@@ -99,7 +99,7 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,
@@ -133,7 +133,7 @@ func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
 	connectionCount := atomic.Int32{}
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
 		connectionCount.Add(1)
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.ReadJSON(&HandshakeMsg{})
 		_ = conn.WriteJSON(HandshakeMsg{
 			InstanceName: "hub",
@@ -150,7 +150,7 @@ func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,
@@ -180,7 +180,7 @@ func TestClient_Close_StopsReconnectLoop(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.ReadJSON(&HandshakeMsg{})
 		_ = conn.WriteJSON(HandshakeMsg{
 			InstanceName: "hub",
@@ -197,7 +197,7 @@ func TestClient_Close_StopsReconnectLoop(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,
@@ -229,7 +229,7 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		_ = conn.ReadJSON(&HandshakeMsg{})
 		_ = conn.WriteJSON(HandshakeMsg{
 			InstanceName: "hub",
@@ -275,7 +275,7 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 
 	var receivedSubscribe []string
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var hs HandshakeMsg
 		_ = conn.ReadJSON(&hs)
 		receivedSubscribe = hs.Subscribe
@@ -294,7 +294,7 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,
@@ -324,7 +324,7 @@ func TestClient_Dial_WithReplayID(t *testing.T) {
 
 	var receivedLastID string
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		var hs HandshakeMsg
 		_ = conn.ReadJSON(&hs)
 		receivedLastID = hs.LastID
@@ -343,7 +343,7 @@ func TestClient_Dial_WithReplayID(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		&fakeAuditLogger2{},
 		log,

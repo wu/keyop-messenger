@@ -1,4 +1,6 @@
 // Package federation implements the hub-to-hub and hub-to-client wire protocol.
+//
+//nolint:gosec // G115: safe type conversions (uintptr->int, int->uint32)
 package federation
 
 import (

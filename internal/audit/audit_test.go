@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G304/G306
 package audit_test
 
 import (

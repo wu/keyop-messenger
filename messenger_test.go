@@ -330,7 +330,7 @@ func TestUnsubscribe(t *testing.T) {
 	dir := t.TempDir()
 	m, err := New(testConfig(dir))
 	require.NoError(t, err)
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	channel := "unsub-test"
 	subID := "sub1"

@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G306
 package storage
 
 import (

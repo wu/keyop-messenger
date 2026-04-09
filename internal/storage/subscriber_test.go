@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G301/G304/G306
 package storage
 
 import (
@@ -53,7 +54,7 @@ func writeTestEnvelope(t *testing.T, channelDir string, env envelope.Envelope) {
 	require.NoError(t, err)
 	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	_, err = fmt.Fprintf(f, "%s\n", data)
 	require.NoError(t, err)
 }

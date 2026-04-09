@@ -100,12 +100,12 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 		LastID:       lastID,
 		Subscribe:    c.subscribeChannels,
 	}); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("federation: client send handshake: %w", err)
 	}
 	// Receive hub's handshake.
 	if _, err := ReceiveHandshake(conn); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("federation: client receive handshake: %w", err)
 	}
 
@@ -158,6 +158,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				"hub", hubAddr, "unacked", len(unacked))
 
 			// Wait with backoff + jitter.
+			//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 			sleep := backoff + jitter
 			if sleep < 0 {
@@ -182,7 +183,8 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 					break
 				}
 				c.log.Error("federation: client reconnect failed", "err", dialErr)
-				backoff = min(backoff*2, c.reconnectMax)
+				backoff = minDuration(backoff*2, c.reconnectMax)
+				//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 				jitter = time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 				sleep = backoff + jitter
 				if sleep < 0 {
@@ -229,7 +231,7 @@ func (c *Client) Close() {
 	c.wg.Wait()
 }
 
-func min(a, b time.Duration) time.Duration {
+func minDuration(a, b time.Duration) time.Duration {
 	if a < b {
 		return a
 	}

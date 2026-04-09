@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G301/G304/G306
 package storage
 
 import (
@@ -192,7 +193,7 @@ func TestWatcher_PathNormalization(t *testing.T) {
 	// unreachable from ".").
 	dir, err := os.MkdirTemp(".", "testwatcher-*")
 	require.NoError(t, err)
-	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	channelDir := filepath.Join(dir, "orders")
 	require.NoError(t, os.MkdirAll(channelDir, 0o755))

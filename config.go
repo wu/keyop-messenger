@@ -1,3 +1,4 @@
+// Package messenger implements a file-based pub-sub system.
 package messenger
 
 import (
@@ -201,11 +202,12 @@ type Config struct {
 
 // LoadConfig reads a YAML config file, applies defaults, and validates the result.
 func LoadConfig(path string) (*Config, error) {
+	//nolint:gosec // G304: loading config from known path (not user input)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open config %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var cfg Config
 	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
@@ -294,6 +296,7 @@ func EnsureDirectories(cfg *Config) error {
 		filepath.Join(cfg.Storage.DataDir, "audit"),
 	}
 	for _, d := range dirs {
+		//nolint:gosec // G301: 0o755 is appropriate for shared data directories
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return fmt.Errorf("create directory %q: %w", d, err)
 		}

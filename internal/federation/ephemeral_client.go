@@ -144,6 +144,7 @@ func (c *EphemeralClient) ConnectWithReconnect(ctx context.Context, hubAddr stri
 		return err
 	}
 	c.wg.Add(1)
+	//nolint:gosec // G118: background reconnect loop doesn't need request context
 	go c.reconnectLoop(hubAddr, connLost)
 	return nil
 }
@@ -378,6 +379,7 @@ func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}
 		c.log.Warn("ephemeral: connection lost, reconnecting", "hub", hubAddr)
 
 		for {
+			//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 			sleep := backoff + jitter
 			if sleep < 0 {

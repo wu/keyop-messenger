@@ -46,6 +46,8 @@ type Logger interface {
 }
 
 // AuditLogger is the interface satisfied by AuditWriter.
+//
+//nolint:revive // exported type name in exported package is intentional
 type AuditLogger interface {
 	Log(event Event) error
 	Close() error
@@ -56,6 +58,8 @@ const eventChannelCap = 1000
 const dropWarnInterval = 5 * time.Second
 
 // AuditWriter writes Event records to a rotating audit.jsonl file.
+//
+//nolint:revive // exported type name in exported package is intentional
 type AuditWriter struct {
 	dir       string
 	maxSizeB  int64
@@ -70,6 +74,7 @@ type AuditWriter struct {
 // maxSizeMB is the rotation threshold per file. maxFiles is the maximum
 // number of rotated files retained (oldest deleted when exceeded).
 func NewAuditWriter(dir string, maxSizeMB, maxFiles int, logger Logger) (*AuditWriter, error) {
+	//nolint:gosec // G301: 0o755 is appropriate for shared data directories
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("audit: mkdir %s: %w", dir, err)
 	}
@@ -123,9 +128,12 @@ func (aw *AuditWriter) run() {
 	defer aw.wg.Done()
 
 	path := filepath.Join(aw.dir, auditFileName)
+	//nolint:gosec // G302: audit logs are not sensitive, 0o644 is intentional
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		aw.logger.Error("audit: failed to open file", "err", err)
+		// Drain channel to unblock senders before returning
+		//nolint:revive // empty-block is intentional for channel draining
 		for range aw.ch {
 		}
 		return
@@ -174,9 +182,12 @@ func (aw *AuditWriter) run() {
 				if err := aw.rotate(); err != nil {
 					aw.logger.Error("audit: rotation failed", "err", err)
 				}
-				f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+				//nolint:gosec // G302/G304: audit logs are not sensitive, 0o644 intentional
+				f, err = os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644) //nolint:gosec
 				if err != nil {
 					aw.logger.Error("audit: reopen after rotation", "err", err)
+					// Drain channel to unblock senders before returning
+					//nolint:revive // empty-block is intentional for channel draining
 					for range aw.ch {
 					}
 					return

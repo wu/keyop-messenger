@@ -107,7 +107,7 @@ func readAllSegments(t *testing.T, channelDir string) []string {
 			lines = append(lines, sc.Text())
 		}
 		require.NoError(t, sc.Err())
-		f.Close()
+		_ = f.Close()
 	}
 	return lines
 }

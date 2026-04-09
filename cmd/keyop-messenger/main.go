@@ -1,4 +1,6 @@
 // Command keyop-messenger provides the CLI for keyop-messenger key management.
+//
+//nolint:gosec // G304/G703: keygen reads/writes cert files (trusted, not user-controlled attacks)
 package main
 
 import (
@@ -36,12 +38,12 @@ func versionCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print build version",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			v := "(devel)"
 			if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
 				v = info.Main.Version
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "version: %s\n", v)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "version: %s\n", v)
 			return nil
 		},
 	}
@@ -67,7 +69,7 @@ func keygenCACmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "ca",
 		Short: "Generate a self-signed CA certificate and private key",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := checkOverwrite(force, outCert, outKey); err != nil {
 				return err
 			}
@@ -105,7 +107,7 @@ func keygenInstanceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "instance",
 		Short: "Generate an instance certificate signed by a CA",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			if outCert == "" {
 				outCert = name + ".crt"
 			}
@@ -183,8 +185,8 @@ func printCertInfo(cmd *cobra.Command, certPEM []byte) {
 		return
 	}
 	sum := sha256.Sum256(cert.Raw)
-	fmt.Fprintf(cmd.OutOrStdout(), "Subject:     %s\n", cert.Subject)
-	fmt.Fprintf(cmd.OutOrStdout(), "Valid from:  %s\n", cert.NotBefore.Format(time.RFC3339))
-	fmt.Fprintf(cmd.OutOrStdout(), "Valid until: %s\n", cert.NotAfter.Format(time.RFC3339))
-	fmt.Fprintf(cmd.OutOrStdout(), "Fingerprint: SHA-256:%s\n", hex.EncodeToString(sum[:]))
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Subject:     %s\n", cert.Subject)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Valid from:  %s\n", cert.NotBefore.Format(time.RFC3339))
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Valid until: %s\n", cert.NotAfter.Format(time.RFC3339))
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Fingerprint: SHA-256:%s\n", hex.EncodeToString(sum[:]))
 }

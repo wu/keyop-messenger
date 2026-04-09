@@ -68,17 +68,17 @@ func (c *Compactor) MinOffset() (int64, error) {
 		return 0, nil
 	}
 
-	var min int64 = math.MaxInt64
+	var minOffset int64 = math.MaxInt64
 	for _, id := range ids {
 		off, err := ReadOffset(filepath.Join(c.offsetDir, id+".offset"))
 		if err != nil {
 			return 0, fmt.Errorf("read offset for subscriber %q: %w", id, err)
 		}
-		if off < min {
-			min = off
+		if off < minOffset {
+			minOffset = off
 		}
 	}
-	return min, nil
+	return minOffset, nil
 }
 
 // MaybeCompact deletes any sealed segment files in channelDir whose contents

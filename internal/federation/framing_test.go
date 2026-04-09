@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G404/G104 acceptable for test setup
 package federation_test
 
 import (

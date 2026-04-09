@@ -101,7 +101,7 @@ func TestNewEnvelope(t *testing.T) {
 	assert.False(t, env.Ts.Before(before), "Ts must not be before call")
 	assert.False(t, env.Ts.After(after), "Ts must not be after return")
 	assert.Equal(t, time.UTC, env.Ts.Location(), "Ts must be in UTC")
-	assert.Zero(t, env.Ts.Nanosecond()%1, "Ts must have no monotonic component (Round(0) applied)")
+	assert.Zero(t, env.Ts.Nanosecond()%1, "Ts must have no monotonic component (Round(0) applied)") //nolint:staticcheck
 	// Confirm Round(0) was applied: marshaling and re-parsing must give the same value.
 	marshaled, _ := json.Marshal(env.Ts)
 	var reparsed time.Time

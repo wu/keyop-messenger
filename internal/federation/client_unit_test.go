@@ -15,8 +15,8 @@ import (
 // fakeAuditLogger is a simple audit logger for testing.
 type fakeAuditLogger struct{}
 
-func (f *fakeAuditLogger) Log(event audit.Event) error { return nil }
-func (f *fakeAuditLogger) Close() error                { return nil }
+func (f *fakeAuditLogger) Log(_ audit.Event) error { return nil }
+func (f *fakeAuditLogger) Close() error            { return nil }
 
 // TestNewClient_ValidConfig creates a valid Client.
 func TestNewClient_ValidConfig(t *testing.T) {
@@ -30,7 +30,7 @@ func TestNewClient_ValidConfig(t *testing.T) {
 		"test-client",
 		nil, // no TLS
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -84,7 +84,7 @@ func TestClient_Dial_InvalidAddr(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -113,7 +113,7 @@ func TestClient_Sender_NilBeforeConnect(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -142,7 +142,7 @@ func TestClient_Close_Idempotent(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -173,7 +173,7 @@ func TestClient_Config_WithTLS(t *testing.T) {
 		"test-client",
 		tlsCfg,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -200,7 +200,7 @@ func TestClient_Config_WithSubscribeChannels(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -227,7 +227,7 @@ func TestClient_Config_LargeBuffers(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -254,7 +254,7 @@ func TestClient_Config_CustomReconnectParams(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -279,7 +279,7 @@ func TestClient_LocalWriter_Signature(t *testing.T) {
 	policy := NewAtomicPolicy(ForwardPolicy{})
 
 	writerCalls := 0
-	localWriter := func(env *envelope.Envelope) error {
+	localWriter := func(_ *envelope.Envelope) error {
 		writerCalls++
 		return nil
 	}
@@ -317,7 +317,7 @@ func TestClient_Deduplicator_Provided(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -348,7 +348,7 @@ func TestClient_Policy_Provided(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -376,7 +376,7 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -404,7 +404,7 @@ func TestClient_ConnectWithReconnect_InvalidAddr(t *testing.T) {
 		"test-client",
 		nil,
 		policy,
-		func(env *envelope.Envelope) error { return nil },
+		func(_ *envelope.Envelope) error { return nil },
 		dedupL,
 		auditL,
 		log,
@@ -422,10 +422,10 @@ func TestClient_ConnectWithReconnect_InvalidAddr(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestClient_Min_Helper tests the min helper function.
-func TestClient_Min_Helper(t *testing.T) {
+// TestClient_MinDuration_Helper tests the minDuration helper function.
+func TestClient_MinDuration_Helper(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, 100*time.Millisecond, min(100*time.Millisecond, 200*time.Millisecond))
-	assert.Equal(t, 50*time.Millisecond, min(100*time.Millisecond, 50*time.Millisecond))
-	assert.Equal(t, time.Duration(0), min(time.Duration(0), 100*time.Millisecond))
+	assert.Equal(t, 100*time.Millisecond, minDuration(100*time.Millisecond, 200*time.Millisecond))
+	assert.Equal(t, 50*time.Millisecond, minDuration(100*time.Millisecond, 50*time.Millisecond))
+	assert.Equal(t, time.Duration(0), minDuration(time.Duration(0), 100*time.Millisecond))
 }

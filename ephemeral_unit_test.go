@@ -136,7 +136,7 @@ func TestEphemeralMessenger_Subscribe_ValidChannel(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
 
-	err = em.Subscribe("events", func(msg Message) {})
+	err = em.Subscribe("events", func(_ Message) {})
 	assert.NoError(t, err)
 }
 
@@ -158,7 +158,7 @@ func TestEphemeralMessenger_Subscribe_InvalidChannel(t *testing.T) {
 		"events\n",           // newline
 	}
 	for _, ch := range tests {
-		err := em.Subscribe(ch, func(msg Message) {})
+		err := em.Subscribe(ch, func(_ Message) {})
 		assert.Error(t, err, "channel %q should be invalid", ch)
 	}
 }
@@ -175,9 +175,9 @@ func TestEphemeralMessenger_Subscribe_MultipleHandlers(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
 
-	handler1 := func(msg Message) {}
-	handler2 := func(msg Message) {}
-	handler3 := func(msg Message) {}
+	handler1 := func(_ Message) {}
+	handler2 := func(_ Message) {}
+	handler3 := func(_ Message) {}
 
 	assert.NoError(t, em.Subscribe("events", handler1))
 	assert.NoError(t, em.Subscribe("events", handler2))
@@ -305,14 +305,14 @@ func TestEphemeralMessenger_Subscribe_BeforeClose(t *testing.T) {
 	t.Cleanup(func() { _ = em.Close() })
 
 	// Subscribe before Close should succeed.
-	err = em.Subscribe("events", func(msg Message) {})
+	err = em.Subscribe("events", func(_ Message) {})
 	assert.NoError(t, err)
 
-	em.Close()
+	_ = em.Close()
 
 	// Subscribe after Close may succeed or fail depending on the client
 	// state; both are acceptable.
-	_ = em.Subscribe("events", func(msg Message) {})
+	_ = em.Subscribe("events", func(_ Message) {})
 }
 
 // TestEphemeralMessenger_RegisterPayloadType_WithDifferentTypes registers
@@ -340,7 +340,7 @@ type testLogger struct {
 	calls *int
 }
 
-func (tl *testLogger) Debug(msg string, args ...any) { *tl.calls++ }
-func (tl *testLogger) Info(msg string, args ...any)  { *tl.calls++ }
-func (tl *testLogger) Warn(msg string, args ...any)  { *tl.calls++ }
-func (tl *testLogger) Error(msg string, args ...any) { *tl.calls++ }
+func (tl *testLogger) Debug(_ string, _ ...any) { *tl.calls++ }
+func (tl *testLogger) Info(_ string, _ ...any)  { *tl.calls++ }
+func (tl *testLogger) Warn(_ string, _ ...any)  { *tl.calls++ }
+func (tl *testLogger) Error(_ string, _ ...any) { *tl.calls++ }

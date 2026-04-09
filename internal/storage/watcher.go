@@ -69,6 +69,8 @@ type channelWatcher struct {
 }
 
 // NewChannelWatcher creates a ChannelWatcher backed by fsnotify. log may be nil.
+//
+//nolint:revive // unexported-return is acceptable for unexported implementation of exported interface
 func NewChannelWatcher(log logger) (*channelWatcher, error) {
 	fw, err := fsnotify.NewWatcher()
 	if err != nil {

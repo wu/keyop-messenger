@@ -46,7 +46,7 @@ func TestEphemeralClient_AddHandler_Single(t *testing.T) {
 	t.Cleanup(func() { ec.Close() })
 
 	handlerCalled := false
-	ec.AddHandler("events", func(env *envelope.Envelope) error {
+	ec.AddHandler("events", func(_ *envelope.Envelope) error {
 		handlerCalled = true
 		return nil
 	})
@@ -62,11 +62,11 @@ func TestEphemeralClient_AddHandler_Multiple(t *testing.T) {
 	t.Cleanup(func() { ec.Close() })
 
 	count := 0
-	ec.AddHandler("events", func(env *envelope.Envelope) error {
+	ec.AddHandler("events", func(_ *envelope.Envelope) error {
 		count++
 		return nil
 	})
-	ec.AddHandler("events", func(env *envelope.Envelope) error {
+	ec.AddHandler("events", func(_ *envelope.Envelope) error {
 		count++
 		return nil
 	})
@@ -88,11 +88,11 @@ func TestEphemeralClient_AddHandler_DifferentChannels(t *testing.T) {
 	t.Cleanup(func() { ec.Close() })
 
 	count1, count2 := 0, 0
-	ec.AddHandler("chan1", func(env *envelope.Envelope) error {
+	ec.AddHandler("chan1", func(_ *envelope.Envelope) error {
 		count1++
 		return nil
 	})
-	ec.AddHandler("chan2", func(env *envelope.Envelope) error {
+	ec.AddHandler("chan2", func(_ *envelope.Envelope) error {
 		count2++
 		return nil
 	})
@@ -261,8 +261,8 @@ func TestEphemeralClient_AddHandler_ConcurrentAdd(t *testing.T) {
 	// Concurrently add handlers.
 	done := make(chan struct{})
 	for i := 0; i < 10; i++ {
-		go func(id int) {
-			ec.AddHandler("events", func(env *envelope.Envelope) error {
+		go func(_ int) {
+			ec.AddHandler("events", func(_ *envelope.Envelope) error {
 				return nil
 			})
 			done <- struct{}{}

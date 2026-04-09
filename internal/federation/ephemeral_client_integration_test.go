@@ -1,3 +1,4 @@
+//nolint:gosec // test file: G115 type conversions are safe
 package federation
 
 import (
@@ -44,14 +45,14 @@ func TestEphemeralClient_Dispatch_MessageHandlers(t *testing.T) {
 	handlerCount := atomic.Int32{}
 
 	for i := 0; i < 5; i++ {
-		ec.AddHandler("events", func(env *envelope.Envelope) error {
+		ec.AddHandler("events", func(_ *envelope.Envelope) error {
 			handlerCount.Add(1)
 			return nil
 		})
 	}
 
 	for i := 0; i < 3; i++ {
-		ec.AddHandler("alerts", func(env *envelope.Envelope) error {
+		ec.AddHandler("alerts", func(_ *envelope.Envelope) error {
 			handlerCount.Add(1)
 			return nil
 		})
@@ -68,7 +69,7 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 
 	receivedFrames := atomic.Int32{}
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Receive handshake
 		hs := HandshakeMsg{}
@@ -142,7 +143,7 @@ func TestEphemeralClient_Close_StopsAllGoroutines(t *testing.T) {
 
 	// Register some handlers
 	for i := 0; i < 3; i++ {
-		ec.AddHandler("test", func(env *envelope.Envelope) error { return nil })
+		ec.AddHandler("test", func(_ *envelope.Envelope) error { return nil })
 	}
 
 	// Close should complete quickly without deadlock
@@ -160,7 +161,7 @@ func TestEphemeralClient_Publish_BlocksUntilAck(t *testing.T) {
 
 	ackDelay := 100 * time.Millisecond
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Receive handshake
 		_ = conn.ReadJSON(&HandshakeMsg{})
@@ -222,7 +223,7 @@ func TestEphemeralClient_PublishConcurrent(t *testing.T) {
 
 	messageCount := atomic.Int32{}
 	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 
 		// Receive handshake
 		_ = conn.ReadJSON(&HandshakeMsg{})
