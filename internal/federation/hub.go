@@ -401,10 +401,15 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	h.mu.Unlock()
 
 	_ = h.auditL.Log(audit.Event{Event: audit.EventClientConnected, Peer: peerName})
-	h.log.Info("federation: hub accepted connection", "peer", peerName)
+	if hs.Ephemeral {
+		h.log.Info("federation: hub accepted ephemeral connection", "peer", peerName)
+	} else {
+		h.log.Info("federation: hub accepted connection", "peer", peerName)
+	}
 
-	// Handle replay for reconnecting peers.
-	if hs.LastID != "" && len(fwdChannels) > 0 {
+	// Handle replay for reconnecting non-ephemeral peers. Ephemeral clients
+	// never receive replayed messages regardless of whether LastID is set.
+	if hs.LastID != "" && len(fwdChannels) > 0 && !hs.Ephemeral {
 		go func() {
 			for env := range h.ReplayFrom(hs.LastID, fwdChannels) {
 				if sender != nil {

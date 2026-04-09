@@ -95,6 +95,80 @@ keyop-messenger keygen instance \
   --out-key  billing-host.key
 ```
 
+## Ephemeral Client
+
+`EphemeralMessenger` connects to a hub without maintaining any local storage. Use it when:
+
+- You need to **publish with delivery confirmation** (blocks until the hub has written the message to disk) but do not want to manage a data directory.
+- You want to **receive live messages** only while connected, with no replay of messages published during a disconnect.
+
+### Publishing
+
+```go
+em, err := messenger.NewEphemeralMessenger(messenger.EphemeralConfig{
+    HubAddr:      "hub.example.com:7740",
+    InstanceName: "transient-service",
+    TLS: messenger.TLSConfig{
+        Cert: "transient-service.crt",
+        Key:  "transient-service.key",
+        CA:   "ca.crt",
+    },
+})
+if err != nil {
+    panic(err)
+}
+defer em.Close()
+
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+
+if err := em.Connect(ctx); err != nil {
+    panic(err)
+}
+
+// Publish blocks until the hub acks (message is on disk) or ctx expires.
+err = em.Publish(ctx, "channelname", "com.example.Event", order)
+if errors.Is(err, messenger.ErrEphemeralConnLost) {
+    // Connection dropped before ack — message may or may not have been received.
+    // Retry if idempotent; check or alert otherwise.
+}
+```
+
+### Subscribing
+
+```go
+em, err := messenger.NewEphemeralMessenger(messenger.EphemeralConfig{
+    HubAddr:      "hub.example.com:7740",
+    InstanceName: "dashboard",
+    Subscribe:    []string{"metrics"},   // declare channels before Connect
+    TLS:          messenger.TLSConfig{Cert: "dashboard.crt", Key: "dashboard.key", CA: "ca.crt"},
+    AutoReconnect: true,
+})
+
+em.Subscribe("metrics", func(msg messenger.Message) {
+    fmt.Println("live metric:", msg.Payload)
+})
+
+em.Connect(ctx) // returns after first connection; reconnects in background
+```
+
+Handler errors are logged but do not stop delivery. On reconnect, delivery resumes from the current hub position — messages published while disconnected are never replayed.
+
+### Auto-Reconnect
+
+Set `AutoReconnect: true` to reconnect automatically with exponential backoff after a disconnect. The default backoff starts at 500 ms and caps at 60 s with ±20% jitter. Pending `Publish` calls that have not yet been enqueued block until reconnected; in-flight calls at the moment of disconnect return `ErrEphemeralConnLost`.
+
+### Differences from `Messenger`
+
+|                  | `Messenger`                         | `EphemeralMessenger`                                            |
+|------------------|-------------------------------------|-----------------------------------------------------------------|
+| Local storage    | `.jsonl` files per channel          | None                                                            |
+| Subscribe replay | Resumes from last offset on restart | No replay; live-only                                            |
+| Publish ack      | Write confirmed to local disk       | Hub confirmed to disk; connection loss = `ErrEphemeralConnLost` |
+| Data directory   | Required                            | Not required                                                    |
+
+---
+
 ## Architecture
 
 Keyop Messenger follows a **Hub-and-Spoke** model:
@@ -124,7 +198,7 @@ golangci-lint run ./...
 
 ## Project Status
 
-All 15 phases are complete. The library is feature-complete and integration-tested.
+All 16 phases are complete. The library is feature-complete and integration-tested.
 
 - [x] Phase 1: Module Scaffold & Configuration
 - [x] Phase 2: Message Envelope & Payload Registry
@@ -141,6 +215,7 @@ All 15 phases are complete. The library is feature-complete and integration-test
 - [x] Phase 13: Root Messenger API
 - [x] Phase 14: CLI (`keygen` subcommands)
 - [x] Phase 15: Hardening, Benchmarks & Integration Tests
+- [x] Phase 16: Ephemeral Client
 
 See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 

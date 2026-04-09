@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/wu/keyop-messenger/internal/envelope"
-	"github.com/wu/keyop-messenger/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
 // writeSegment creates a segment file in channelDir starting at startOffset

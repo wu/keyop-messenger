@@ -15,6 +15,9 @@ type HandshakeMsg struct {
 	Version      string   `json:"version"`             // wire protocol version, currently "1"
 	LastID       string   `json:"last_id,omitempty"`   // last acked ID; non-empty on reconnect
 	Subscribe    []string `json:"subscribe,omitempty"` // channels the client wants to receive
+	// Ephemeral signals that this client does not maintain local state.
+	// The hub must not replay missed messages even if LastID is set.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 // AckMsg is sent by the receiver after processing a batch of data frames.

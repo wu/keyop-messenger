@@ -6,9 +6,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/wu/keyop-messenger/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
 // ---- test types -------------------------------------------------------

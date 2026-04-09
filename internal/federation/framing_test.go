@@ -8,9 +8,9 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/wu/keyop-messenger/internal/federation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/federation"
 )
 
 // roundTrip encodes records with WriteFrame then decodes with ReadFrame.

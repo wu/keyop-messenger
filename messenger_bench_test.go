@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
 // BenchmarkPublishThroughput measures the sustained write rate for Publish on a

@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/gorilla/websocket"
-	"github.com/wu/keyop-messenger/internal/federation"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/federation"
 )
 
 var upgrader = websocket.Upgrader{

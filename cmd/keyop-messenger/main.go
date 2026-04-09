@@ -11,8 +11,8 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"github.com/spf13/cobra"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
 func main() {

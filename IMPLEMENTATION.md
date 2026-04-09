@@ -489,6 +489,40 @@ type PeerSender interface {
 
 ---
 
+### Phase 16 — Ephemeral Client ✓
+
+**Depends on:** Phase 12 (federation hub, PeerReceiver), Phase 13 (root Messenger API)
+
+**Deliverables:**
+
+- `internal/federation/handshake.go` (modified): added `Ephemeral bool \`json:"ephemeral,omitempty"\`` field to `HandshakeMsg`. The `omitempty` tag ensures the field is absent from non-ephemeral connections and hub responses, preserving wire compatibility with pre-Phase 16 hubs.
+
+- `internal/federation/hub.go` (modified): in `serveConn`, the hub now checks `hs.Ephemeral` before starting replay (`ReplayFrom`). Replay is skipped entirely for ephemeral connections even if `LastID` is set. Ephemeral connections are logged at a distinct info message.
+
+- `internal/federation/ephemeral_client.go` (new): `EphemeralClientConfig`, `EphemeralClient`, `ephemeralWriteItem`. Key methods: `NewEphemeralClient`, `AddHandler`, `Connect`, `ConnectWithReconnect`, `Publish`, `Close`. Internal: `startConn`, `dispatchEnvelope`, `writeLoop`, `reconnectLoop`. See DESIGN.md §11 for semantics. `noopAuditLogger` satisfies `audit.AuditLogger` by discarding all events.
+
+  Goroutine design: three goroutines per connection (PeerReceiver, watcher, write loop) plus one optional reconnect loop. All tracked in `EphemeralClient.wg`; `Close` calls `wg.Wait()`. The watcher goroutine ensures `conn.Close()` is called before `wg.Wait()` returns, preventing goroutine leaks if the write loop is blocked.
+
+  Per-message ack: `Publish` enqueues an `ephemeralWriteItem` with a buffered `doneCh` (cap 1). The write loop batches items from `writeQ`, sends one binary frame, then blocks on `ackCh` for the hub's text-frame ack. All items in the batch are signalled together via non-blocking sends to `doneCh`.
+
+- `ephemeral.go` (new, root package): `EphemeralConfig`, `EphemeralMessenger`. Public methods: `NewEphemeralMessenger`, `RegisterPayloadType`, `Subscribe(channel string, handler func(Message))`, `Connect(ctx)`, `Publish(ctx, channel, payloadType, payload)`, `Close`. Re-exports `ErrEphemeralConnLost`.
+
+- `ephemeral_test.go` (new, `//go:build integration`): 7 integration tests covering: publish-to-hub delivery, subscribe-from-hub delivery, no-replay on connect, context-cancelled publish, registered payload type decoding, auto-reconnect lifecycle, and concurrent multi-publish.
+
+**Test strategy:**
+
+- `TestEphemeralMessenger_Publish_ToHub`: publish via ephemeral client; assert hub subscriber receives the message.
+- `TestEphemeralMessenger_Subscribe_FromHub`: hub publishes; assert ephemeral handler fires.
+- `TestEphemeralMessenger_Subscribe_NoReplay`: publish before ephemeral connects; assert pre-connect message is not delivered; post-connect messages are.
+- `TestEphemeralMessenger_Publish_ContextCancelled`: pre-cancelled context; assert `context.Canceled` returned immediately.
+- `TestEphemeralMessenger_RegisterPayloadType`: typed payload decoded correctly in handler.
+- `TestEphemeralMessenger_AutoReconnect`: connect, publish, close hub, close ephemeral; verify no deadlock.
+- `TestEphemeralMessenger_MultiplePublish`: 20 concurrent publishes all succeed and are acked.
+
+All tests use `hubLocalAddr(t, hub)` (returns `localhost:PORT`) and hub cert CN `"localhost"` so TLS hostname verification passes without IP SANs.
+
+---
+
 ## 5. Public API Surface
 
 ```go
@@ -535,39 +569,38 @@ var (
     ErrPayloadTypeAlreadyRegistered = errors.New("payload type already registered")
     ErrInvalidChannelName           = errors.New("invalid channel name")
     ErrMessengerClosed              = errors.New("messenger is closed")
+    ErrEphemeralConnLost            = errors.New("ephemeral client: connection lost before ack")
 )
+
+// EphemeralMessenger — stateless hub client (Phase 16)
+
+type EphemeralConfig struct {
+    HubAddr         string
+    InstanceName    string
+    Subscribe       []string
+    TLS             TLSConfig
+    AutoReconnect   bool
+    ReconnectBase   time.Duration
+    ReconnectMax    time.Duration
+    ReconnectJitter float64
+    MaxBatchBytes   int
+    WriteQueueSize  int
+}
+
+func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMessenger, error)
+
+type EphemeralMessenger struct { ... }
+
+func (m *EphemeralMessenger) RegisterPayloadType(typeStr string, prototype any) error
+func (m *EphemeralMessenger) Subscribe(channel string, handler func(msg Message)) error
+func (m *EphemeralMessenger) Connect(ctx context.Context) error
+func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType string, payload any) error
+func (m *EphemeralMessenger) Close() error
 ```
 
 ---
 
-## 6. Phase Sequencing
-
-```
-Phase 1  (Module + Config)
-  ├─ Phase 2  (Envelope + Registry)
-  │    └─ Phase 3  (Writer goroutine)
-  │         └─ Phase 4  (Offset + Watcher)
-  │              └─ Phase 5  (Subscriber + Dead-letter)
-  │                   └─ Phase 6  (Compaction)
-  │    └─ Phase 10 (Wire framing + handshake)
-  │         └─ Phase 11 (Policy engine) ──────────────┐
-  ├─ Phase 7  (Dedup LRU)          [parallel w/ 2–6]  │
-  ├─ Phase 8  (Audit log)          [parallel w/ 2–7]  │
-  └─ Phase 9  (TLS utilities)      [parallel w/ 2–8]  │
-                                                       ▼
-                              Phase 12 (Hub + peers) [needs 7,8,9,10,11]
-                                   └─ Phase 13 (Root API) [needs 5,6,7,8,12]
-                                        └─ Phase 15 (Hardening + integration)
-Phase 9 └─ Phase 14 (CLI keygen)   [parallel w/ 13]
-```
-
-**Critical path:** 1 → 2 → 3 → 4 → 5 → 6 → (merge 7+8+9+10+11) → 12 → 13 → 15
-
-Phases 7, 8, and 9 are fully independent once Phase 1 is done and can be worked in parallel. Phase 10 requires only Phase 2.
-
----
-
-## 7. Testing Conventions
+## 6. Testing Conventions
 
 - All tests use `testify/require` (fatal) and `testify/assert` (non-fatal).
 - All tests run with `-race` in CI. No test is exempt.

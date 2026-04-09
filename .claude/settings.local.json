@@ -11,7 +11,19 @@
       "Bash(sed -i '' 's/NewSubscriber\\(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log\\)/NewSubscriber\\(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log, 0\\)/' /Volumes/tank/projects/keyop-messenger/internal/storage/subscriber_test.go)",
       "Bash(sed -i '' 's/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, \\\\&testutil.FakeLogger{}\\)/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, \\\\&testutil.FakeLogger{}, 0\\)/g' /Volumes/tank/projects/keyop-messenger/internal/storage/subscriber_test.go)",
       "Bash(sed -i '' 's/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log\\)/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0\\)/g' /Volumes/tank/projects/keyop-messenger/internal/storage/subscriber_test.go)",
-      "Bash(sed -i '' 's/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, \\\\&testutil.FakeLogger{}\\)/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, \\\\&testutil.FakeLogger{}, 0\\)/' /Volumes/tank/projects/keyop-messenger/internal/storage/subscriber_test.go)"
+      "Bash(sed -i '' 's/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, \\\\&testutil.FakeLogger{}\\)/NewSubscriber\\(\"\"s\"\", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, \\\\&testutil.FakeLogger{}, 0\\)/' /Volumes/tank/projects/keyop-messenger/internal/storage/subscriber_test.go)",
+      "Bash(git stash:*)",
+      "Bash(ls -la /Volumes/tank/projects/keyopx/keyop-messenger/*ephemeral*)",
+      "Bash(ls -la /Volumes/tank/projects/keyopx/keyop-messenger/internal/federation/*test*)",
+      "Bash(grep -n \"type.*AuditLogger\\\\|func.*NewAtomicPolicy\" /Volumes/tank/projects/keyopx/keyop-messenger/internal/federation/*.go /Volumes/tank/projects/keyopx/keyop-messenger/internal/audit/*.go)",
+      "Bash(go tool:*)",
+      "Bash(for i:*)",
+      "Bash(do echo:*)",
+      "Bash(done)",
+      "Bash(golangci-lint run:*)",
+      "Bash(go fmt:*)",
+      "Bash(go vet:*)",
+      "Bash(go run:*)"
     ]
   }
 }

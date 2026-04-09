@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Phases 1–15 complete.
+Phases 1–16 complete.
 See `DESIGN.md` for the full architecture and `IMPLEMENTATION.md` for the phase plan.
 
 ## Build / Test / Install Commands

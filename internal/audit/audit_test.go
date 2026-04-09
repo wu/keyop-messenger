@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wu/keyop-messenger/internal/audit"
-	"github.com/wu/keyop-messenger/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/audit"
+	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
 // readJSONLEvents reads all JSON lines from path and decodes them into Events.

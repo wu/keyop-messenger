@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wu/keyop-messenger/internal/federation"
-	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/federation"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -273,20 +273,44 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "hub2")
 
 	// Hub1 starts with forward policy for channel-a only.
+	// Hub2 connects as a CLIENT, so it must be in AllowedClients with allow_channels.
 	hub1M := newHubMessenger(t, "hub1", filepath.Join(dir, "hub1"), caFile,
 		certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			// addr="localhost" matches Hub2's cert CN when Hub2 connects.
-			PeerHubs: []PeerHubConfig{
-				{Addr: "localhost", Forward: []string{"channel-a"}},
+			AllowedClients: []AllowedClient{
+				{
+					Name:          "hub2",
+					AllowChannels: []string{"channel-a"}, // Initial policy: only channel-a
+				},
 			},
 		},
 	)
 	hub1Addr := hubLocalAddr(t, hub1M)
 
-	// Hub2 connects to Hub1 as a client.
-	hub2M := newClientMessenger(t, "hub2", dir, caFile,
-		certFor("localhost"), keyFor("localhost"), hub1Addr)
+	// Hub2 connects to Hub1 as a client, subscribing to channel-a and channel-b.
+	// Note: Subscribe list in ClientHubRef is sent in the handshake;
+	// later Messenger.Subscribe() calls only register local handlers.
+	cfg := &Config{
+		Name: "hub2",
+		Storage: StorageConfig{
+			DataDir:    filepath.Join(dir, "hub2"),
+			SyncPolicy: SyncPolicyNone,
+		},
+		Client: ClientConfig{
+			Enabled: true,
+			Hubs: []ClientHubRef{
+				{
+					Addr:      hub1Addr,
+					Subscribe: []string{"channel-a", "channel-b"},
+				},
+			},
+		},
+		TLS: TLSConfig{Cert: certFor("hub2"), Key: keyFor("hub2"), CA: caFile},
+	}
+	cfg.ApplyDefaults()
+	hub2M, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = hub2M.Close() })
 
 	received := make(chan string, 20)
 	require.NoError(t, hub2M.Subscribe(context.Background(), "channel-a", "sub",
@@ -294,8 +318,8 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 	require.NoError(t, hub2M.Subscribe(context.Background(), "channel-b", "sub",
 		func(_ context.Context, msg Message) error { received <- "b"; return nil }))
 
-	// Allow connection to establish.
-	time.Sleep(200 * time.Millisecond)
+	// Allow connection and subscriptions to establish.
+	time.Sleep(1 * time.Second)
 
 	// Confirm channel-a is forwarded before reload.
 	require.NoError(t, hub1M.Publish(context.Background(), "channel-a", "test.Evt",
@@ -308,20 +332,27 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 	}
 
 	// Write initial config file and start PolicyWatcher.
+	// Include AllowedClients to preserve the Hub2 client configuration.
 	cfgPath := filepath.Join(dir, "hub1-policy.yaml")
 	writeFedCfg(t, cfgPath, federation.HubConfig{
-		PeerHubs: []federation.PeerHubConfig{
-			{Addr: "localhost", Forward: []string{"channel-a"}},
+		AllowedClients: []federation.AllowedClient{
+			{
+				Name:          "hub2",
+				AllowChannels: []string{"channel-a"}, // Initial: only channel-a
+			},
 		},
 	})
 	pw, err := federation.NewPolicyWatcher(cfgPath, hub1M.hub, hub1M.auditL, hub1M.log)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = pw.Close() })
 
-	// Hot-reload: add channel-b to the forward list.
+	// Hot-reload: expand to include channel-b.
 	writeFedCfg(t, cfgPath, federation.HubConfig{
-		PeerHubs: []federation.PeerHubConfig{
-			{Addr: "localhost", Forward: []string{"channel-a", "channel-b"}},
+		AllowedClients: []federation.AllowedClient{
+			{
+				Name:          "hub2",
+				AllowChannels: []string{"channel-a", "channel-b"}, // Expanded: add channel-b
+			},
 		},
 	})
 

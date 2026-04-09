@@ -41,9 +41,9 @@ Clients connect only to hubs. Hubs connect to peer hubs. Clients never connect d
 Private Network                        External Network
 ────────────────                       ────────────────
 Instance A ─┐                         Instance D ─┐
-Instance B ─┼──→ Hub 1 ──(selected)──→ Hub 2 ←────┤ Instance E
-Instance C ─┘          channels only              └──(selected)──→ Instance F
-                                                   channels only
+Instance B ─┼──→ Hub 1 ──(selected)──→ Hub 2 ←────┤─ Instance E
+Instance C ─┘           channels only             └──(selected)──→ Instance F
+                                                    channels only
 ```
 
 A single instance may simultaneously accept client connections (hub role) and dial outbound to peer hubs (client role). In this case it acts as a relay between its local clients and the wider federation.
@@ -629,3 +629,100 @@ audit:
   max_size_mb: 100         # Rotate audit.jsonl when it reaches this size
   max_files: 10            # Number of rotated audit files to retain
 ```
+
+---
+
+## 11. Ephemeral Client
+
+### 11.1 Overview
+
+An **ephemeral client** is a process that connects to a hub without maintaining any local storage. It has two primary use cases:
+
+- **Fire-and-forget publishers** that need guaranteed delivery confirmation (the hub has written the message to disk) but do not consume messages themselves.
+- **Live-view consumers** that want to receive messages only while connected; they accept that messages published during a disconnect are permanently missed.
+
+The public API is `EphemeralMessenger`; the internal implementation is `EphemeralClient` in `internal/federation`.
+
+### 11.2 Handshake Flag
+
+The ephemeral client sets `"ephemeral": true` in its handshake frame:
+
+```json
+{
+  "instance_name": "billing-service",
+  "role":          "client",
+  "version":       "1",
+  "subscribe":     ["alerts"],
+  "ephemeral":     true
+}
+```
+
+The `ephemeral` field is `omitempty`; it is absent from non-ephemeral connections and from the hub's response. This ensures backward compatibility with hubs that do not yet understand the field.
+
+When the hub sees `ephemeral: true`, it skips the `ReplayFrom` step on connect — even if `last_id` is set. The hub also logs ephemeral connections at a distinct info message so operators can distinguish them from durable client connections.
+
+### 11.3 Publish Semantics
+
+`EphemeralMessenger.Publish` (and the underlying `EphemeralClient.Publish`) blocks until one of:
+
+| Outcome | Return value |
+|---|---|
+| Hub writes the message and sends an ack text frame | `nil` |
+| Connection drops before the ack arrives | `ErrEphemeralConnLost` |
+| `ctx` is cancelled or deadline exceeded | wrapped `ctx.Err()` |
+| `Close()` was called | `ErrEphemeralClosed` |
+
+On `ErrEphemeralConnLost`, the message **may or may not** have been received by the hub — the caller must decide whether to retry. There is no automatic retransmission; that is the caller's responsibility.
+
+Multiple `Publish` calls may be batched into a single binary WebSocket frame when they arrive concurrently. The hub acks the entire batch with one text frame; all callers in the batch are unblocked simultaneously. The hub uses the standard `PeerReceiver` ack path, so all deduplication, policy enforcement, and local storage semantics are identical to regular federation.
+
+### 11.4 Subscribe Semantics
+
+`EphemeralMessenger.Subscribe` registers an in-memory handler. No offset file is created and no replay occurs:
+
+- The handler is called synchronously in the receive goroutine; it must not block.
+- On reconnect (with `AutoReconnect`), delivery resumes from the current hub position. Messages published while disconnected are never delivered.
+- The channel list declared in `Subscribe []string` is sent in the handshake; the hub intersects it with its per-client allowlist as normal (`effective = subscribe ∩ allowlist`).
+
+Handler errors are logged at `WARN` level and do not stop delivery to subsequent handlers or messages.
+
+### 11.5 Auto-Reconnect
+
+With `AutoReconnect: true`, `EphemeralMessenger.Connect` (which delegates to `EphemeralClient.ConnectWithReconnect`) returns after the first connection succeeds and starts a background reconnect loop. On disconnect, the loop retries with exponential backoff:
+
+```
+delay = min(reconnect_base * 2^attempt, reconnect_max) ± jitter
+```
+
+The `writeQ` channel (depth 256 by default) persists across reconnects. Items enqueued by `Publish` while disconnected wait in `writeQ` until a new connection is established. If the queue fills, new `Publish` calls block until space is available (no drops).
+
+With `AutoReconnect: false`, `Connect` dials once. After disconnect, subsequent `Publish` calls return `ErrEphemeralConnLost` until `Connect` is called again.
+
+### 11.6 Goroutine Model
+
+Each call to `startConn` (internal) starts three goroutines per connection:
+
+| Goroutine | Role |
+|---|---|
+| `PeerReceiver` | Owns all reads on the WebSocket conn; dispatches inbound binary frames to in-memory handlers; routes text-frame acks to `ackCh` |
+| Watcher | Waits for `PeerReceiver.Done()` or `stop`; closes `connDead`, closes `conn`, then waits for `PeerReceiver` to fully exit |
+| Write loop | Drains `writeQ`, writes batched binary frames, blocks waiting for an ack on `ackCh`; exits on `connDead` or `stop` |
+
+With `AutoReconnect: true`, a fourth goroutine (`reconnectLoop`) runs for the lifetime of the client.
+
+All goroutines are tracked in `EphemeralClient.wg`; `Close()` closes the `stop` channel and calls `wg.Wait()`, ensuring clean shutdown with no dangling goroutines.
+
+### 11.7 No Audit Log
+
+`EphemeralClient` does not write an audit log. Inbound messages dispatched to handlers use a `noopAuditLogger`. The hub's own audit log records ephemeral client connections (`client_connected`) and disconnections (`peer_disconnected`) via its standard `serveConn` path.
+
+### 11.8 Differences from Regular Client
+
+| Aspect | Regular `Client` | `EphemeralClient` |
+|---|---|---|
+| Local storage | Writes received messages to `.jsonl` | None — in-memory handlers only |
+| Replay on reconnect | Sends `last_id`; hub replays missed messages | Never replays; `ephemeral: true` in handshake |
+| Publish ack | Ack tracked per batch, unacked messages replayed on reconnect | Ack unblocks callers; on loss caller receives `ErrEphemeralConnLost` |
+| Subscriber offset | Durable offset file per subscriber | No offset file |
+| Audit log | Full hub events | No audit log on client side |
+| Dedup | Shared instance-wide LRU (100k IDs) | Small per-connection LRU (1024 IDs, defense-in-depth) |
