@@ -1,3 +1,9 @@
+## [0.3.0](https://github.com/wu/keyop-messenger/compare/v0.2.0...0.3.0) (2026-04-09)
+
+### Features
+
+* add godoc badge, testing semantic release workflow ([c737dd2](https://github.com/wu/keyop-messenger/commit/c737dd2c2896e9587cb3ef99835e29645be4499c))
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
