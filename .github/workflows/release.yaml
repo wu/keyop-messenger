@@ -3,15 +3,9 @@ name: Release
 # ──────────────────────────────────────────────────────────────────────────────
 # Trigger: every push to main.
 #
-# Job flow:
-#   semantic-release  →  (on new tag/release published)  →  build-release
-#
-#  • semantic-release  analyses Conventional Commits, bumps the version,
-#    creates a git tag, publishes a GitHub Release, and commits CHANGELOG.md.
-#    If no releasable commits are present it exits 0 and the build job is skipped.
-#
-#  • build-release  cross-compiles binaries for every supported platform and
-#    uploads them as assets to the GitHub Release just created.
+# semantic-release analyses Conventional Commits, bumps the version,
+# creates a git tag, publishes a GitHub Release, and commits CHANGELOG.md.
+# If no releasable commits are present it exits 0.
 # ──────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -75,76 +69,3 @@ jobs:
           GIT_COMMITTER_NAME:  github-actions[bot]
           GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
         run: npx semantic-release
-
-  # ────────────────────────────────────────────────────────────────────────────
-  # Job 2 – cross-compile and upload release assets
-  # ────────────────────────────────────────────────────────────────────────────
-  build-release:
-    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
-    # Run when triggered by a release event OR when semantic-release published a release
-    # during a push-run (needs.semantic-release.outputs.released is set to 'true').
-    if: github.event_name == 'release' || needs.semantic-release.outputs.released == 'true'
-    runs-on: ${{ matrix.runner }}
-
-    strategy:
-      matrix:
-        include:
-          - { goos: linux,   goarch: amd64, runner: ubuntu-latest }
-          - { goos: linux,   goarch: arm64, runner: ubuntu-latest }
-          - { goos: linux,   goarch: arm,   goarm: "6", runner: ubuntu-latest }
-          - { goos: darwin,  goarch: amd64, runner: macos-latest }
-          - { goos: darwin,  goarch: arm64, runner: macos-latest }
-
-    steps:
-      - name: Checkout at the new tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.release.tag_name }}
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Build binary
-        env:
-          GOOS:   ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          GOARM:  ${{ matrix.goarm }}
-        run: |
-          VERSION="${{ github.event.release.tag_name }}"
-          COMMIT="$(git rev-parse --short HEAD)"
-          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          LDFLAGS="-X github.com/wu/keyop-messenger/cmd.Version=${VERSION} \
-                   -X github.com/wu/keyop-messenger/cmd.Commit=${COMMIT} \
-                   -X github.com/wu/keyop-messenger/cmd.Branch=main \
-                   -X github.com/wu/keyop-messenger/cmd.BuildTime=${BUILD_TIME}"
-
-          EXT=""
-          [[ "${GOOS}" == "windows" ]] && EXT=".exe"
-
-          # Normalize architecture name for ARM builds so the resulting filename
-          # doesn't contain 'arm' twice (e.g. linux-arm-arm6). For ARM we produce
-          # 'arm6' or 'arm7' (appended to 'arm' in a single token).
-          if [[ "${GOARCH}" == "arm" && -n "${GOARM}" ]]; then
-            ARCH_NAME="arm${GOARM}"
-          else
-            ARCH_NAME="${GOARCH}"
-          fi
-
-          BINARY="keyop-messenger-${VERSION}-${GOOS}-${ARCH_NAME}${EXT}"
-          mkdir -p output
-          echo "Building output/${BINARY}"
-          # Ensure cgo is disabled for reproducible cross-compiles and to avoid cgo/toolchain issues
-          export CGO_ENABLED=0
-          go build -ldflags "${LDFLAGS}" -o "output/${BINARY}" ./cmd/keyop-messenger
-          gzip -n "output/${BINARY}"
-
-      - name: Upload asset to GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.semantic-release.outputs.version || github.event.release.tag_name }}
-          files: output/*.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
