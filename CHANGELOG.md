@@ -1,3 +1,13 @@
+## [0.4.0](https://github.com/wu/keyop-messenger/compare/0.3.0...0.4.0) (2026-04-09)
+
+### Features
+
+* add Ephemeral Client support with live-only messaging and stateless operation ([9ae9c40](https://github.com/wu/keyop-messenger/commit/9ae9c40f2f38f32197f3735a9da71d3f2f7584d3))
+
+### Refactoring
+
+* clean up failing lint tests ([20f8ad6](https://github.com/wu/keyop-messenger/commit/20f8ad66c16a99d02f56c7bf0ff430823a3d76a1))
+
 ## [0.3.0](https://github.com/wu/keyop-messenger/compare/v0.2.0...0.3.0) (2026-04-09)
 
 ### Features
