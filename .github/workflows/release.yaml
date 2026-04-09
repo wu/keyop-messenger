@@ -1,0 +1,150 @@
+name: Release
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Trigger: every push to main.
+#
+# Job flow:
+#   semantic-release  →  (on new tag/release published)  →  build-release
+#
+#  • semantic-release  analyses Conventional Commits, bumps the version,
+#    creates a git tag, publishes a GitHub Release, and commits CHANGELOG.md.
+#    If no releasable commits are present it exits 0 and the build job is skipped.
+#
+#  • build-release  cross-compiles binaries for every supported platform and
+#    uploads them as assets to the GitHub Release just created.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: ["main"]
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write   # push tag + release, commit CHANGELOG
+  issues: write     # semantic-release GitHub plugin
+  pull-requests: write
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 1 – semantic-release
+  # ────────────────────────────────────────────────────────────────────────────
+  semantic-release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+
+    outputs:
+      # "true" when a new release was actually published this run.
+      released: ${{ steps.release.outputs.new_release_published }}
+      version:  ${{ steps.release.outputs.new_release_version }}
+
+    steps:
+      - name: Checkout (full history required by semantic-release)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT so the CHANGELOG commit can trigger downstream workflows.
+          # Falls back to GITHUB_TOKEN if the secret is not set.
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+
+      - name: Install semantic-release and plugins
+        run: |
+          npm install --no-save \
+            semantic-release \
+            @semantic-release/changelog \
+            @semantic-release/commit-analyzer \
+            @semantic-release/git \
+            @semantic-release/github \
+            @semantic-release/release-notes-generator \
+            conventional-changelog-conventionalcommits
+
+      - name: Run semantic-release
+        id: release
+        env:
+          # Prefer a personal access token so the created Release triggers workflows.
+          # If RELEASE_TOKEN is not set, fallback to GITHUB_TOKEN (less reliable).
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          GIT_AUTHOR_NAME:  github-actions[bot]
+          GIT_AUTHOR_EMAIL: github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME:  github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: npx semantic-release
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job 2 – cross-compile and upload release assets
+  # ────────────────────────────────────────────────────────────────────────────
+  build-release:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    # Run when triggered by a release event OR when semantic-release published a release
+    # during a push-run (needs.semantic-release.outputs.released is set to 'true').
+    if: github.event_name == 'release' || needs.semantic-release.outputs.released == 'true'
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux,   goarch: arm64, runner: ubuntu-latest }
+          - { goos: linux,   goarch: arm,   goarm: "6", runner: ubuntu-latest }
+          - { goos: darwin,  goarch: amd64, runner: macos-latest }
+          - { goos: darwin,  goarch: arm64, runner: macos-latest }
+
+    steps:
+      - name: Checkout at the new tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binary
+        env:
+          GOOS:   ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM:  ${{ matrix.goarm }}
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-X github.com/wu/keyop-messenger/cmd.Version=${VERSION} \
+                   -X github.com/wu/keyop-messenger/cmd.Commit=${COMMIT} \
+                   -X github.com/wu/keyop-messenger/cmd.Branch=main \
+                   -X github.com/wu/keyop-messenger/cmd.BuildTime=${BUILD_TIME}"
+
+          EXT=""
+          [[ "${GOOS}" == "windows" ]] && EXT=".exe"
+
+          # Normalize architecture name for ARM builds so the resulting filename
+          # doesn't contain 'arm' twice (e.g. linux-arm-arm6). For ARM we produce
+          # 'arm6' or 'arm7' (appended to 'arm' in a single token).
+          if [[ "${GOARCH}" == "arm" && -n "${GOARM}" ]]; then
+            ARCH_NAME="arm${GOARM}"
+          else
+            ARCH_NAME="${GOARCH}"
+          fi
+
+          BINARY="keyop-messenger-${VERSION}-${GOOS}-${ARCH_NAME}${EXT}"
+          mkdir -p output
+          echo "Building output/${BINARY}"
+          # Ensure cgo is disabled for reproducible cross-compiles and to avoid cgo/toolchain issues
+          export CGO_ENABLED=0
+          go build -ldflags "${LDFLAGS}" -o "output/${BINARY}" ./cmd/keyop-messenger
+          gzip -n "output/${BINARY}"
+
+      - name: Upload asset to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.semantic-release.outputs.version || github.event.release.tag_name }}
+          files: output/*.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
