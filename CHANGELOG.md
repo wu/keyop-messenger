@@ -1,3 +1,9 @@
+## [0.6.1](https://github.com/wu/keyop-messenger/compare/v0.6.0...v0.6.1) (2026-04-10)
+
+### Bug Fixes
+
+* return context.Canceled error if dial context is canceled ([770ea1d](https://github.com/wu/keyop-messenger/commit/770ea1d71439cd802f9ee65bd726219e6e6520c4))
+
 ## [v0.6.0](https://github.com/wu/keyop-messenger/compare/v0.5.0...v0.6.0) (2026-04-10)
 
 ### Chores
