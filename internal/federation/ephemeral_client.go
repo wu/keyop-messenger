@@ -188,6 +188,10 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
+		// If context was cancelled, return context.Canceled to maintain error chain semantics
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("ephemeral: dial %s: %w", hubAddr, err)
 	}
 
