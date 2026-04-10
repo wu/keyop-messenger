@@ -22,11 +22,12 @@ permissions:
 jobs:
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Job 1 – semantic-release
+  # Job – semantic-release (only runs if tests pass)
   # ────────────────────────────────────────────────────────────────────────────
   semantic-release:
     name: Semantic Release
     runs-on: ubuntu-latest
+    needs: test
 
     outputs:
       # "true" when a new release was actually published this run.
