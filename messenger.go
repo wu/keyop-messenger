@@ -272,6 +272,11 @@ func (m *Messenger) HubAddr() string {
 	return m.hub.Addr()
 }
 
+// InstanceName returns the configured instance name for this messenger.
+func (m *Messenger) InstanceName() string {
+	return m.cfg.Name
+}
+
 // RegisterPayloadType associates typeStr with the Go type of prototype for
 // decoding incoming message payloads. Registering the same typeStr twice
 // returns ErrPayloadTypeAlreadyRegistered.

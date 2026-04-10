@@ -403,3 +403,35 @@ func TestRegisterPayloadTypeDuplicate(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrPayloadTypeAlreadyRegistered)
 }
+
+// TestInstanceName verifies that InstanceName returns the configured instance name.
+func TestInstanceName(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	cfg.Name = "my-messenger-instance"
+
+	m, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	assert.Equal(t, "my-messenger-instance", m.InstanceName())
+}
+
+// TestInstanceNameDefault verifies that InstanceName returns the default name when not explicitly set.
+func TestInstanceNameDefault(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{
+		Storage: StorageConfig{
+			DataDir:    dir,
+			SyncPolicy: SyncPolicyNone,
+		},
+	}
+	cfg.ApplyDefaults()
+
+	m, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// After ApplyDefaults, Name should be set to the hostname
+	assert.NotEmpty(t, m.InstanceName())
+}
