@@ -1,3 +1,9 @@
+## [0.6.2](https://github.com/wu/keyop-messenger/compare/v0.6.1...v0.6.2) (2026-04-10)
+
+### Refactoring
+
+* unify client and peer configurations under a single `allowed_peers` abstraction ([76dd0cf](https://github.com/wu/keyop-messenger/commit/76dd0cf51b7ff1f53d089d44dbd2e9eb4aeaecb8))
+
 ## [0.6.1](https://github.com/wu/keyop-messenger/compare/v0.6.0...v0.6.1) (2026-04-10)
 
 ### Bug Fixes
