@@ -13,8 +13,8 @@
  */
 
 export default {
-  // Match the existing bare-semver tag format (no "v" prefix).
-  tagFormat: "${version}",
+  // Tags are written with a "v" prefix (v0.5.0, v0.5.1, …).
+  tagFormat: "v${version}",
 
   branches: ["main"],
 
