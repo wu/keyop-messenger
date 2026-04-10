@@ -1,3 +1,15 @@
+## [0.3.0](https://github.com/wu/keyop-messenger/compare/v0.2.0...v0.3.0) (2026-04-10)
+
+### Features
+
+* add Ephemeral Client support with live-only messaging and stateless operation ([9ae9c40](https://github.com/wu/keyop-messenger/commit/9ae9c40f2f38f32197f3735a9da71d3f2f7584d3))
+* add godoc badge, testing semantic release workflow ([c737dd2](https://github.com/wu/keyop-messenger/commit/c737dd2c2896e9587cb3ef99835e29645be4499c))
+* add InstanceName method and tests ([c025026](https://github.com/wu/keyop-messenger/commit/c0250269aa6efc25db593f4296406add485a0a0f))
+
+### Refactoring
+
+* clean up failing lint tests ([20f8ad6](https://github.com/wu/keyop-messenger/commit/20f8ad66c16a99d02f56c7bf0ff430823a3d76a1))
+
 ## [0.5.0](https://github.com/wu/keyop-messenger/compare/0.4.0...0.5.0) (2026-04-10)
 
 ### Features
