@@ -39,7 +39,7 @@ func TestEphemeralMessenger_Publish_ToHub(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
+			AllowedPeers: []AllowedPeer{
 				{Name: "em-client"},
 			},
 		},
@@ -79,8 +79,8 @@ func TestEphemeralMessenger_Subscribe_FromHub(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"events"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"events"}},
 			},
 		},
 	)
@@ -115,8 +115,8 @@ func TestEphemeralMessenger_Subscribe_NoReplay(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"events"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"events"}},
 			},
 		},
 	)
@@ -156,7 +156,7 @@ func TestEphemeralMessenger_Publish_ContextCancelled(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), nil)
@@ -183,8 +183,8 @@ func TestEphemeralMessenger_RegisterPayloadType(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"typed"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"typed"}},
 			},
 		},
 	)
@@ -222,7 +222,7 @@ func TestEphemeralMessenger_AutoReconnect(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	em, err := NewEphemeralMessenger(EphemeralConfig{
@@ -260,7 +260,7 @@ func TestEphemeralMessenger_MultiplePublish(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	var hubReceived atomic.Int32
@@ -301,8 +301,8 @@ func TestEphemeralMessenger_SubscribeBeforeConnect(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"chan1", "chan2"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"chan1", "chan2"}},
 			},
 		},
 	)
@@ -340,8 +340,8 @@ func TestEphemeralMessenger_MultipleHandlers(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"events"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"events"}},
 			},
 		},
 	)
@@ -380,8 +380,8 @@ func TestEphemeralMessenger_HandlerError(t *testing.T) {
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"events"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"events"}},
 			},
 		},
 	)
@@ -423,7 +423,7 @@ func TestEphemeralMessenger_PublishAfterClose(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), nil)
@@ -445,7 +445,7 @@ func TestEphemeralMessenger_SubscribeAfterClose(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), nil)
@@ -466,7 +466,7 @@ func TestEphemeralMessenger_CloseIdempotent(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "em-client")
 
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "em-client"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "em-client"}}},
 	)
 
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), nil)
@@ -490,8 +490,8 @@ func TestEphemeralMessenger_AllowChannels(t *testing.T) {
 	// Allowlist only permits "allowed-chan", not "denied-chan".
 	hub := newHubMessenger(t, "hub", dir+"/hub-data", caFile, certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
-				{Name: "em-client", AllowChannels: []string{"allowed-chan"}},
+			AllowedPeers: []AllowedPeer{
+				{Name: "em-client", Subscribe: []string{"allowed-chan"}},
 			},
 		},
 	)

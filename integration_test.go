@@ -124,7 +124,7 @@ func TestIntegrationHubTwoClients(t *testing.T) {
 	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
 		certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{{Name: "client-a"}, {Name: "client-b"}},
+			AllowedPeers: []AllowedPeer{{Name: "client-a"}, {Name: "client-b"}},
 		},
 	)
 	hubAddr := hubLocalAddr(t, hubM)
@@ -188,7 +188,7 @@ func TestIntegrationRingDedup(t *testing.T) {
 	// Hub2: hub, accepts connections from hub1 (identified by its TLS CN).
 	hub2M := newHubMessenger(t, "hub2", filepath.Join(dir, "hub2"), caFile,
 		certFor("localhost"), keyFor("localhost"),
-		HubConfig{AllowedClients: []AllowedClient{{Name: "hub1"}}},
+		HubConfig{AllowedPeers: []AllowedPeer{{Name: "hub1"}}},
 	)
 	hub2Addr := hubLocalAddr(t, hub2M)
 
@@ -273,14 +273,14 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "hub2")
 
 	// Hub1 starts with forward policy for channel-a only.
-	// Hub2 connects as a CLIENT, so it must be in AllowedClients with allow_channels.
+	// Hub2 connects as a CLIENT, so it must be in AllowedPeers with subscribe channels.
 	hub1M := newHubMessenger(t, "hub1", filepath.Join(dir, "hub1"), caFile,
 		certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			AllowedClients: []AllowedClient{
+			AllowedPeers: []AllowedPeer{
 				{
-					Name:          "hub2",
-					AllowChannels: []string{"channel-a"}, // Initial policy: only channel-a
+					Name:      "hub2",
+					Subscribe: []string{"channel-a"}, // Initial policy: only channel-a
 				},
 			},
 		},
@@ -332,13 +332,13 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 	}
 
 	// Write initial config file and start PolicyWatcher.
-	// Include AllowedClients to preserve the Hub2 client configuration.
+	// Include AllowedPeers to preserve the Hub2 client configuration.
 	cfgPath := filepath.Join(dir, "hub1-policy.yaml")
 	writeFedCfg(t, cfgPath, federation.HubConfig{
-		AllowedClients: []federation.AllowedClient{
+		AllowedPeers: []federation.AllowedPeer{
 			{
-				Name:          "hub2",
-				AllowChannels: []string{"channel-a"}, // Initial: only channel-a
+				Name:      "hub2",
+				Subscribe: []string{"channel-a"}, // Initial: only channel-a
 			},
 		},
 	})
@@ -348,10 +348,10 @@ func TestIntegrationPolicyHotReload(t *testing.T) {
 
 	// Hot-reload: expand to include channel-b.
 	writeFedCfg(t, cfgPath, federation.HubConfig{
-		AllowedClients: []federation.AllowedClient{
+		AllowedPeers: []federation.AllowedPeer{
 			{
-				Name:          "hub2",
-				AllowChannels: []string{"channel-a", "channel-b"}, // Expanded: add channel-b
+				Name:      "hub2",
+				Subscribe: []string{"channel-a", "channel-b"}, // Expanded: add channel-b
 			},
 		},
 	})
@@ -391,9 +391,9 @@ func TestIntegrationBackpressure(t *testing.T) {
 			SyncPolicy: SyncPolicyAlways,
 		},
 		Hub: HubConfig{
-			Enabled:        true,
-			ListenAddr:     "127.0.0.1:0",
-			AllowedClients: []AllowedClient{{Name: "publisher"}},
+			Enabled:      true,
+			ListenAddr:   "127.0.0.1:0",
+			AllowedPeers: []AllowedPeer{{Name: "publisher"}},
 		},
 		TLS: TLSConfig{
 			Cert: certFor("localhost"),
