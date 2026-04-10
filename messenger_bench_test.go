@@ -101,9 +101,9 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 			SyncPolicy: SyncPolicyNone,
 		},
 		Hub: HubConfig{
-			Enabled:        true,
-			ListenAddr:     "127.0.0.1:0",
-			AllowedClients: []AllowedClient{{Name: "bench-client"}},
+			Enabled:      true,
+			ListenAddr:   "127.0.0.1:0",
+			AllowedPeers: []AllowedPeer{{Name: "bench-client"}},
 		},
 		TLS: TLSConfig{
 			Cert: writePEM("hub.crt", hubCert),

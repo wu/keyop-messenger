@@ -93,7 +93,7 @@ func newHub(t *testing.T, cfg federation.HubConfig, cw *countingWriter, auditL a
 func TestHubClientIntegration(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
-	cfg := federation.HubConfig{AllowedClients: []federation.AllowedClient{{Name: "sender"}}}
+	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
 	srv, cli := newWSPair(t)
@@ -115,7 +115,7 @@ func TestHubClientIntegration(t *testing.T) {
 func TestAllowlistRejection(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
-	cfg := federation.HubConfig{AllowedClients: []federation.AllowedClient{{Name: "allowed-only"}}}
+	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "allowed-only"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
 	srv, cli := newWSPair(t)
@@ -138,7 +138,7 @@ func TestAllowlistRejection(t *testing.T) {
 func TestDeduplication(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
-	cfg := federation.HubConfig{AllowedClients: []federation.AllowedClient{{Name: "sender"}}}
+	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
 	srv, cli := newWSPair(t)
@@ -164,10 +164,10 @@ func TestPolicyViolation(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
 	cfg := federation.HubConfig{
-		AllowedClients: []federation.AllowedClient{{Name: "sender"}},
-		PeerHubs: []federation.PeerHubConfig{
-			{Addr: "sender:7740", Forward: nil, Receive: []string{"allowed-ch"}},
-		},
+		AllowedPeers: []federation.AllowedPeer{{
+			Name:    "sender",
+			Publish: []string{"allowed-ch"},
+		}},
 	}
 	hub := newHub(t, cfg, cw, auditL)
 
@@ -191,7 +191,7 @@ func TestPolicyViolation(t *testing.T) {
 func TestBackpressure(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{delay: 250 * time.Millisecond}
-	cfg := federation.HubConfig{AllowedClients: []federation.AllowedClient{{Name: "sender"}}}
+	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
 	srv, cli := newWSPair(t)

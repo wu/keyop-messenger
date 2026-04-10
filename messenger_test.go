@@ -181,9 +181,9 @@ func TestFederationEndToEnd(t *testing.T) {
 			SyncPolicy: SyncPolicyNone,
 		},
 		Hub: HubConfig{
-			Enabled:        true,
-			ListenAddr:     "127.0.0.1:0",
-			AllowedClients: []AllowedClient{{Name: "test-client"}},
+			Enabled:      true,
+			ListenAddr:   "127.0.0.1:0",
+			AllowedPeers: []AllowedPeer{{Name: "test-client"}},
 		},
 		TLS: TLSConfig{
 			Cert: writePEM("hub.crt", hubCert),

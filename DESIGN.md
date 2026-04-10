@@ -287,74 +287,59 @@ An acknowledgment frame is sent by the receiver after writing a batch to its loc
 
 **Layer 1 — mTLS:** The TLS handshake verifies the peer holds a certificate signed by the configured CA. A peer with no valid cert or a cert from an unknown CA is rejected at the TLS layer before any application code runs.
 
-**Layer 2 — Allowlist:** After the handshake, the hub extracts the instance name from the peer cert's CN and checks it against its configured `allowed_clients` or `peer_hubs` list. A peer with a valid cert but an unrecognized name is rejected with a close frame (code 4403) and the connection is recorded in the audit log.
+**Layer 2 — Allowlist:** After the handshake, the hub extracts the instance name from the peer cert's CN and checks it against its configured `allowed_peers` list. A peer with a valid cert but an unrecognized name is rejected with a close frame (code 4403) and the connection is recorded in the audit log.
 
 Clients never perform allowlist checks — a client accepts any hub it is configured to dial (trust is established by the cert).
 
-**Allowlist changes on hot-reload:** When a client's name is removed from the allowlist during a policy reload, the existing connection is allowed to drain in-flight messages before being closed gracefully. The connection is not dropped mid-message.
+**Allowlist changes on hot-reload:** When a peer's name is removed from the allowlist during a policy reload, the existing connection is allowed to drain in-flight messages before being closed gracefully. The connection is not dropped mid-message.
 
 ### 6.5 Subscription Model and Channel Policy
 
-#### 6.5.1 Client Subscriptions
+#### 6.5.1 Client Configuration
 
-Clients declare which channels they want to receive in the `subscribe` field of the handshake. The hub computes the effective channel set as:
-
-```
-effective = client.subscribe ∩ hub_allowlist_for(client)
-```
-
-The hub creates an outbound sender for the client only when the effective set is non-empty. A client that sends no `subscribe` list (or an empty one) will not receive any messages from the hub regardless of what the hub config says.
-
-There are no wildcards; all channel names are exact strings.
-
-#### 6.5.2 Hub Access Control for Clients
-
-Each entry in `allowed_clients` may optionally list the channels that client is permitted to subscribe to:
-
-```yaml
-hub:
-  allowed_clients:
-    - name: "billing-host"
-      allow_channels: ["metrics", "alerts"]  # may only subscribe to these
-    - name: "monitor"
-      allow_channels: []                     # empty = permit any channel
-```
-
-An empty `allow_channels` list means the client may subscribe to any channel. A non-empty list acts as an allowlist; the hub silently restricts the effective subscription to the intersection.
-
-#### 6.5.3 Peer Hub Policy
-
-Peer hubs connect to this hub using the same subscription mechanism. The `forward` list on a `peer_hubs` entry acts as the channel allowlist for that peer hub — it controls what that peer is permitted to subscribe to (not an auto-push list):
-
-```yaml
-hub:
-  peer_hubs:
-    - addr: "hub2.external:7740"
-      forward: ["alerts", "public-events"]   # channels hub2.external is allowed to subscribe to
-      receive: ["ack", "external-status"]    # channels this hub accepts inbound from hub2.external
-```
-
-The peer hub is identified by the hostname in `addr`. The hub verifies that the connecting peer's cert CN matches this hostname.
-
-When `hub2.external` connects, it sends `subscribe: ["alerts"]` in its handshake. The hub computes `effective = {"alerts"} ∩ {"alerts", "public-events"} = {"alerts"}` and creates a sender for that channel only.
-
-On the client side (`hub2.external`'s config), the `subscribe` field on a `client.hubs` entry declares what channels to request:
+Each outbound hub connection in `client.hubs` declares both directions independently:
 
 ```yaml
 client:
   enabled: true
   hubs:
-    - addr: "hub1.internal:7740"
-      subscribe: ["alerts"]
+    - addr: "hub.internal:7740"
+      subscribe: ["orders", "payments"]   # channels we request from the hub
+      publish:   ["billing.created"]      # channels we send to the hub
 ```
 
-#### 6.5.4 Receive Policy (Inbound Filter)
+The `subscribe` list controls which channels the hub streams to this client. The `publish` list controls which channels this client is permitted to send to the hub. An empty list means "all channels" for that direction.
 
-The `receive` list on a `peer_hubs` entry is an inbound filter that controls which channels this hub will accept when the peer hub sends messages to it. If the channel is not in `receive`, the message is discarded and recorded in the audit log as a policy violation. This is a defense-in-depth measure that protects against peer misconfiguration.
+When a client connects, the hub computes the effective subscribe channel set as:
 
-An **empty `receive` list** means "accept all channels from this peer" — no inbound filter is applied. Regular client connections always have an empty receive policy.
+```
+effective_subscribe = client.subscribe ∩ hub_subscribe_allowlist_for(client)
+```
 
-#### 6.5.5 General Notes
+The hub creates an outbound sender for the client only when the effective subscribe set is non-empty. A client that sends no `subscribe` list (or an empty one) will not receive any messages from the hub.
+
+There are no wildcards; all channel names are exact strings.
+
+#### 6.5.2 Hub Access Control for Peers
+
+Each entry in `allowed_peers` specifies what channels that peer is permitted to subscribe to (receive from hub) and publish to (send to hub):
+
+```yaml
+hub:
+  allowed_peers:
+    - name: "billing-host"
+      subscribe: ["metrics", "alerts"]  # channels this peer may receive from hub
+      publish:   ["billing.events"]     # channels this peer may send to hub
+    - name: "monitor"
+      subscribe: []                     # empty = permit any channel
+      publish:   []                     # empty = permit any channel
+```
+
+An empty `subscribe` list means the peer may request any channel. An empty `publish` list means the peer may send messages on any channel. Non-empty lists act as allowlists; the hub silently restricts to the intersection.
+
+The `publish` allowlist is an inbound filter: if a peer sends a message on a channel not in the list, the message is discarded and recorded in the audit log as a policy violation. This is a defense-in-depth measure against peer misconfiguration.
+
+#### 6.5.3 General Notes
 
 Forwarding is independent of whether any local subscriber currently exists for the channel. Messages are written to the local `.jsonl` file regardless of local subscriber presence.
 
@@ -363,11 +348,11 @@ Forwarding is independent of whether any local subscriber currently exists for t
 The hub watches its configuration file using `fsnotify`. When the file changes:
 
 1. The new configuration is parsed and validated. If invalid, the reload is aborted and an error is logged; the existing policy remains active.
-2. For each existing peer connection, the effective channel set is recomputed as `stored_subscribe ∩ new_allowlist` and swapped atomically. This means admin changes to `allow_channels` or `forward` take effect immediately for in-flight connections without requiring reconnection. If the new allowlist removes a channel that a peer subscribed to, the hub stops sending that channel to that peer immediately.
+2. For each existing peer connection, the effective channel sets are recomputed as `stored_subscribe ∩ new_subscribe_allowlist` and swapped atomically. This means admin changes to `subscribe` or `publish` allowlists take effect immediately for in-flight connections without requiring reconnection. If the new allowlist removes a channel that a peer subscribed to, the hub stops sending that channel to that peer immediately.
 3. Peers whose names have been removed from the allowlist have their connections drained gracefully before closing.
-4. Client allowlist additions take effect immediately for new connections. Removals allow existing connections to drain before closing — no in-progress delivery is interrupted.
+4. Peer allowlist additions take effect immediately for new connections. Removals allow existing connections to drain before closing — no in-progress delivery is interrupted.
 
-**Note on allowlist expansion:** If an admin adds new channels to a peer's allowlist after the peer has already connected, the peer will not automatically receive those new channels — it can only receive channels it originally subscribed to at connect time. The peer must reconnect and include the new channels in its `subscribe` list to pick them up.
+**Note on allowlist expansion:** If an admin adds new channels to a peer's subscribe allowlist after the peer has already connected, the peer will not automatically receive those new channels — it can only receive channels it originally subscribed to at connect time. The peer must reconnect and include the new channels in its `subscribe` list to pick them up.
 
 Policy reload does not restart the hub, drop existing connections mid-message, or interrupt local message delivery. A `policy_reloaded` event is written to the audit log on every successful reload.
 
@@ -591,22 +576,20 @@ hub:
   enabled: false
   listen_addr: ""          # e.g. "0.0.0.0:7740"
 
-  allowed_clients:         # Instance names permitted to connect as clients
+  allowed_peers:           # Instance names permitted to connect to this hub
     - name: "billing-host"
-      allow_channels: []   # Channels this client may subscribe to; empty = any channel
+      subscribe: []        # Channels this peer may receive from hub; empty = any channel
+      publish: []          # Channels this peer may send to hub; empty = any channel
     - name: "orders-host"
-      allow_channels: ["metrics", "alerts"]
-
-  peer_hubs:               # Peer hub connections (peers that connect TO this hub)
-    - addr: ""             # host:port — hostname must match peer cert CN
-      forward: []          # Allowlist: channels this peer hub may subscribe to (exact names, no wildcards)
-      receive: []          # Inbound filter: channels accepted from this peer hub (empty = any channel)
+      subscribe: ["metrics", "alerts"]
+      publish: ["orders.created", "orders.updated"]
 
 client:
   enabled: false
-  hubs:                    # Hubs to dial (used when this instance is a client or peer hub)
+  hubs:                    # Hubs to dial (this instance as a client)
     - addr: ""             # host:port
       subscribe: []        # Channels to request from this hub (exact names, no wildcards)
+      publish: []          # Channels to send to this hub (exact names, no wildcards)
 
 tls:
   cert: ""                 # Path to instance certificate (PEM)

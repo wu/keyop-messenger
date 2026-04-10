@@ -141,17 +141,7 @@ func (h *Hub) ApplyPolicy(newCfg HubConfig) {
 
 	// Update or remove existing peers.
 	for name, entry := range h.peers {
-		stillAllowed := false
-		for _, ph := range newCfg.PeerHubs {
-			if hostnameOf(ph.Addr) == name || ph.Addr == name {
-				stillAllowed = true
-				break
-			}
-		}
-		if !stillAllowed {
-			stillAllowed = newCfg.IsClientAllowed(name)
-		}
-		if !stillAllowed {
+		if !newCfg.IsPeerAllowed(name) {
 			go h.drainAndClose(entry)
 			delete(h.peers, name)
 			continue
@@ -159,8 +149,8 @@ func (h *Hub) ApplyPolicy(newCfg HubConfig) {
 		// Re-intersect the peer's subscribe list with the updated config.
 		if entry.policy != nil {
 			entry.policy.Store(ForwardPolicy{
-				Forward: effectiveForwardChannels(entry.subscribedChannels, name, newCfg),
-				Receive: receiveChannelsFor(name, newCfg),
+				Forward: effectiveSubscribeChannels(entry.subscribedChannels, name, newCfg),
+				Receive: publishChannelsFor(name, newCfg),
 			})
 		}
 	}
@@ -333,15 +323,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	cfg := h.cfg
 	h.mu.RUnlock()
 
-	allowed := cfg.IsClientAllowed(peerName)
-	if !allowed {
-		for _, ph := range cfg.PeerHubs {
-			if ph.Addr == peerName || hostnameOf(ph.Addr) == peerName {
-				allowed = true
-				break
-			}
-		}
-	}
+	allowed := cfg.IsPeerAllowed(peerName)
 
 	if !allowed {
 		_ = conn.WriteMessage(websocket.CloseMessage,
@@ -365,17 +347,17 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 
 	// Compute the effective channels this hub will send to the peer:
 	// intersection of the peer's Subscribe request and the hub's allowlist.
-	fwdChannels := effectiveForwardChannels(hs.Subscribe, peerName, cfg)
-	recvChannels := receiveChannelsFor(peerName, cfg)
+	subChannels := effectiveSubscribeChannels(hs.Subscribe, peerName, cfg)
+	pubChannels := publishChannelsFor(peerName, cfg)
 	policy := NewAtomicPolicy(ForwardPolicy{
-		Forward: fwdChannels,
-		Receive: recvChannels,
+		Forward: subChannels,
+		Receive: pubChannels,
 	})
 
 	// Start receiver. Also start a sender if the peer subscribed to any channels.
 	// When both share a conn, route acks via an internal channel so the
 	// PeerReceiver owns all reads and avoids a concurrent-read race.
-	needSender := len(fwdChannels) > 0
+	needSender := len(subChannels) > 0
 
 	var receiver *PeerReceiver
 	var sender *PeerSender
@@ -411,9 +393,9 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 
 	// Handle replay for reconnecting non-ephemeral peers. Ephemeral clients
 	// never receive replayed messages regardless of whether LastID is set.
-	if hs.LastID != "" && len(fwdChannels) > 0 && !hs.Ephemeral {
+	if hs.LastID != "" && len(subChannels) > 0 && !hs.Ephemeral {
 		go func() {
-			for env := range h.ReplayFrom(hs.LastID, fwdChannels) {
+			for env := range h.ReplayFrom(hs.LastID, subChannels) {
 				if sender != nil {
 					sender.Enqueue(env)
 				}
@@ -434,13 +416,4 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		}
 		_ = h.auditL.Log(audit.Event{Event: audit.EventPeerDisconnected, Peer: peerName})
 	}()
-}
-
-// hostnameOf extracts the hostname from "host:port" or returns s unchanged.
-func hostnameOf(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-	return host
 }

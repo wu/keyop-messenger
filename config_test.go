@@ -76,13 +76,6 @@ func TestValidate_Errors(t *testing.T) {
 			wantMsg: "hub.listen_addr is required when hub.enabled is true",
 		},
 		{
-			name: "peer hub with empty addr",
-			mutate: func(c *Config) {
-				c.Hub.PeerHubs = []PeerHubConfig{{Addr: ""}}
-			},
-			wantMsg: "hub.peer_hubs[0].addr is required",
-		},
-		{
 			name: "client hub with empty addr",
 			mutate: func(c *Config) {
 				c.Client.Enabled = true
@@ -277,18 +270,18 @@ subscribers:
 hub:
   enabled: true
   listen_addr: "0.0.0.0:7741"
-  allowed_clients:
+  allowed_peers:
     - name: client-a
     - name: client-b
-  peer_hubs:
+client:
+  enabled: true
+  hubs:
     - addr: hub2.internal:7740
-      forward:
+      subscribe:
         - alerts
         - events
-      receive:
+      publish:
         - ack
-client:
-  enabled: false
 tls:
   cert: /etc/certs/host.crt
   key:  /etc/certs/host.key
@@ -323,14 +316,14 @@ audit:
 	assert.Equal(t, 10, *cfg.Subscribers.MaxRetries)
 	assert.True(t, cfg.Hub.Enabled)
 	assert.Equal(t, "0.0.0.0:7741", cfg.Hub.ListenAddr)
-	require.Len(t, cfg.Hub.AllowedClients, 2)
-	assert.Equal(t, "client-a", cfg.Hub.AllowedClients[0].Name)
-	assert.Equal(t, "client-b", cfg.Hub.AllowedClients[1].Name)
-	require.Len(t, cfg.Hub.PeerHubs, 1)
-	assert.Equal(t, "hub2.internal:7740", cfg.Hub.PeerHubs[0].Addr)
-	assert.Equal(t, []string{"alerts", "events"}, cfg.Hub.PeerHubs[0].Forward)
-	assert.Equal(t, []string{"ack"}, cfg.Hub.PeerHubs[0].Receive)
-	assert.False(t, cfg.Client.Enabled)
+	require.Len(t, cfg.Hub.AllowedPeers, 2)
+	assert.Equal(t, "client-a", cfg.Hub.AllowedPeers[0].Name)
+	assert.Equal(t, "client-b", cfg.Hub.AllowedPeers[1].Name)
+	assert.True(t, cfg.Client.Enabled)
+	require.Len(t, cfg.Client.Hubs, 1)
+	assert.Equal(t, "hub2.internal:7740", cfg.Client.Hubs[0].Addr)
+	assert.Equal(t, []string{"alerts", "events"}, cfg.Client.Hubs[0].Subscribe)
+	assert.Equal(t, []string{"ack"}, cfg.Client.Hubs[0].Publish)
 	assert.Equal(t, "/etc/certs/host.crt", cfg.TLS.Cert)
 	assert.Equal(t, "/etc/certs/host.key", cfg.TLS.Key)
 	assert.Equal(t, "/etc/certs/ca.crt", cfg.TLS.CA)

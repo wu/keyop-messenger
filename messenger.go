@@ -627,22 +627,17 @@ func (m *Messenger) checkCertExpiry(tlsCfg *tls.Config, cfg *Config) {
 }
 
 // toFedHubConfig converts the messenger-level HubConfig to the federation
-// package's HubConfig (which omits the Enabled/ListenAddr fields).
+// package's HubConfig.
 func toFedHubConfig(cfg HubConfig) federation.HubConfig {
-	clients := make([]federation.AllowedClient, len(cfg.AllowedClients))
-	for i, c := range cfg.AllowedClients {
-		clients[i] = federation.AllowedClient{Name: c.Name, AllowChannels: c.AllowChannels}
-	}
-	peers := make([]federation.PeerHubConfig, len(cfg.PeerHubs))
-	for i, p := range cfg.PeerHubs {
-		peers[i] = federation.PeerHubConfig{
-			Addr:    p.Addr,
-			Forward: p.Forward,
-			Receive: p.Receive,
+	peers := make([]federation.AllowedPeer, len(cfg.AllowedPeers))
+	for i, p := range cfg.AllowedPeers {
+		peers[i] = federation.AllowedPeer{
+			Name:      p.Name,
+			Subscribe: p.Subscribe,
+			Publish:   p.Publish,
 		}
 	}
 	return federation.HubConfig{
-		AllowedClients: clients,
-		PeerHubs:       peers,
+		AllowedPeers: peers,
 	}
 }

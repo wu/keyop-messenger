@@ -70,26 +70,16 @@ type SubscribersConfig struct {
 	MaxRetries *int `yaml:"max_retries"`
 }
 
-// AllowedClient is an instance that is permitted to connect to this hub as a client.
-type AllowedClient struct {
-	// Name is the instance name embedded in the client's TLS certificate CN.
+// AllowedPeer is an instance that is permitted to connect to this hub.
+type AllowedPeer struct {
+	// Name is the instance name embedded in the peer's TLS certificate CN.
 	Name string `yaml:"name"`
-	// AllowChannels lists the channels this client is permitted to subscribe to.
-	// An empty list means the client may subscribe to any channel.
-	AllowChannels []string `yaml:"allow_channels"`
-}
-
-// PeerHubConfig describes a peer hub connection and the channels forwarded over it.
-type PeerHubConfig struct {
-	// Addr is the host:port of the peer hub. The hostname must match the peer cert's CN.
-	Addr string `yaml:"addr"`
-
-	// Forward lists the channels this hub will send to the peer hub (exact names only).
-	Forward []string `yaml:"forward"`
-
-	// Receive lists the channels this hub will accept from the peer hub (exact names only).
-	// Messages on unlisted channels are discarded and audit-logged as policy violations.
-	Receive []string `yaml:"receive"`
+	// Subscribe lists the channels this peer is permitted to receive (from hub to peer).
+	// An empty list means the peer may subscribe to any channel.
+	Subscribe []string `yaml:"subscribe"`
+	// Publish lists the channels this peer is permitted to send to this hub (from peer to hub).
+	// An empty list means the peer may publish to any channel.
+	Publish []string `yaml:"publish"`
 }
 
 // HubConfig controls the hub listener and its federation policy.
@@ -101,21 +91,21 @@ type HubConfig struct {
 	// Required when Enabled is true.
 	ListenAddr string `yaml:"listen_addr"`
 
-	// AllowedClients is the explicit list of client instance names permitted to connect.
+	// AllowedPeers is the explicit list of peer instance names permitted to connect.
 	// Connections from instances not in this list are rejected after the mTLS handshake.
-	AllowedClients []AllowedClient `yaml:"allowed_clients"`
-
-	// PeerHubs lists peer hubs to connect to and the forwarding policy for each.
-	PeerHubs []PeerHubConfig `yaml:"peer_hubs"`
+	AllowedPeers []AllowedPeer `yaml:"allowed_peers"`
 }
 
 // ClientHubRef is a hub address a client instance dials.
 type ClientHubRef struct {
 	// Addr is the host:port of the hub to dial.
 	Addr string `yaml:"addr"`
-	// Subscribe lists the channels to request from the hub.
+	// Subscribe lists the channels to request from the hub (inbound to this instance).
 	// The hub may deliver a subset based on its access control policy.
 	Subscribe []string `yaml:"subscribe"`
+	// Publish lists the channels this instance will send to the hub (outbound from this instance).
+	// The hub may reject a subset based on its receive policy.
+	Publish []string `yaml:"publish"`
 }
 
 // ClientConfig controls outbound hub connections.
@@ -337,12 +327,6 @@ func (c *Config) Validate() error {
 
 	if c.Hub.Enabled && c.Hub.ListenAddr == "" {
 		errs = append(errs, errors.New("hub.listen_addr is required when hub.enabled is true"))
-	}
-
-	for i, peer := range c.Hub.PeerHubs {
-		if peer.Addr == "" {
-			errs = append(errs, fmt.Errorf("hub.peer_hubs[%d].addr is required", i))
-		}
 	}
 
 	if c.Client.Enabled {

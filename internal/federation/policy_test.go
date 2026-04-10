@@ -76,24 +76,24 @@ func TestAtomicPolicySwapRace(_ *testing.T) {
 	wg.Wait()
 }
 
-// ---- HubConfig / IsClientAllowed --------------------------------------------
+// ---- HubConfig / IsPeerAllowed ------------------------------------------
 
-func TestIsClientAllowed(t *testing.T) {
+func TestIsPeerAllowed(t *testing.T) {
 	cfg := federation.HubConfig{
-		AllowedClients: []federation.AllowedClient{
+		AllowedPeers: []federation.AllowedPeer{
 			{Name: "billing-host"},
 			{Name: "orders-host"},
 		},
 	}
-	assert.True(t, cfg.IsClientAllowed("billing-host"))
-	assert.True(t, cfg.IsClientAllowed("orders-host"))
-	assert.False(t, cfg.IsClientAllowed("unknown-host"))
-	assert.False(t, cfg.IsClientAllowed(""))
+	assert.True(t, cfg.IsPeerAllowed("billing-host"))
+	assert.True(t, cfg.IsPeerAllowed("orders-host"))
+	assert.False(t, cfg.IsPeerAllowed("unknown-host"))
+	assert.False(t, cfg.IsPeerAllowed(""))
 }
 
-func TestIsClientAllowedEmpty(t *testing.T) {
+func TestIsPeerAllowedEmpty(t *testing.T) {
 	cfg := federation.HubConfig{}
-	assert.False(t, cfg.IsClientAllowed("anyone"))
+	assert.False(t, cfg.IsPeerAllowed("anyone"))
 }
 
 // ---- PolicyWatcher ----------------------------------------------------------
@@ -152,27 +152,19 @@ func (f *fakeAuditLogger) hasEvent(name string) bool {
 }
 
 const validConfig = `
-allowed_clients:
+allowed_peers:
   - name: billing-host
-peer_hubs:
-  - addr: "hub2.internal:7740"
-    forward: [orders]
-    receive: [events]
 `
 
 const validConfig2 = `
-allowed_clients:
+allowed_peers:
   - name: billing-host
   - name: orders-host
-peer_hubs:
-  - addr: "hub2.internal:7740"
-    forward: [orders, billing]
-    receive: [events]
 `
 
 const invalidConfig = `
-peer_hubs:
-  - addr: ""
+allowed_peers:
+  - name: ""
 `
 
 func writeConfig(t *testing.T, path, content string) {
@@ -208,7 +200,7 @@ func TestPolicyWatcherReload(t *testing.T) {
 
 	cfg, ok := hub.lastApplied()
 	require.True(t, ok)
-	assert.True(t, cfg.IsClientAllowed("orders-host"), "updated config should include orders-host")
+	assert.True(t, cfg.IsPeerAllowed("orders-host"), "updated config should include orders-host")
 	assert.True(t, auditLog.hasEvent(audit.EventPolicyReloaded))
 }
 

@@ -2,7 +2,6 @@ package federation
 
 import (
 	"fmt"
-	"net"
 	"sync/atomic"
 )
 
@@ -61,92 +60,63 @@ func (a *AtomicPolicy) AllowReceive(channel string) bool {
 	return false
 }
 
-// ---- Hub configuration types -------------------------------------------------
+// ---- Federation configuration types -----------------------------------------
 
-// PeerHubConfig describes a single peer hub connection and its channel policy.
-type PeerHubConfig struct {
-	Addr    string   `yaml:"addr"`
-	Forward []string `yaml:"forward"`
-	Receive []string `yaml:"receive"`
+// AllowedPeer describes a peer instance permitted to connect to a hub.
+type AllowedPeer struct {
+	Name      string   `yaml:"name"`
+	Subscribe []string `yaml:"subscribe"`
+	Publish   []string `yaml:"publish"`
 }
 
-// AllowedClient describes a client instance permitted to connect to this hub.
-type AllowedClient struct {
-	Name string `yaml:"name"`
-	// AllowChannels lists the channels this client is permitted to subscribe to.
-	// An empty list means the client may subscribe to any channel.
-	AllowChannels []string `yaml:"allow_channels"`
-}
-
-// HubConfig is the runtime policy configuration for a hub instance. It is
-// loaded from a YAML file and can be hot-reloaded without restarting.
+// HubConfig holds the federation policy for a hub instance.
 type HubConfig struct {
-	AllowedClients []AllowedClient `yaml:"allowed_clients"`
-	PeerHubs       []PeerHubConfig `yaml:"peer_hubs"`
+	AllowedPeers []AllowedPeer `yaml:"allowed_peers"`
 }
 
-// IsClientAllowed reports whether name appears in the AllowedClients list.
-func (c HubConfig) IsClientAllowed(name string) bool {
-	for _, ac := range c.AllowedClients {
-		if ac.Name == name {
+// IsPeerAllowed reports whether name appears in the AllowedPeers list.
+func (c HubConfig) IsPeerAllowed(name string) bool {
+	for _, peer := range c.AllowedPeers {
+		if peer.Name == name {
 			return true
 		}
 	}
 	return false
 }
 
-// effectiveForwardChannels returns the channels the hub should send to peerName,
+// ---- Channel allowlist computation -------------------------------------------
+
+// effectiveSubscribeChannels returns the channels the hub should send to peerName,
 // computed as the intersection of the peer's Subscribe request and the hub's
-// allowlist for that peer.
-//
-//   - For peer hubs (in PeerHubs): PeerHubConfig.Forward is the allowlist.
-//   - For allowed clients (in AllowedClients): AllowedClient.AllowChannels is the
-//     allowlist; an empty AllowChannels means "permit all subscribed channels".
+// Subscribe allowlist for that peer.
 //
 // Returns nil when the intersection is empty or requested is empty.
-func effectiveForwardChannels(requested []string, peerName string, cfg HubConfig) []string {
+func effectiveSubscribeChannels(requested []string, peerName string, cfg HubConfig) []string {
 	if len(requested) == 0 {
 		return nil
 	}
-	for _, ph := range cfg.PeerHubs {
-		if hostnameMatch(ph.Addr, peerName) {
-			return intersectChannels(requested, ph.Forward)
-		}
-	}
-	for _, ac := range cfg.AllowedClients {
-		if ac.Name == peerName {
-			if len(ac.AllowChannels) == 0 {
+	for _, peer := range cfg.AllowedPeers {
+		if peer.Name == peerName {
+			if len(peer.Subscribe) == 0 {
 				out := make([]string, len(requested))
 				copy(out, requested)
 				return out
 			}
-			return intersectChannels(requested, ac.AllowChannels)
+			return intersectChannels(requested, peer.Subscribe)
 		}
 	}
 	return nil
 }
 
-// receiveChannelsFor returns the Receive allowlist for peerName if it is a
-// configured peer hub, otherwise nil (accept all inbound channels).
-func receiveChannelsFor(peerName string, cfg HubConfig) []string {
-	for _, ph := range cfg.PeerHubs {
-		if hostnameMatch(ph.Addr, peerName) {
-			return ph.Receive
+// publishChannelsFor returns the Publish allowlist for peerName.
+// An empty list means "accept any channels" (returns nil).
+func publishChannelsFor(peerName string, cfg HubConfig) []string {
+	for _, peer := range cfg.AllowedPeers {
+		if peer.Name == peerName {
+			return peer.Publish
 		}
 	}
 	return nil
-}
-
-// hostnameMatch reports whether addr (a "host:port" or bare hostname) matches name.
-func hostnameMatch(addr, name string) bool {
-	if addr == name {
-		return true
-	}
-	// Extract hostname from addr and compare.
-	if h, _, err := net.SplitHostPort(addr); err == nil {
-		return h == name
-	}
-	return false
 }
 
 // intersectChannels returns elements of a that also appear in b.
@@ -169,18 +139,17 @@ func intersectChannels(a, b []string) []string {
 }
 
 // validate checks that the HubConfig is internally consistent:
-// every peer hub must have a non-empty Addr, and peer names (Addr) must be
-// unique.
+// every peer must have a non-empty Name, and peer names must be unique.
 func (c HubConfig) validate() error {
-	seen := make(map[string]bool, len(c.PeerHubs))
-	for i, ph := range c.PeerHubs {
-		if ph.Addr == "" {
-			return fmt.Errorf("federation: peer_hubs[%d]: addr must not be empty", i)
+	seen := make(map[string]bool, len(c.AllowedPeers))
+	for i, peer := range c.AllowedPeers {
+		if peer.Name == "" {
+			return fmt.Errorf("federation: allowed_peers[%d]: name must not be empty", i)
 		}
-		if seen[ph.Addr] {
-			return fmt.Errorf("federation: peer_hubs: duplicate addr %q", ph.Addr)
+		if seen[peer.Name] {
+			return fmt.Errorf("federation: allowed_peers: duplicate name %q", peer.Name)
 		}
-		seen[ph.Addr] = true
+		seen[peer.Name] = true
 	}
 	return nil
 }
