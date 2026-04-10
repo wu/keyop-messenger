@@ -1,3 +1,9 @@
+## [0.5.0](https://github.com/wu/keyop-messenger/compare/0.4.0...0.5.0) (2026-04-10)
+
+### Features
+
+* add InstanceName method and tests ([c025026](https://github.com/wu/keyop-messenger/commit/c0250269aa6efc25db593f4296406add485a0a0f))
+
 ## [0.4.0](https://github.com/wu/keyop-messenger/compare/0.3.0...0.4.0) (2026-04-09)
 
 ### Features
