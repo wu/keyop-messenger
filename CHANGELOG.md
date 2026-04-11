@@ -1,3 +1,9 @@
+## [0.9.0](https://github.com/wu/keyop-messenger/compare/v0.8.0...v0.9.0) (2026-04-11)
+
+### Features
+
+* add support for correlation IDs for message tracing ([860b61f](https://github.com/wu/keyop-messenger/commit/860b61f9a69aa4468db4fd8d4ee2405167730f7e))
+
 ## [0.8.0](https://github.com/wu/keyop-messenger/compare/v0.7.0...v0.8.0) (2026-04-11)
 
 ### Features
