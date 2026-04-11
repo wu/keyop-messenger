@@ -589,15 +589,10 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 		return err
 	}
 
-	// Forward to other peers via hub (hub's forward policy decides which peers).
+	// Forward to all connected peers. All peers have senders created at connection
+	// time (even those without subscriptions), so messages can be forwarded to them.
 	if m.hub != nil {
 		m.hub.EnqueueToAll(env)
-	}
-	// Forward to direct clients (hub's receive policy decides acceptance).
-	for _, c := range m.clients {
-		if s := c.Sender(); s != nil {
-			s.Enqueue(env)
-		}
 	}
 
 	return nil

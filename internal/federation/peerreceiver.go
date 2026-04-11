@@ -175,12 +175,13 @@ func (pr *PeerReceiver) run() {
 			// Receive policy check — discard silently but still ack.
 			if pr.policy != nil && !pr.policy.AllowReceive(env.Channel) {
 				pr.log.Warn("federation: receive policy violation",
-					"channel", env.Channel, "peer", pr.peerName)
+					"channel", env.Channel, "peer", pr.peerName, "id", env.ID)
 				_ = pr.auditL.Log(audit.Event{
 					Event:     audit.EventPolicyViolation,
 					Channel:   env.Channel,
 					Peer:      pr.peerName,
 					Direction: "inbound",
+					MessageID: env.ID,
 				})
 				lastID = env.ID
 				continue
@@ -189,7 +190,7 @@ func (pr *PeerReceiver) run() {
 			// Write to local storage — blocks on disk full (backpressure).
 			envCopy := env
 			if err := pr.localWriter(&envCopy); err != nil {
-				pr.log.Error("federation: receiver local write", "id", env.ID, "err", err)
+				pr.log.Error("federation: receiver local write", "id", env.ID, "err", err, "channel", env.Channel)
 				lastID = env.ID
 				continue
 			}

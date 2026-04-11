@@ -7,7 +7,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 - **Reliable at-least-once delivery** backed by append-only `.jsonl` log files
 - **Fan-out isolation** — slow subscribers do not affect other subscribers or publishers
 - **Federated messaging** — instances connect via WebSocket with mutual TLS; hubs forward select channels to peer hubs under explicit policy
-- **Subscription-based routing** — clients declare which channels they want; hubs enforce per-client allowlists that are statically configured and hot-reloaded without restart
+- **Subscription-based routing** — clients declare which channels they want; hubs enforce per-client allowlists that are statically configured
 - **Dead letter queue** — messages that exceed the retry limit are moved to a dead-letter channel rather than blocking delivery
 - **Audit logging** — all cross-hub message forwarding is recorded with automatic rotation
 
@@ -291,8 +291,6 @@ An acknowledgment frame is sent by the receiver after writing a batch to its loc
 
 Clients never perform allowlist checks — a client accepts any hub it is configured to dial (trust is established by the cert).
 
-**Allowlist changes on hot-reload:** When a peer's name is removed from the allowlist during a policy reload, the existing connection is allowed to drain in-flight messages before being closed gracefully. The connection is not dropped mid-message.
-
 ### 6.5 Subscription Model and Channel Policy
 
 #### 6.5.1 Client Configuration
@@ -469,9 +467,6 @@ Event types:
 | `peer_disconnected` | A peer hub connection was lost |
 | `client_connected` | A client connected to this hub |
 | `client_rejected` | A client was rejected (name not in allowlist) |
-| `client_drain` | An allowlist-removed client is draining before disconnect |
-| `policy_reloaded` | Forwarding policy was hot-reloaded successfully |
-| `policy_reload_failed` | Policy reload was aborted due to parse/validation error |
 
 ### 8.1 Audit Log Rotation
 

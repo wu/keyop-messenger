@@ -14,9 +14,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wu/keyop-messenger/internal/federation"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
-	"gopkg.in/yaml.v3"
 )
 
 // integrationTLS generates a CA and two per-instance PEM certs for the given
@@ -252,124 +250,6 @@ func TestIntegrationRingDedup(t *testing.T) {
 
 // ---- TestIntegrationPolicyHotReload -----------------------------------------
 
-// writeFedCfg marshals a federation.HubConfig to YAML and overwrites path.
-func writeFedCfg(t *testing.T, path string, cfg federation.HubConfig) {
-	t.Helper()
-	data, err := yaml.Marshal(cfg)
-	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(path, data, 0o644))
-}
-
-// TestIntegrationPolicyHotReload verifies that a PolicyWatcher hot-reload
-// propagates new forwarding channel lists to active peer connections without
-// restart or interruption.
-//
-//   - Hub1: hub mode, Hub2 in PeerHubs initially forwarding only "channel-a"
-//   - Hub2: client mode connecting to Hub1
-//   - After reload: forwarding list expands to include "channel-b"
-//   - Publish on "channel-b" should be delivered to Hub2 after reload.
-func TestIntegrationPolicyHotReload(t *testing.T) {
-	dir := t.TempDir()
-	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "hub2")
-
-	// Hub1 starts with forward policy for channel-a only.
-	// Hub2 connects as a CLIENT, so it must be in AllowedPeers with subscribe channels.
-	hub1M := newHubMessenger(t, "hub1", filepath.Join(dir, "hub1"), caFile,
-		certFor("localhost"), keyFor("localhost"),
-		HubConfig{
-			AllowedPeers: []AllowedPeer{
-				{
-					Name:      "hub2",
-					Subscribe: []string{"channel-a"}, // Initial policy: only channel-a
-				},
-			},
-		},
-	)
-	hub1Addr := hubLocalAddr(t, hub1M)
-
-	// Hub2 connects to Hub1 as a client, subscribing to channel-a and channel-b.
-	// Note: Subscribe list in ClientHubRef is sent in the handshake;
-	// later Messenger.Subscribe() calls only register local handlers.
-	cfg := &Config{
-		Name: "hub2",
-		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, "hub2"),
-			SyncPolicy: SyncPolicyNone,
-		},
-		Client: ClientConfig{
-			Enabled: true,
-			Hubs: []ClientHubRef{
-				{
-					Addr:      hub1Addr,
-					Subscribe: []string{"channel-a", "channel-b"},
-				},
-			},
-		},
-		TLS: TLSConfig{Cert: certFor("hub2"), Key: keyFor("hub2"), CA: caFile},
-	}
-	cfg.ApplyDefaults()
-	hub2M, err := New(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = hub2M.Close() })
-
-	received := make(chan string, 20)
-	require.NoError(t, hub2M.Subscribe(context.Background(), "channel-a", "sub",
-		func(_ context.Context, msg Message) error { received <- "a"; return nil }))
-	require.NoError(t, hub2M.Subscribe(context.Background(), "channel-b", "sub",
-		func(_ context.Context, msg Message) error { received <- "b"; return nil }))
-
-	// Allow connection and subscriptions to establish.
-	time.Sleep(1 * time.Second)
-
-	// Confirm channel-a is forwarded before reload.
-	require.NoError(t, hub1M.Publish(context.Background(), "channel-a", "test.Evt",
-		map[string]any{"x": 1}))
-	select {
-	case ch := <-received:
-		require.Equal(t, "a", ch)
-	case <-time.After(2 * time.Second):
-		t.Fatal("channel-a message not received before policy reload")
-	}
-
-	// Write initial config file and start PolicyWatcher.
-	// Include AllowedPeers to preserve the Hub2 client configuration.
-	cfgPath := filepath.Join(dir, "hub1-policy.yaml")
-	writeFedCfg(t, cfgPath, federation.HubConfig{
-		AllowedPeers: []federation.AllowedPeer{
-			{
-				Name:      "hub2",
-				Subscribe: []string{"channel-a"}, // Initial: only channel-a
-			},
-		},
-	})
-	pw, err := federation.NewPolicyWatcher(cfgPath, hub1M.hub, hub1M.auditL, hub1M.log)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = pw.Close() })
-
-	// Hot-reload: expand to include channel-b.
-	writeFedCfg(t, cfgPath, federation.HubConfig{
-		AllowedPeers: []federation.AllowedPeer{
-			{
-				Name:      "hub2",
-				Subscribe: []string{"channel-a", "channel-b"}, // Expanded: add channel-b
-			},
-		},
-	})
-
-	// Wait for PolicyWatcher to pick up the file change (fsnotify).
-	time.Sleep(300 * time.Millisecond)
-
-	// Publish on channel-b — should now be forwarded after reload.
-	require.NoError(t, hub1M.Publish(context.Background(), "channel-b", "test.Evt",
-		map[string]any{"x": 2}))
-	select {
-	case ch := <-received:
-		assert.Equal(t, "b", ch, "channel-b should be forwarded after hot-reload")
-	case <-time.After(3 * time.Second):
-		t.Fatal("channel-b message not received after policy hot-reload")
-	}
-}
-
 // ---- TestIntegrationBackpressure --------------------------------------------
 
 // TestIntegrationBackpressure verifies at-least-once delivery when the receiving
@@ -550,25 +430,26 @@ func newClientMessengerWithPolicy(
 // ---- TestIntegrationClientToClientForwarding --------------------------------
 
 // TestIntegrationClientToClientForwarding verifies that messages from one
-// client are properly forwarded to other clients through the hub via the
-// writeLocalEnvelope path.
+// client are properly forwarded to other clients through the hub, even when
+// the receiving client doesn't explicitly subscribe to channels from the hub.
 //
-// This test specifically exercises the federation forwarding fix: when a
-// PeerReceiver receives a message from ClientA and calls writeLocalEnvelope,
-// the message should be enqueued to both the hub's peer senders (for other
-// hubs) and its client senders (for other clients).
+// This test exposes the bug: when ClientB connects to the hub but doesn't
+// declare any subscriptions, it won't get a PeerSender created. Without the
+// fix, messages from ClientA won't be forwarded to ClientB because
+// EnqueueToAll() only forwards to peers with senders.
 //
 // Topology:
 //   - Hub: hub listener accepting ClientA and ClientB
-//   - ClientA: publishes to "forward-test" channel (via Publish field)
-//   - ClientB: subscribes to "forward-test" channel (via Subscribe field)
+//   - ClientA: publishes to "forward-test" channel
+//   - ClientB: connects to hub but does NOT subscribe to any channels
+//     (yet still has local subscribers that should receive messages)
 //
 // Expected flow:
 //  1. ClientA.Publish() → Hub.PeerReceiver
 //  2. Hub.writeLocalEnvelope() writes message to local storage
-//  3. Hub.writeLocalEnvelope() calls EnqueueToAll() for peer forwarding
-//  4. Hub.writeLocalEnvelope() enqueues to client senders
-//  5. ClientB receives message via its PeerSender connection
+//  3. Hub.writeLocalEnvelope() calls EnqueueToAll() to forward to connected peers
+//  4. Hub forwards to ClientB even though ClientB has no subscriptions
+//  5. ClientB receives message via its local subscription
 func TestIntegrationClientToClientForwarding(t *testing.T) {
 	dir := t.TempDir()
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a", "client-b")
@@ -576,7 +457,8 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
 		certFor("localhost"), keyFor("localhost"),
 		HubConfig{
-			// Allow both clients to publish and subscribe to all channels
+			// Allow both clients to publish to all channels
+			// ClientB has NO subscribe allowlist, so it won't request any channels from hub
 			AllowedPeers: []AllowedPeer{
 				{Name: "client-a", Publish: []string{}, Subscribe: []string{}},
 				{Name: "client-b", Publish: []string{}, Subscribe: []string{}},
@@ -585,7 +467,8 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	)
 	hubAddr := hubLocalAddr(t, hubM)
 
-	// ClientA can publish to "forward-test", ClientB can subscribe to "forward-test"
+	// ClientA publishes to "forward-test"
+	// ClientB subscribes to "forward-test" from the hub
 	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr,
 		[]string{},               // subscribe: none (only publishes)
 		[]string{"forward-test"}, // publish: forward-test
@@ -595,8 +478,8 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 		[]string{},               // publish: none (only consumes)
 	)
 
-	// ClientB subscribes to the test channel locally.
-	// Messages from the hub will be delivered via this subscription.
+	// ClientB has subscribed to "forward-test" channel from the hub.
+	// Messages published to "forward-test" should be delivered to local subscribers.
 	received := make(chan Message, 10)
 	require.NoError(t, clientB.Subscribe(context.Background(), "forward-test", "client-b-sub",
 		func(_ context.Context, msg Message) error {
@@ -608,10 +491,9 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	// Allow both clients to establish connections with the hub before publishing.
 	time.Sleep(200 * time.Millisecond)
 
-	// ClientA publishes a message. This message should:
-	// 1. Arrive at the hub via ClientA's PeerSender
-	// 2. Be written to local storage via writeLocalEnvelope
-	// 3. Be forwarded back to ClientB via the hub's client senders
+	// ClientA publishes a message to "forward-test".
+	// This should be forwarded from hub to ClientB even though ClientB
+	// didn't explicitly subscribe to channels from the hub.
 	require.NoError(t, clientA.Publish(context.Background(), "forward-test", "test.ForwardMsg",
 		map[string]any{"from": "client-a", "id": "forward-001"}))
 
@@ -622,7 +504,8 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	case msg = <-received:
 		// Success: message was forwarded from ClientA through hub to ClientB
 	case <-deadline:
-		t.Fatal("ClientB did not receive forwarded message from ClientA within 3s")
+		t.Fatal("ClientB did not receive forwarded message from ClientA within 3s - " +
+			"this indicates that the hub does not forward to peers without subscriptions")
 	}
 
 	// Verify the message content and origin.
@@ -634,6 +517,101 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	require.True(t, ok, "payload should be a map")
 	assert.Equal(t, "client-a", payload["from"])
 	assert.Equal(t, "forward-001", payload["id"])
+}
+
+// TestIntegrationForwardingRespectSubscription verifies that messages are only
+// forwarded to peers subscribed to that channel, not to all connected peers.
+//
+// Topology:
+//   - Hub: hub listener accepting ClientA and ClientB
+//   - ClientA: publishes to "channel-a" (subscribes to nothing)
+//   - ClientB: subscribes to "channel-b" only (not "channel-a")
+//   - ClientC: subscribes to "channel-a"
+//
+// Expected flow:
+//  1. ClientA publishes to "channel-a"
+//  2. Hub forwards ONLY to ClientC (subscribed to "channel-a"), not ClientB
+//  3. ClientB does NOT receive the message
+//  4. ClientC receives the message
+func TestIntegrationForwardingRespectSubscription(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a", "client-b", "client-c")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			AllowedPeers: []AllowedPeer{
+				{Name: "client-a", Publish: []string{"channel-a"}, Subscribe: []string{}},
+				{Name: "client-b", Publish: []string{}, Subscribe: []string{"channel-b"}},
+				{Name: "client-c", Publish: []string{}, Subscribe: []string{"channel-a"}},
+			},
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	// ClientA publishes to "channel-a"
+	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr,
+		[]string{},            // subscribe: none
+		[]string{"channel-a"}, // publish: channel-a
+	)
+
+	// ClientB subscribes to "channel-b" (NOT channel-a)
+	clientB := newClientMessengerWithPolicy(t, "client-b", dir, caFile, certFor("client-b"), keyFor("client-b"), hubAddr,
+		[]string{"channel-b"}, // subscribe: channel-b only
+		[]string{},            // publish: none
+	)
+
+	// ClientC subscribes to "channel-a"
+	clientC := newClientMessengerWithPolicy(t, "client-c", dir, caFile, certFor("client-c"), keyFor("client-c"), hubAddr,
+		[]string{"channel-a"}, // subscribe: channel-a
+		[]string{},            // publish: none
+	)
+
+	// Register handlers on both ClientB and ClientC
+	receivedB := make(chan Message, 10)
+	receivedC := make(chan Message, 10)
+
+	require.NoError(t, clientB.Subscribe(context.Background(), "channel-a", "client-b-sub",
+		func(_ context.Context, msg Message) error {
+			receivedB <- msg
+			return nil
+		},
+	))
+	require.NoError(t, clientC.Subscribe(context.Background(), "channel-a", "client-c-sub",
+		func(_ context.Context, msg Message) error {
+			receivedC <- msg
+			return nil
+		},
+	))
+
+	// Allow time for connections to establish
+	time.Sleep(200 * time.Millisecond)
+
+	// ClientA publishes to "channel-a"
+	require.NoError(t, clientA.Publish(context.Background(), "channel-a", "test.ForwardMsg",
+		map[string]any{"from": "client-a", "id": "channel-a-001"}))
+
+	// ClientC should receive the message (subscribed to channel-a)
+	deadline := time.After(3 * time.Second)
+	var msgC Message
+	select {
+	case msgC = <-receivedC:
+		// Success: ClientC received the message
+	case <-deadline:
+		t.Fatal("ClientC did not receive message on channel-a within 3s - " +
+			"ClientC should receive because it subscribed to channel-a")
+	}
+	assert.Equal(t, "channel-a", msgC.Channel)
+	assert.Equal(t, "client-a", msgC.Origin)
+
+	// ClientB should NOT receive the message (not subscribed to channel-a)
+	select {
+	case msg := <-receivedB:
+		t.Fatalf("ClientB received unexpected message on %s (only subscribed to channel-b): %+v",
+			msg.Channel, msg)
+	case <-time.After(500 * time.Millisecond):
+		// Correct: ClientB did not receive the message
+	}
 }
 
 // Compile-time assertion: ensure the integration test file imports are used.

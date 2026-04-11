@@ -86,7 +86,7 @@ func (ps *PeerSender) Enqueue(env *envelope.Envelope) bool {
 	case ps.buf <- env:
 		return true
 	default:
-		ps.log.Warn("federation: peer send buffer full, dropping message", "id", env.ID)
+		ps.log.Warn("federation: peer send buffer full, dropping message", "id", env.ID, "channel", env.Channel)
 		return false
 	}
 }

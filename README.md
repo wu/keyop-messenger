@@ -14,7 +14,7 @@ NOTE: This is still Beta, the API should now be relatively stable.
 - **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
 - **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
 - **Reliable Retries & DLQ**: Configurable retry logic with automatic routing to `.dead-letter` channels.
-- **Secure Federation**: Star-topology federation over mTLS WebSockets. Clients subscribe to specific channels; hubs enforce per-client channel allowlists under explicit, hot-reloadable policy.
+- **Secure Federation**: Star-topology federation over mTLS WebSockets. Clients subscribe to specific channels; hubs enforce per-client channel allowlists under explicit policy.
 - **Observability**: File-based offsets and JSONL records allow operators to use standard Unix tools (`cat`, `grep`, `tail`) for debugging.
 
 ## Why Keyop Messenger?

@@ -71,8 +71,7 @@ keyop-messenger/
 │       ├── client.go       # Client: dial hubs, reconnect backoff
 │       ├── client_test.go
 │       ├── policy.go       # ForwardPolicy, allowlist, atomic swap
-│       ├── policy_test.go
-│       └── policywatcher.go # fsnotify config watcher, hot-reload orchestration
+│       └── policy_test.go
 │
 └── cmd/
     └── keyop-messenger/
@@ -373,16 +372,12 @@ type PeerSender interface {
 
 **Deliverables:**
 
-- `internal/federation/policy.go`: `ForwardPolicy{Forward, Receive []string}`. `AtomicPolicy` wraps `sync/atomic.Pointer[ForwardPolicy]` for lock-free reads. `AllowForward(channel string) bool`, `AllowReceive(channel string) bool` — linear scan (channel lists are small). `PeerHubConfig{Addr, Forward, Receive}`. `AllowedClient{Name}`. `HubConfig{AllowedClients, PeerHubs}`. `IsClientAllowed(name string) bool`.
-- `internal/federation/policywatcher.go`: `PolicyWatcher`. `NewPolicyWatcher(configPath string, hub *Hub, audit AuditLogger, logger Logger) (*PolicyWatcher, error)`. Watches config file via fsnotify. On change: parse `HubConfig` from YAML, validate (non-empty addrs, no duplicate peer names), call `hub.ApplyPolicy(newConfig)`. `ApplyPolicy` atomically swaps channel lists on existing connections; dials newly added peers; initiates drain-then-close for removed peers and removed allowlist clients. Logs `EventPolicyReloaded` or `EventPolicyReloadFailed`.
+- `internal/federation/policy.go`: `ForwardPolicy{Forward, Receive []string}`. `AtomicPolicy` wraps `sync/atomic.Pointer[ForwardPolicy]` for lock-free reads. `AllowForward(channel string) bool`, `AllowReceive(channel string) bool` — linear scan (channel lists are small). `HubConfig{AllowedPeers}`. `IsClientAllowed(name string) bool`.
 
 **Test strategy:**
 
-- `AllowForward`/`AllowReceive`: exact match returns `true`; non-match returns `false`; empty list returns `false`.
+- `AllowForward`/`AllowReceive`: exact match returns `true`; non-match returns `false`; empty list returns `false` for Forward, `true` for Receive.
 - `AtomicPolicy` swap: readers calling `AllowForward` concurrently while writer swaps; no data race.
-- `PolicyWatcher` integration: write config, start watcher, modify file, assert `ApplyPolicy` called within 1 second.
-- Invalid config (missing addr): reload aborted, `EventPolicyReloadFailed` logged, existing policy unchanged.
-- Removed peer: drain-then-close initiated (mock peer connection).
 
 ---
 
@@ -470,7 +465,7 @@ type PeerSender interface {
 **Deliverables:**
 
 - `messenger_bench_test.go`: benchmark `Publish` throughput (single channel, no federation), `Subscribe` read latency (time from `Publish` return to handler invocation), federation round-trip latency.
-- `integration_test.go` (build tag `//go:build integration`): hub + 2 clients; dedup via dual-path forwarding; policy hot-reload mid-stream; disk-full backpressure; compaction during active subscribers.
+- `integration_test.go` (build tag `//go:build integration`): hub + 2 clients; dedup via dual-path forwarding; subscription-based filtering; disk-full backpressure; compaction during active subscribers.
 - `Makefile`: targets `build`, `test`, `test-integration`, `bench`, `lint`.
 - `.golangci.yml`: enable `revive`, `govet`, `staticcheck`, `gosec`, `errcheck`, `exhaustive`.
 - `CLAUDE.md` update: build/run/test commands, architecture overview, environment variables (`KEYOP_MESSENGER_DATA_DIR`, `KEYOP_MESSENGER_CONFIG`).

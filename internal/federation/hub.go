@@ -17,21 +17,28 @@ import (
 	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
+// logger is a minimal logging interface used by federation components.
+type logger interface {
+	Debug(msg string, args ...any)
+	Info(msg string, args ...any)
+	Warn(msg string, args ...any)
+	Error(msg string, args ...any)
+}
+
 const wireVersion = "1"
 
 // peerEntry tracks an active peer connection on the hub.
 type peerEntry struct {
-	name               string
-	sender             *PeerSender   // may be nil if this peer only sends to us
-	receiver           *PeerReceiver // may be nil if we only send to this peer
-	policy             *AtomicPolicy
-	conn               *websocket.Conn
-	connWriteMu        *sync.Mutex // protects concurrent writes to conn (from sender and receiver)
-	subscribedChannels []string    // channels the peer requested; used for policy reload
+	name                  string
+	sender                *PeerSender   // may be nil if this peer only sends to us
+	receiver              *PeerReceiver // may be nil if we only send to this peer
+	policy                *AtomicPolicy
+	conn                  *websocket.Conn
+	connWriteMu           *sync.Mutex // protects concurrent writes to conn (from sender and receiver)
+	effectiveSubscription []string    // channels to forward to this peer (intersection of request and allowlist)
 }
 
-// Hub accepts incoming WebSocket connections, enforces the allowlist and receive
-// policy, and implements HubApplier for PolicyWatcher hot-reload.
+// Hub accepts incoming WebSocket connections and enforces the allowlist and receive policy.
 type Hub struct {
 	instanceName  string
 	tlsCfg        *tls.Config
@@ -43,11 +50,12 @@ type Hub struct {
 	maxBatchBytes int
 	dataDir       string
 
-	mu       sync.RWMutex
-	cfg      HubConfig
-	peers    map[string]*peerEntry // keyed by instance name
-	listener net.Listener
-	httpSrv  *http.Server
+	mu                 sync.RWMutex
+	cfg                HubConfig
+	peers              map[string]*peerEntry   // keyed by instance name
+	channelSubscribers map[string][]*peerEntry // channel -> list of subscribed peers (reverse index)
+	listener           net.Listener
+	httpSrv            *http.Server
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -66,18 +74,19 @@ func NewHub(
 	dataDir string,
 ) *Hub {
 	return &Hub{
-		instanceName:  instanceName,
-		cfg:           cfg,
-		tlsCfg:        tlsCfg,
-		localWriter:   localWriter,
-		dedup:         dedup,
-		auditL:        auditL,
-		log:           log,
-		sendBufSize:   sendBufSize,
-		maxBatchBytes: maxBatchBytes,
-		dataDir:       dataDir,
-		peers:         make(map[string]*peerEntry),
-		stop:          make(chan struct{}),
+		instanceName:       instanceName,
+		cfg:                cfg,
+		tlsCfg:             tlsCfg,
+		localWriter:        localWriter,
+		dedup:              dedup,
+		auditL:             auditL,
+		log:                log,
+		sendBufSize:        sendBufSize,
+		maxBatchBytes:      maxBatchBytes,
+		dataDir:            dataDir,
+		peers:              make(map[string]*peerEntry),
+		channelSubscribers: make(map[string][]*peerEntry),
+		stop:               make(chan struct{}),
 	}
 }
 
@@ -133,46 +142,26 @@ func (h *Hub) Addr() string {
 	return h.listener.Addr().String()
 }
 
-// ApplyPolicy atomically updates the hub's policy configuration (implements
-// HubApplier). Existing peer AtomicPolicies are updated in place; newly added
-// peer hubs are dialed; removed peers are drained then closed.
-func (h *Hub) ApplyPolicy(newCfg HubConfig) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// Update or remove existing peers.
-	for name, entry := range h.peers {
-		if !newCfg.IsPeerAllowed(name) {
-			go h.drainAndClose(entry)
-			delete(h.peers, name)
-			continue
-		}
-		// Re-intersect the peer's subscribe list with the updated config.
-		if entry.policy != nil {
-			entry.policy.Store(ForwardPolicy{
-				Forward: effectiveSubscribeChannels(entry.subscribedChannels, name, newCfg),
-				Receive: publishChannelsFor(name, newCfg),
-			})
-		}
-	}
-
-	h.cfg = newCfg
-}
-
-func (h *Hub) drainAndClose(entry *peerEntry) {
-	_ = entry.conn.WriteMessage(websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.CloseNormalClosure, "policy updated"))
-	_ = entry.conn.Close()
-	_ = h.auditL.Log(audit.Event{Event: audit.EventClientDrain, Peer: entry.name})
-}
-
-// EnqueueToAll enqueues env to every peer sender whose forward policy permits
-// the channel. Used by the Messenger layer (Phase 13) when publishing.
+// EnqueueToAll enqueues env to every peer sender that is subscribed to the channel.
+// Only peers that explicitly subscribed to this channel will receive the message.
+// All peers have senders created at connection time to support forwarding.
 func (h *Hub) EnqueueToAll(env *envelope.Envelope) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for _, entry := range h.peers {
-		if entry.sender != nil && entry.policy != nil && entry.policy.AllowForward(env.Channel) {
+		// Only forward to peers subscribed to this channel (using effective subscription after hub's allowlist)
+		isSubscribed := false
+		for _, ch := range entry.effectiveSubscription {
+			if ch == env.Channel {
+				isSubscribed = true
+				break
+			}
+		}
+		if !isSubscribed {
+			continue
+		}
+
+		if entry.sender != nil {
 			entry.sender.Enqueue(env)
 		}
 	}
@@ -355,10 +344,11 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		Receive: pubChannels,
 	})
 
-	// Start receiver. Also start a sender if the peer subscribed to any channels.
-	// When both share a conn, route acks via an internal channel so the
-	// PeerReceiver owns all reads and avoids a concurrent-read race.
-	needSender := len(subChannels) > 0
+	// Start receiver. Also start a sender for all peers (even those without subscriptions)
+	// so that messages from other peers can be forwarded to them. When both share a conn,
+	// route acks via an internal channel so the PeerReceiver owns all reads and avoids
+	// a concurrent-read race.
+	needSender := true
 
 	var receiver *PeerReceiver
 	var sender *PeerSender
@@ -375,17 +365,21 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	}
 
 	entry := &peerEntry{
-		name:               peerName,
-		sender:             sender,
-		receiver:           receiver,
-		policy:             policy,
-		conn:               conn,
-		connWriteMu:        connWriteMu,
-		subscribedChannels: hs.Subscribe,
+		name:                  peerName,
+		sender:                sender,
+		receiver:              receiver,
+		policy:                policy,
+		conn:                  conn,
+		connWriteMu:           connWriteMu,
+		effectiveSubscription: subChannels,
 	}
 
 	h.mu.Lock()
 	h.peers[peerName] = entry
+	// Also add to reverse index by channel for fast EnqueueToAll lookups.
+	for _, ch := range subChannels {
+		h.channelSubscribers[ch] = append(h.channelSubscribers[ch], entry)
+	}
 	h.mu.Unlock()
 
 	_ = h.auditL.Log(audit.Event{Event: audit.EventClientConnected, Peer: peerName})
