@@ -60,3 +60,25 @@ Keyop Messenger is a Go pub-sub library with:
 | `internal/audit` | Audit writer with rotation |
 | `internal/dedup` | LRU seen-ID deduplication |
 | `cmd/keyop-messenger` | CLI entry point (`keygen ca`, `keygen instance`, `version`) |
+
+---
+
+## Testing Requirements
+
+**CRITICAL: No task or feature is considered complete until all tests pass.**
+
+- **Before declaring any work done**, ALWAYS run `go test ./...` and verify all packages show `ok` status
+- If any tests fail, report the failures and continue fixing them until all pass
+- Never use words like "done", "complete", "success", or "fixed" without verified test results showing all tests passing
+- If delegating work to agents, immediately run full test suite after agents complete to verify their changes didn't break anything
+- Use the task system: mark tasks as `completed` only after confirming `go test ./...` shows zero failures
+- Expected state: `go test ./...` should show "62 ok" and "0 FAIL"
+
+---
+
+## Policies
+
+- **Never run git commands** (add/commit/push/branch/tag) or modify the repository without explicit written approval.
+- **Never modify configuration** without explicit written approval.
+- **Do not look for server process IDs or kill processes** unless explicitly asked; make HTTP requests instead (ask for the port).
+- **Always discuss before adding backward compatibility** or fallback mechanisms.

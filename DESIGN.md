@@ -15,17 +15,17 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 
 ## 2. Concepts
 
-| Term | Definition |
-|---|---|
-| **Instance** | A single running process embedding the messenger library |
-| **Instance name** | Human-readable identifier for an instance; defaults to OS hostname. If multiple instances share a host, append the port: `hostname:port`. |
-| **Channel** | A named, ordered stream of messages (analogous to a Kafka topic) |
-| **Publisher** | Code that appends a message to a channel |
-| **Subscriber** | Code that reads and processes messages from a channel |
-| **Hub** | An instance that accepts inbound WebSocket connections from clients and/or peer hubs |
-| **Client** | An instance that dials outbound to one or more hubs |
-| **Peer hub** | A hub-to-hub WebSocket connection carrying forwarded messages |
-| **Dead-letter channel** | A channel named `{channel}.dead-letter` that receives messages the subscriber has failed to process after the maximum retry count |
+| Term                    | Definition                                                                                                                                |
+|-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| **Instance**            | A single running process embedding the messenger library                                                                                  |
+| **Instance name**       | Human-readable identifier for an instance; defaults to OS hostname. If multiple instances share a host, append the port: `hostname:port`. |
+| **Channel**             | A named, ordered stream of messages (analogous to a Kafka topic)                                                                          |
+| **Publisher**           | Code that appends a message to a channel                                                                                                  |
+| **Subscriber**          | Code that reads and processes messages from a channel                                                                                     |
+| **Hub**                 | An instance that accepts inbound WebSocket connections from clients and/or peer hubs                                                      |
+| **Client**              | An instance that dials outbound to one or more hubs                                                                                       |
+| **Peer hub**            | A hub-to-hub WebSocket connection carrying forwarded messages                                                                             |
+| **Dead-letter channel** | A channel named `{channel}.dead-letter` that receives messages the subscriber has failed to process after the maximum retry count         |
 
 An instance may be a hub, a client, or both simultaneously.
 
