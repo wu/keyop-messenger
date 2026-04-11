@@ -585,7 +585,22 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	if err != nil {
 		return err
 	}
-	return cs.writer.Write(env)
+	if err := cs.writer.Write(env); err != nil {
+		return err
+	}
+
+	// Forward to other peers via hub (hub's forward policy decides which peers).
+	if m.hub != nil {
+		m.hub.EnqueueToAll(env)
+	}
+	// Forward to direct clients (hub's receive policy decides acceptance).
+	for _, c := range m.clients {
+		if s := c.Sender(); s != nil {
+			s.Enqueue(env)
+		}
+	}
+
+	return nil
 }
 
 // runCompaction iterates all known channels and attempts to delete fully-consumed

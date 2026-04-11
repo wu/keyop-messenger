@@ -4,6 +4,8 @@
 
 Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is designed for systems where durability and delivery guarantees are paramount, offering a simple yet robust architecture based on append-only `.jsonl` files, persistent offset tracking, and mTLS-secured federation.
 
+NOTE: This is still Beta, the API should now be relatively stable.
+
 ## Key Features
 
 - **At-Least-Once Delivery**: Messages are only committed (offset advanced) after successful handler execution.

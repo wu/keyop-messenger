@@ -520,5 +520,121 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 	assert.Empty(t, received, "no extra deliveries expected")
 }
 
+// newClientMessengerWithPolicy creates a Messenger in client-only mode with
+// configured subscribe/publish channel lists for federation.
+func newClientMessengerWithPolicy(
+	t *testing.T,
+	name, dir, caFile, certFile, keyFile, hubAddr string,
+	subscribe, publish []string,
+) *Messenger {
+	t.Helper()
+	cfg := &Config{
+		Name: name,
+		Storage: StorageConfig{
+			DataDir:    filepath.Join(dir, name),
+			SyncPolicy: SyncPolicyNone,
+		},
+		Client: ClientConfig{
+			Enabled: true,
+			Hubs:    []ClientHubRef{{Addr: hubAddr, Subscribe: subscribe, Publish: publish}},
+		},
+		TLS: TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
+	}
+	cfg.ApplyDefaults()
+	m, err := New(cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
+// ---- TestIntegrationClientToClientForwarding --------------------------------
+
+// TestIntegrationClientToClientForwarding verifies that messages from one
+// client are properly forwarded to other clients through the hub via the
+// writeLocalEnvelope path.
+//
+// This test specifically exercises the federation forwarding fix: when a
+// PeerReceiver receives a message from ClientA and calls writeLocalEnvelope,
+// the message should be enqueued to both the hub's peer senders (for other
+// hubs) and its client senders (for other clients).
+//
+// Topology:
+//   - Hub: hub listener accepting ClientA and ClientB
+//   - ClientA: publishes to "forward-test" channel (via Publish field)
+//   - ClientB: subscribes to "forward-test" channel (via Subscribe field)
+//
+// Expected flow:
+//   1. ClientA.Publish() → Hub.PeerReceiver
+//   2. Hub.writeLocalEnvelope() writes message to local storage
+//   3. Hub.writeLocalEnvelope() calls EnqueueToAll() for peer forwarding
+//   4. Hub.writeLocalEnvelope() enqueues to client senders
+//   5. ClientB receives message via its PeerSender connection
+func TestIntegrationClientToClientForwarding(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a", "client-b")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			// Allow both clients to publish and subscribe to all channels
+			AllowedPeers: []AllowedPeer{
+				{Name: "client-a", Publish: []string{}, Subscribe: []string{}},
+				{Name: "client-b", Publish: []string{}, Subscribe: []string{}},
+			},
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	// ClientA can publish to "forward-test", ClientB can subscribe to "forward-test"
+	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr,
+		[]string{}, // subscribe: none (only publishes)
+		[]string{"forward-test"}, // publish: forward-test
+	)
+	clientB := newClientMessengerWithPolicy(t, "client-b", dir, caFile, certFor("client-b"), keyFor("client-b"), hubAddr,
+		[]string{"forward-test"}, // subscribe: forward-test
+		[]string{}, // publish: none (only consumes)
+	)
+
+	// ClientB subscribes to the test channel locally.
+	// Messages from the hub will be delivered via this subscription.
+	received := make(chan Message, 10)
+	require.NoError(t, clientB.Subscribe(context.Background(), "forward-test", "client-b-sub",
+		func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		},
+	))
+
+	// Allow both clients to establish connections with the hub before publishing.
+	time.Sleep(200 * time.Millisecond)
+
+	// ClientA publishes a message. This message should:
+	// 1. Arrive at the hub via ClientA's PeerSender
+	// 2. Be written to local storage via writeLocalEnvelope
+	// 3. Be forwarded back to ClientB via the hub's client senders
+	require.NoError(t, clientA.Publish(context.Background(), "forward-test", "test.ForwardMsg",
+		map[string]any{"from": "client-a", "id": "forward-001"}))
+
+	// Wait for ClientB to receive the message.
+	deadline := time.After(3 * time.Second)
+	var msg Message
+	select {
+	case msg = <-received:
+		// Success: message was forwarded from ClientA through hub to ClientB
+	case <-deadline:
+		t.Fatal("ClientB did not receive forwarded message from ClientA within 3s")
+	}
+
+	// Verify the message content and origin.
+	assert.Equal(t, "forward-test", msg.Channel)
+	assert.Equal(t, "client-a", msg.Origin, "message should originate from client-a")
+	assert.Equal(t, "test.ForwardMsg", msg.PayloadType)
+
+	payload, ok := msg.Payload.(map[string]any)
+	require.True(t, ok, "payload should be a map")
+	assert.Equal(t, "client-a", payload["from"])
+	assert.Equal(t, "forward-001", payload["id"])
+}
+
 // Compile-time assertion: ensure the integration test file imports are used.
 var _ = fmt.Sprintf
