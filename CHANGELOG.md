@@ -1,3 +1,10 @@
+## [0.8.0](https://github.com/wu/keyop-messenger/compare/v0.7.0...v0.8.0) (2026-04-11)
+
+### Features
+
+* optimize peer message routing with reverse index and add cleanup tests ([acacb00](https://github.com/wu/keyop-messenger/commit/acacb00a0bcc310cfeae039d05684bdff0bd556c))
+* remove hot-reload logic and related tests for allowlist policies ([f148423](https://github.com/wu/keyop-messenger/commit/f14842311351f90d93403ec4260df1b060b09cdb))
+
 ## [0.7.0](https://github.com/wu/keyop-messenger/compare/v0.6.2...v0.7.0) (2026-04-11)
 
 ### Features
