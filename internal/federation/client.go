@@ -112,14 +112,15 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 	// When the hub pushes messages back to this client both a PeerSender and a
 	// PeerReceiver share the same conn. Route acks through an internal channel
 	// so the PeerReceiver owns all reads and avoids a concurrent-read race.
+	connWriteMu := &sync.Mutex{} // shared mutex for protecting concurrent writes to conn
 	var sender *PeerSender
 	if c.localWriter != nil {
 		ackCh := make(chan AckMsg, 4)
-		newPeerReceiverWithAck(conn, c.policy, c.dedup, c.localWriter,
+		newPeerReceiverWithAck(conn, connWriteMu, c.policy, c.dedup, c.localWriter,
 			c.auditL, c.log, hubAddr, c.maxBatchBytes, ackCh)
-		sender = newPeerSenderWithAck(conn, c.sendBufSize, c.maxBatchBytes, c.log, ackCh)
+		sender = newPeerSenderWithAck(conn, connWriteMu, c.sendBufSize, c.maxBatchBytes, c.log, ackCh)
 	} else {
-		sender = NewPeerSender(conn, c.sendBufSize, c.maxBatchBytes, c.log)
+		sender = NewPeerSender(conn, connWriteMu, c.sendBufSize, c.maxBatchBytes, c.log)
 	}
 
 	c.mu.Lock()

@@ -26,7 +26,8 @@ type peerEntry struct {
 	receiver           *PeerReceiver // may be nil if we only send to this peer
 	policy             *AtomicPolicy
 	conn               *websocket.Conn
-	subscribedChannels []string // channels the peer requested; used for policy reload
+	connWriteMu        *sync.Mutex // protects concurrent writes to conn (from sender and receiver)
+	subscribedChannels []string    // channels the peer requested; used for policy reload
 }
 
 // Hub accepts incoming WebSocket connections, enforces the allowlist and receive
@@ -361,13 +362,15 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 
 	var receiver *PeerReceiver
 	var sender *PeerSender
+	connWriteMu := &sync.Mutex{} // shared mutex for protecting concurrent writes to conn
+
 	if needSender {
 		ackCh := make(chan AckMsg, 4)
-		receiver = newPeerReceiverWithAck(conn, policy, h.dedup, h.localWriter,
+		receiver = newPeerReceiverWithAck(conn, connWriteMu, policy, h.dedup, h.localWriter,
 			h.auditL, h.log, peerName, h.maxBatchBytes, ackCh)
-		sender = newPeerSenderWithAck(conn, h.sendBufSize, h.maxBatchBytes, h.log, ackCh)
+		sender = newPeerSenderWithAck(conn, connWriteMu, h.sendBufSize, h.maxBatchBytes, h.log, ackCh)
 	} else {
-		receiver = NewPeerReceiver(conn, policy, h.dedup, h.localWriter,
+		receiver = NewPeerReceiver(conn, connWriteMu, policy, h.dedup, h.localWriter,
 			h.auditL, h.log, peerName, h.maxBatchBytes)
 	}
 
@@ -377,6 +380,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		receiver:           receiver,
 		policy:             policy,
 		conn:               conn,
+		connWriteMu:        connWriteMu,
 		subscribedChannels: hs.Subscribe,
 	}
 

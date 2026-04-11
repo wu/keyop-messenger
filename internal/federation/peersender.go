@@ -14,6 +14,7 @@ import (
 // are retained for replay on reconnect.
 type PeerSender struct {
 	conn          *websocket.Conn
+	connWriteMu   *sync.Mutex // protects concurrent writes to conn (shared with PeerReceiver if present)
 	maxBatchBytes int
 	log           logger
 
@@ -33,9 +34,10 @@ type PeerSender struct {
 
 // NewPeerSender starts a PeerSender goroutine on conn.
 // bufSize is the capacity of the outbound buffer (send_buffer_messages).
-func NewPeerSender(conn *websocket.Conn, bufSize, maxBatchBytes int, log logger) *PeerSender {
+func NewPeerSender(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger) *PeerSender {
 	ps := &PeerSender{
 		conn:          conn,
+		connWriteMu:   connWriteMu,
 		maxBatchBytes: maxBatchBytes,
 		log:           log,
 		buf:           make(chan *envelope.Envelope, bufSize),
@@ -49,9 +51,10 @@ func NewPeerSender(conn *websocket.Conn, bufSize, maxBatchBytes int, log logger)
 // newPeerSenderWithAck creates a PeerSender that reads acks from ackCh instead
 // of the connection directly. Use this when a PeerReceiver also reads from conn
 // to avoid concurrent reads violating gorilla/websocket's single-reader rule.
-func newPeerSenderWithAck(conn *websocket.Conn, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
+func newPeerSenderWithAck(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
 	ps := &PeerSender{
 		conn:          conn,
+		connWriteMu:   connWriteMu,
 		maxBatchBytes: maxBatchBytes,
 		log:           log,
 		ackCh:         ackCh,
@@ -163,20 +166,25 @@ func (ps *PeerSender) run() {
 		}
 
 		// Write one binary frame containing all records.
+		ps.connWriteMu.Lock()
 		w, err := ps.conn.NextWriter(websocket.BinaryMessage)
 		if err != nil {
+			ps.connWriteMu.Unlock()
 			ps.log.Error("federation: sender next writer", "err", err)
 			return
 		}
 		if err := WriteFrame(w, records); err != nil {
 			_ = w.Close()
+			ps.connWriteMu.Unlock()
 			ps.log.Error("federation: sender write frame", "err", err)
 			return
 		}
 		if err := w.Close(); err != nil {
+			ps.connWriteMu.Unlock()
 			ps.log.Error("federation: sender close writer", "err", err)
 			return
 		}
+		ps.connWriteMu.Unlock()
 
 		// Record as unacked.
 		ps.mu.Lock()

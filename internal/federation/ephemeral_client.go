@@ -215,9 +215,11 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	// unblock waiting Publish callers.
 	ackCh := make(chan AckMsg, 4)
 
+	connWriteMu := &sync.Mutex{}     // shared mutex for protecting concurrent writes to conn
 	dd, _ := dedup.NewLRUDedup(1024) // small dedup for defense-in-depth
 	receiver := newPeerReceiverWithAck(
 		conn,
+		connWriteMu,
 		nil, // nil policy → accept all channels forwarded by the hub
 		dd,
 		c.dispatchEnvelope,

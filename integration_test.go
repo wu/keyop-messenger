@@ -564,11 +564,11 @@ func newClientMessengerWithPolicy(
 //   - ClientB: subscribes to "forward-test" channel (via Subscribe field)
 //
 // Expected flow:
-//   1. ClientA.Publish() → Hub.PeerReceiver
-//   2. Hub.writeLocalEnvelope() writes message to local storage
-//   3. Hub.writeLocalEnvelope() calls EnqueueToAll() for peer forwarding
-//   4. Hub.writeLocalEnvelope() enqueues to client senders
-//   5. ClientB receives message via its PeerSender connection
+//  1. ClientA.Publish() → Hub.PeerReceiver
+//  2. Hub.writeLocalEnvelope() writes message to local storage
+//  3. Hub.writeLocalEnvelope() calls EnqueueToAll() for peer forwarding
+//  4. Hub.writeLocalEnvelope() enqueues to client senders
+//  5. ClientB receives message via its PeerSender connection
 func TestIntegrationClientToClientForwarding(t *testing.T) {
 	dir := t.TempDir()
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a", "client-b")
@@ -587,12 +587,12 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 
 	// ClientA can publish to "forward-test", ClientB can subscribe to "forward-test"
 	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr,
-		[]string{}, // subscribe: none (only publishes)
+		[]string{},               // subscribe: none (only publishes)
 		[]string{"forward-test"}, // publish: forward-test
 	)
 	clientB := newClientMessengerWithPolicy(t, "client-b", dir, caFile, certFor("client-b"), keyFor("client-b"), hubAddr,
 		[]string{"forward-test"}, // subscribe: forward-test
-		[]string{}, // publish: none (only consumes)
+		[]string{},               // publish: none (only consumes)
 	)
 
 	// ClientB subscribes to the test channel locally.

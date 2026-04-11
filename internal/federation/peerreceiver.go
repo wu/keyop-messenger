@@ -3,6 +3,7 @@ package federation
 import (
 	"encoding/json"
 	"io"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -25,6 +26,7 @@ type Deduplicator interface {
 // ackRouteCh. ackRouteCh is closed when the receiver exits.
 type PeerReceiver struct {
 	conn          *websocket.Conn
+	connWriteMu   *sync.Mutex   // protects concurrent writes to conn (shared with PeerSender if present)
 	policy        *AtomicPolicy // may be nil (accept everything)
 	dedup         Deduplicator
 	localWriter   func(*envelope.Envelope) error
@@ -41,6 +43,7 @@ type PeerReceiver struct {
 // NewPeerReceiver creates a PeerReceiver and starts its goroutine.
 func NewPeerReceiver(
 	conn *websocket.Conn,
+	connWriteMu *sync.Mutex,
 	policy *AtomicPolicy,
 	dedup Deduplicator,
 	localWriter func(*envelope.Envelope) error,
@@ -51,6 +54,7 @@ func NewPeerReceiver(
 ) *PeerReceiver {
 	pr := &PeerReceiver{
 		conn:          conn,
+		connWriteMu:   connWriteMu,
 		policy:        policy,
 		dedup:         dedup,
 		localWriter:   localWriter,
@@ -71,6 +75,7 @@ func NewPeerReceiver(
 // receiver goroutine exits, which will unblock the paired PeerSender.
 func newPeerReceiverWithAck(
 	conn *websocket.Conn,
+	connWriteMu *sync.Mutex,
 	policy *AtomicPolicy,
 	dedup Deduplicator,
 	localWriter func(*envelope.Envelope) error,
@@ -82,6 +87,7 @@ func newPeerReceiverWithAck(
 ) *PeerReceiver {
 	pr := &PeerReceiver{
 		conn:          conn,
+		connWriteMu:   connWriteMu,
 		policy:        policy,
 		dedup:         dedup,
 		localWriter:   localWriter,
@@ -200,8 +206,11 @@ func (pr *PeerReceiver) run() {
 
 		// Ack the full batch — even policy-violated records are acked so the
 		// sender can advance its window.
-		if err := SendAck(pr.conn, AckMsg{LastID: lastID}); err != nil {
-			pr.log.Error("federation: receiver send ack", "err", err)
+		pr.connWriteMu.Lock()
+		ackErr := SendAck(pr.conn, AckMsg{LastID: lastID})
+		pr.connWriteMu.Unlock()
+		if ackErr != nil {
+			pr.log.Error("federation: receiver send ack", "err", ackErr)
 			return
 		}
 	}

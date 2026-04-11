@@ -101,7 +101,7 @@ func TestHubClientIntegration(t *testing.T) {
 	clientHandshake(t, cli, "sender")
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, 100, 65536, log)
+	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
 	defer sender.Close()
 
 	for i := 0; i < 10; i++ {
@@ -146,7 +146,7 @@ func TestDeduplication(t *testing.T) {
 	clientHandshake(t, cli, "sender")
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, 100, 65536, log)
+	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
 	defer sender.Close()
 
 	env, err := envelope.NewEnvelope("ch", "sender", "t", nil)
@@ -176,7 +176,7 @@ func TestPolicyViolation(t *testing.T) {
 	clientHandshake(t, cli, "sender")
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, 100, 65536, log)
+	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
 	defer sender.Close()
 
 	env, err := envelope.NewEnvelope("blocked-ch", "sender", "t", nil)
@@ -199,7 +199,7 @@ func TestBackpressure(t *testing.T) {
 	clientHandshake(t, cli, "sender")
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, 100, 65536, log)
+	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
 	defer sender.Close()
 
 	env1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
@@ -218,7 +218,7 @@ func TestSendBufferFull(t *testing.T) {
 	log := &testutil.FakeLogger{}
 	srv, _ := newWSPair(t)
 	// Buffer size 1; goroutine will be stuck waiting for ack since no receiver.
-	ps := federation.NewPeerSender(srv, 1, 65536, log)
+	ps := federation.NewPeerSender(srv, &sync.Mutex{}, 1, 65536, log)
 	defer ps.Close()
 
 	e1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
@@ -258,7 +258,7 @@ func TestBatching(t *testing.T) {
 		}
 	}()
 
-	sender := federation.NewPeerSender(cli, 1000, 65536, log)
+	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 1000, 65536, log)
 	for i := 0; i < 200; i++ {
 		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
 		sender.Enqueue(&env)
@@ -336,7 +336,7 @@ func TestReconnectReplay(t *testing.T) {
 		_ = srv1.Close()
 	}()
 
-	sender1 := federation.NewPeerSender(cli1, 100, 65536, log)
+	sender1 := federation.NewPeerSender(cli1, &sync.Mutex{}, 100, 65536, log)
 	var sent []*envelope.Envelope
 	for i := 0; i < 5; i++ {
 		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
@@ -366,7 +366,7 @@ func TestReconnectReplay(t *testing.T) {
 		}
 	}()
 
-	sender2 := federation.NewPeerSender(cli2, 100, 65536, log)
+	sender2 := federation.NewPeerSender(cli2, &sync.Mutex{}, 100, 65536, log)
 	for _, env := range unacked {
 		env := env
 		sender2.Enqueue(env)
