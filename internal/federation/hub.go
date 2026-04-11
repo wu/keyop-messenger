@@ -148,19 +148,8 @@ func (h *Hub) Addr() string {
 func (h *Hub) EnqueueToAll(env *envelope.Envelope) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	for _, entry := range h.peers {
-		// Only forward to peers subscribed to this channel (using effective subscription after hub's allowlist)
-		isSubscribed := false
-		for _, ch := range entry.effectiveSubscription {
-			if ch == env.Channel {
-				isSubscribed = true
-				break
-			}
-		}
-		if !isSubscribed {
-			continue
-		}
-
+	// Use reverse index for O(k) lookup where k = number of subscribers to this channel.
+	for _, entry := range h.channelSubscribers[env.Channel] {
 		if entry.sender != nil {
 			entry.sender.Enqueue(env)
 		}
@@ -408,6 +397,20 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		<-receiver.Done()
 		h.mu.Lock()
 		delete(h.peers, peerName)
+		// Remove from reverse index by channel.
+		for _, ch := range subChannels {
+			peers := h.channelSubscribers[ch]
+			for i, p := range peers {
+				if p == entry {
+					h.channelSubscribers[ch] = append(peers[:i], peers[i+1:]...)
+					break
+				}
+			}
+			// Clean up empty channel entries.
+			if len(h.channelSubscribers[ch]) == 0 {
+				delete(h.channelSubscribers, ch)
+			}
+		}
 		h.mu.Unlock()
 		if sender != nil {
 			sender.Close()

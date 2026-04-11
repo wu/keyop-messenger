@@ -1,7 +1,6 @@
 package federation
 
 import (
-	"fmt"
 	"sync/atomic"
 )
 
@@ -136,20 +135,4 @@ func intersectChannels(a, b []string) []string {
 		}
 	}
 	return result
-}
-
-// validate checks that the HubConfig is internally consistent:
-// every peer must have a non-empty Name, and peer names must be unique.
-func (c HubConfig) validate() error {
-	seen := make(map[string]bool, len(c.AllowedPeers))
-	for i, peer := range c.AllowedPeers {
-		if peer.Name == "" {
-			return fmt.Errorf("federation: allowed_peers[%d]: name must not be empty", i)
-		}
-		if seen[peer.Name] {
-			return fmt.Errorf("federation: allowed_peers: duplicate name %q", peer.Name)
-		}
-		seen[peer.Name] = true
-	}
-	return nil
 }

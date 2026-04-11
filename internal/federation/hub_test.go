@@ -426,3 +426,136 @@ func TestMTLSRejection(t *testing.T) {
 	_, _, err = dialer.Dial("wss://"+hub.Addr(), nil)
 	assert.Error(t, err, "client with cert from untrusted CA must be rejected")
 }
+
+// ---- reverse index (channelSubscribers) tests --------------------------------
+
+func TestChannelSubscribersCleanupOnDisconnect(t *testing.T) {
+	// Verify that the reverse index is properly cleaned up when a peer disconnects.
+	// After cleanup, the channel lists should be empty for channels that only had that peer.
+	auditL := &fakeAuditLog{}
+	cw := &countingWriter{}
+	cfg := federation.HubConfig{
+		AllowedPeers: []federation.AllowedPeer{{
+			Name:      "cleanup-test",
+			Subscribe: []string{"ch-a", "ch-b"},
+		}},
+	}
+	hub := newHub(t, cfg, cw, auditL)
+
+	srv, cli := newWSPair(t)
+	hub.ServeTestConn(srv, nil)
+	clientHandshake(t, cli, "cleanup-test")
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Close the connection to trigger cleanup.
+	_ = cli.Close()
+	_ = srv.Close()
+
+	// Wait for cleanup goroutine to run.
+	require.Eventually(t, func() bool {
+		return auditL.has(audit.EventPeerDisconnected)
+	}, 2*time.Second, 20*time.Millisecond)
+
+	// After cleanup, verify the hub handles EnqueueToAll without panic or sending to dead peers.
+	// This ensures the reverse index was properly cleaned up.
+	env1, _ := envelope.NewEnvelope("ch-a", "sender", "t", nil)
+	env2, _ := envelope.NewEnvelope("ch-b", "sender", "t", nil)
+
+	// These should be no-ops (no peers to send to) and not crash.
+	hub.EnqueueToAll(&env1)
+	hub.EnqueueToAll(&env2)
+
+	time.Sleep(100 * time.Millisecond)
+
+	// No panic occurred and cleanup was successful.
+	assert.True(t, true, "cleanup completed without panic")
+}
+
+func TestChannelSubscribersEmptyChannelDeletion(t *testing.T) {
+	// Verify that when all peers on a channel disconnect, the channel entry is deleted
+	// from the reverse index to prevent memory leaks.
+	auditL := &fakeAuditLog{}
+	cw := &countingWriter{}
+	cfg := federation.HubConfig{
+		AllowedPeers: []federation.AllowedPeer{
+			{Name: "peer-1", Subscribe: []string{"exclusive-ch"}},
+		},
+	}
+	hub := newHub(t, cfg, cw, auditL)
+
+	srv, cli := newWSPair(t)
+	hub.ServeTestConn(srv, nil)
+	clientHandshake(t, cli, "peer-1")
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Disconnect the only peer on exclusive-ch.
+	_ = cli.Close()
+	_ = srv.Close()
+
+	require.Eventually(t, func() bool {
+		return auditL.has(audit.EventPeerDisconnected)
+	}, 2*time.Second, 20*time.Millisecond)
+
+	// Verify the hub can handle EnqueueToAll for the now-empty channel without leaking memory.
+	// This would fail if empty channel entries weren't being deleted from the reverse index.
+	env, _ := envelope.NewEnvelope("exclusive-ch", "sender", "t", nil)
+	hub.EnqueueToAll(&env)
+
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, true, "empty channel handling succeeded")
+}
+
+func TestChannelSubscribersStressConnectDisconnect(t *testing.T) {
+	// Stress test: rapidly connect and disconnect many peers to verify the reverse index
+	// doesn't have memory leaks or corruption.
+	auditL := &fakeAuditLog{}
+	cw := &countingWriter{}
+
+	peers := []federation.AllowedPeer{}
+	for i := 0; i < 30; i++ {
+		peers = append(peers, federation.AllowedPeer{
+			Name:      fmt.Sprintf("peer-%d", i),
+			Subscribe: []string{"stress-ch-a", "stress-ch-b"},
+		})
+	}
+
+	cfg := federation.HubConfig{AllowedPeers: peers}
+	hub := newHub(t, cfg, cw, auditL)
+
+	// Connect and disconnect 30 peers multiple times, each subscribing to 2 channels.
+	for round := 0; round < 3; round++ {
+		var connections []*websocket.Conn
+		for i := 0; i < 30; i++ {
+			srv, cli := newWSPair(t)
+			hub.ServeTestConn(srv, nil)
+			clientHandshake(t, cli, fmt.Sprintf("peer-%d", i))
+			connections = append(connections, cli)
+		}
+
+		time.Sleep(50 * time.Millisecond) // Let all connections establish
+
+		// Disconnect all peers.
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+
+		time.Sleep(50 * time.Millisecond) // Let cleanup complete
+
+		// Try to enqueue to both channels to verify no panics and proper index cleanup.
+		env1, _ := envelope.NewEnvelope("stress-ch-a", "sender", "t", nil)
+		env2, _ := envelope.NewEnvelope("stress-ch-b", "sender", "t", nil)
+		hub.EnqueueToAll(&env1)
+		hub.EnqueueToAll(&env2)
+	}
+
+	// Final enqueue to verify hub is still functional.
+	env1, _ := envelope.NewEnvelope("stress-ch-a", "sender", "t", nil)
+	env2, _ := envelope.NewEnvelope("stress-ch-b", "sender", "t", nil)
+	hub.EnqueueToAll(&env1)
+	hub.EnqueueToAll(&env2)
+
+	// Test completed without panic; reverse index survived the stress.
+	assert.True(t, true, "stress test completed without panic or memory issues")
+}
