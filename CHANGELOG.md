@@ -1,3 +1,13 @@
+## [0.7.0](https://github.com/wu/keyop-messenger/compare/v0.6.2...v0.7.0) (2026-04-11)
+
+### Features
+
+* add client-to-client message forwarding test and improve hub forwarding logic ([7b2fad6](https://github.com/wu/keyop-messenger/commit/7b2fad6082bc6b0dffa8099b21c0bdacdc04bbb9))
+
+### Bug Fixes
+
+* add shared mutex to synchronize concurrent writes to WebSocket connections ([ab87f8f](https://github.com/wu/keyop-messenger/commit/ab87f8fc9f6c10a97559ab36ff3c7ca608f6741e))
+
 ## [0.6.2](https://github.com/wu/keyop-messenger/compare/v0.6.1...v0.6.2) (2026-04-10)
 
 ### Refactoring
