@@ -13,6 +13,7 @@ NOTE: This is still Beta, the API should now be relatively stable.
 - **Persistent Offset Tracking**: Subscribers resume exactly where they left off, even after a crash or restart.
 - **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
 - **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
+- **Correlation IDs**: Stamp messages with application-level correlation IDs to trace multi-step processes across service boundaries.
 - **Reliable Retries & DLQ**: Configurable retry logic with automatic routing to `.dead-letter` channels.
 - **Secure Federation**: Star-topology federation over mTLS WebSockets. Clients subscribe to specific channels; hubs enforce per-client channel allowlists under explicit policy.
 - **Observability**: File-based offsets and JSONL records allow operators to use standard Unix tools (`cat`, `grep`, `tail`) for debugging.
@@ -78,6 +79,31 @@ func main() {
     // Publish blocks until the write is confirmed to disk.
     m.Publish(ctx, "alerts", "com.example.Alert", Alert{Message: "system heat!"})
 }
+```
+
+### Correlation IDs
+
+Correlation IDs track related messages across multi-step processes. Set a correlation ID via context before publishing, and it will be stamped on the envelope and delivered to subscribers. Useful for tracing a request through multiple services.
+
+```go
+// Start a correlated chain of messages
+ctx := messenger.WithCorrelationID(context.Background(), "order-123")
+
+// All messages published with this context carry the same correlation ID
+m.Publish(ctx, "orders", "com.example.OrderCreated", &order)
+m.Publish(ctx, "payments", "com.example.ChargeOrder", &charge)
+m.Publish(ctx, "shipping", "com.example.ShipOrder", &shipment)
+
+// Subscribers receive the correlation ID
+m.Subscribe(ctx, "orders", "processor", func(ctx context.Context, msg messenger.Message) error {
+    // msg.CorrelationID == "order-123"
+
+    // Propagate to downstream services
+    downstreamCtx := messenger.WithCorrelationID(ctx, msg.CorrelationID)
+    m.Publish(downstreamCtx, "next-channel", "com.example.NextEvent", &event)
+
+    return nil
+})
 ```
 
 ### Certificate Generation (for Federation)

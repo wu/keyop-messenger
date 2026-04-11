@@ -167,6 +167,8 @@ func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType s
 	if err != nil {
 		return fmt.Errorf("ephemeral publish: create envelope: %w", err)
 	}
+	// Stamp correlation ID from context if present
+	env.CorrelationID = CorrelationIDFromContext(ctx)
 	return m.client.Publish(ctx, &env)
 }
 

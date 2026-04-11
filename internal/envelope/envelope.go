@@ -45,6 +45,10 @@ type Envelope struct {
 	// e.g. "com.keyop.orders.OrderCreated". Reverse-DNS format is recommended.
 	PayloadType string `json:"payload_type"`
 
+	// CorrelationID is an optional application-level identifier used to group
+	// related messages across a multi-step process. Omitted from JSON if empty.
+	CorrelationID string `json:"correlation_id,omitempty"`
+
 	// Payload is the application-defined body. Its structure is described by
 	// PayloadType and decoded via the payload registry.
 	Payload json.RawMessage `json:"payload"`

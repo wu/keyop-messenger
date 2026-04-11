@@ -71,6 +71,9 @@ type Message struct {
 	Origin string
 	// PayloadType is the type discriminator string (e.g. "com.acme.OrderCreated").
 	PayloadType string
+	// CorrelationID is an optional application-level identifier used to group
+	// related messages across a multi-step process.
+	CorrelationID string
 	// Payload is the decoded payload. Its concrete type is the prototype
 	// registered via RegisterPayloadType, or map[string]any for unknown types.
 	Payload any
@@ -314,6 +317,9 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 		return fmt.Errorf("publish %q: create envelope: %w", channel, err)
 	}
 
+	// Stamp correlation ID from context if present
+	env.CorrelationID = CorrelationIDFromContext(ctx)
+
 	// Mark in dedup so that if this message returns via federation it is
 	// recognised as already seen and not re-delivered locally.
 	m.dedup.SeenOrAdd(env.ID)
@@ -391,12 +397,13 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 	// Adapt the public HandlerFunc to the storage-level signature.
 	storageHandler := func(env *envelope.Envelope, payload any) error {
 		return handler(subCtx, Message{
-			ID:          env.ID,
-			Channel:     env.Channel,
-			Origin:      env.Origin,
-			PayloadType: env.PayloadType,
-			Payload:     payload,
-			Timestamp:   env.Ts,
+			ID:            env.ID,
+			Channel:       env.Channel,
+			Origin:        env.Origin,
+			PayloadType:   env.PayloadType,
+			CorrelationID: env.CorrelationID,
+			Payload:       payload,
+			Timestamp:     env.Ts,
 		})
 	}
 
