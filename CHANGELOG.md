@@ -1,3 +1,9 @@
+## [0.10.0](https://github.com/wu/keyop-messenger/compare/v0.9.1...v0.10.0) (2026-04-13)
+
+### Features
+
+* add ServiceName context field to track message publishers ([2d82aba](https://github.com/wu/keyop-messenger/commit/2d82abaf35126066616e0b81cf237fa4dd86a14a))
+
 ## [0.9.1](https://github.com/wu/keyop-messenger/compare/v0.9.0...v0.9.1) (2026-04-13)
 
 ### Bug Fixes
