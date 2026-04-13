@@ -1,3 +1,9 @@
+## [0.10.1](https://github.com/wu/keyop-messenger/compare/v0.10.0...v0.10.1) (2026-04-13)
+
+### Bug Fixes
+
+* resolve issue with publish channel support and client receive policy ([23a251f](https://github.com/wu/keyop-messenger/commit/23a251f2e3171dab59d2f1d7160cef8b5a89f893))
+
 ## [0.10.0](https://github.com/wu/keyop-messenger/compare/v0.9.1...v0.10.0) (2026-04-13)
 
 ### Features
