@@ -217,6 +217,11 @@ func (c *Client) Sender() *PeerSender {
 	return c.sender
 }
 
+// AllowPublish reports whether the given channel is allowed to be published to the hub.
+func (c *Client) AllowPublish(channel string) bool {
+	return c.policy.AllowReceive(channel)
+}
+
 // Close stops the reconnect loop and the current connection.
 func (c *Client) Close() {
 	select {

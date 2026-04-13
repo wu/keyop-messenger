@@ -224,7 +224,9 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 	// Dial configured client hubs.
 	if cfg.Client.Enabled {
 		for _, ref := range cfg.Client.Hubs {
-			policy := federation.NewAtomicPolicy(federation.ForwardPolicy{})
+			policy := federation.NewAtomicPolicy(federation.ForwardPolicy{
+				Receive: ref.Publish,
+			})
 			c := federation.NewClient(
 				cfg.Name,
 				tlsCfg,
@@ -332,9 +334,9 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	if m.hub != nil {
 		m.hub.EnqueueToAll(&env)
 	}
-	// Enqueue to client senders (hub's receive policy decides acceptance).
+	// Enqueue to client senders (client's publish policy decides acceptance).
 	for _, c := range m.clients {
-		if s := c.Sender(); s != nil {
+		if s := c.Sender(); s != nil && c.AllowPublish(env.Channel) {
 			s.Enqueue(&env)
 		}
 	}
