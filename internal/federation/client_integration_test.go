@@ -63,7 +63,7 @@ func TestClient_Dial_Success(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{"events"},
+		[]string{"events"}, nil,
 	)
 	defer client.Close()
 
@@ -108,7 +108,7 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -159,7 +159,7 @@ func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
 		100*time.Millisecond, // short reconnect base for testing
 		500*time.Millisecond,
 		0.1,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -206,7 +206,7 @@ func TestClient_Close_StopsReconnectLoop(t *testing.T) {
 		100*time.Millisecond,
 		500*time.Millisecond,
 		0.1,
-		[]string{},
+		[]string{}, nil,
 	)
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
@@ -256,6 +256,7 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 		60*time.Second,
 		0.2,
 		[]string{}, // no subscriptions
+		nil,
 	)
 	defer client.Close()
 
@@ -303,7 +304,7 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{"chan1", "chan2", "chan3"},
+		[]string{"chan1", "chan2", "chan3"}, nil,
 	)
 	defer client.Close()
 
@@ -352,7 +353,7 @@ func TestClient_Dial_WithReplayID(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 

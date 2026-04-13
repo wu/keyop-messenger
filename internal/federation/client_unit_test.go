@@ -39,7 +39,7 @@ func TestNewClient_ValidConfig(t *testing.T) {
 		500*time.Millisecond, // reconnectBase
 		60*time.Second,       // reconnectMax
 		0.2,                  // reconnectJitter
-		[]string{"events"},
+		[]string{"events"}, nil,
 	)
 	assert.NotNil(t, client)
 	t.Cleanup(func() { client.Close() })
@@ -66,7 +66,7 @@ func TestNewClient_NoLocalWriter(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	assert.NotNil(t, client)
 	t.Cleanup(func() { client.Close() })
@@ -93,7 +93,7 @@ func TestClient_Dial_InvalidAddr(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{"events"},
+		[]string{"events"}, nil,
 	)
 	defer client.Close()
 
@@ -122,7 +122,7 @@ func TestClient_Sender_NilBeforeConnect(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -151,7 +151,7 @@ func TestClient_Close_Idempotent(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 
 	// Multiple Close calls should not panic.
@@ -182,7 +182,7 @@ func TestClient_Config_WithTLS(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -209,7 +209,7 @@ func TestClient_Config_WithSubscribeChannels(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{"chan1", "chan2", "chan3"},
+		[]string{"chan1", "chan2", "chan3"}, nil,
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -236,7 +236,7 @@ func TestClient_Config_LargeBuffers(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -263,7 +263,7 @@ func TestClient_Config_CustomReconnectParams(t *testing.T) {
 		100*time.Millisecond, // custom base
 		10*time.Second,       // custom max
 		0.5,                  // custom jitter
-		[]string{},
+		[]string{}, nil,
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -297,7 +297,7 @@ func TestClient_LocalWriter_Signature(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -326,7 +326,7 @@ func TestClient_Deduplicator_Provided(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -357,7 +357,7 @@ func TestClient_Policy_Provided(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -385,7 +385,7 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 
@@ -413,7 +413,7 @@ func TestClient_ConnectWithReconnect_InvalidAddr(t *testing.T) {
 		100*time.Millisecond, // short timeout for test
 		500*time.Millisecond,
 		0.2,
-		[]string{},
+		[]string{}, nil,
 	)
 	defer client.Close()
 

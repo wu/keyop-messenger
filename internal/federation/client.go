@@ -26,6 +26,7 @@ type Client struct {
 	sendBufSize       int
 	maxBatchBytes     int
 	subscribeChannels []string // channels this client wants to receive from the hub
+	publishChannels   []string // channels this client is allowed to publish to the hub
 
 	// Reconnect parameters.
 	reconnectBase   time.Duration
@@ -43,6 +44,7 @@ type Client struct {
 // ConnectWithReconnect to establish a connection.
 // subscribeChannels is the list of channels to request from the hub; the hub
 // may deliver a subset based on its access control policy.
+// publishChannels is the list of channels the client is allowed to publish to the hub.
 func NewClient(
 	instanceName string,
 	tlsCfg *tls.Config,
@@ -55,6 +57,7 @@ func NewClient(
 	reconnectBase, reconnectMax time.Duration,
 	reconnectJitter float64,
 	subscribeChannels []string,
+	publishChannels []string,
 ) *Client {
 	return &Client{
 		instanceName:      instanceName,
@@ -70,6 +73,7 @@ func NewClient(
 		reconnectMax:      reconnectMax,
 		reconnectJitter:   reconnectJitter,
 		subscribeChannels: subscribeChannels,
+		publishChannels:   publishChannels,
 		stop:              make(chan struct{}),
 	}
 }
@@ -219,7 +223,17 @@ func (c *Client) Sender() *PeerSender {
 
 // AllowPublish reports whether the given channel is allowed to be published to the hub.
 func (c *Client) AllowPublish(channel string) bool {
-	return c.policy.AllowReceive(channel)
+	// If no publish channels are configured, allow all
+	if len(c.publishChannels) == 0 {
+		return true
+	}
+	// Check if channel is in the allowed list
+	for _, ch := range c.publishChannels {
+		if ch == channel {
+			return true
+		}
+	}
+	return false
 }
 
 // Close stops the reconnect loop and the current connection.

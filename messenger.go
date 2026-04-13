@@ -227,7 +227,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 	if cfg.Client.Enabled {
 		for _, ref := range cfg.Client.Hubs {
 			policy := federation.NewAtomicPolicy(federation.ForwardPolicy{
-				Receive: ref.Publish,
+				Receive: ref.Subscribe, // channels client may receive from hub (checked by PeerReceiver)
 			})
 			c := federation.NewClient(
 				cfg.Name,
@@ -243,6 +243,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				time.Duration(cfg.Federation.ReconnectMaxMS)*time.Millisecond,
 				cfg.Federation.ReconnectJitter,
 				ref.Subscribe,
+				ref.Publish,
 			)
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)
