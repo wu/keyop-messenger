@@ -1,3 +1,9 @@
+## [0.9.1](https://github.com/wu/keyop-messenger/compare/v0.9.0...v0.9.1) (2026-04-13)
+
+### Bug Fixes
+
+* resolve a bug with client channel filtering ([70791ba](https://github.com/wu/keyop-messenger/commit/70791ba885845664501bbd15f22ec9d4a50d8d17))
+
 ## [0.9.0](https://github.com/wu/keyop-messenger/compare/v0.8.0...v0.9.0) (2026-04-11)
 
 ### Features
