@@ -74,6 +74,8 @@ type Message struct {
 	// CorrelationID is an optional application-level identifier used to group
 	// related messages across a multi-step process.
 	CorrelationID string
+	// ServiceName is the name of the service that published this message.
+	ServiceName string
 	// Payload is the decoded payload. Its concrete type is the prototype
 	// registered via RegisterPayloadType, or map[string]any for unknown types.
 	Payload any
@@ -319,8 +321,9 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 		return fmt.Errorf("publish %q: create envelope: %w", channel, err)
 	}
 
-	// Stamp correlation ID from context if present
+	// Stamp correlation ID and service name from context if present
 	env.CorrelationID = CorrelationIDFromContext(ctx)
+	env.ServiceName = ServiceNameFromContext(ctx)
 
 	// Mark in dedup so that if this message returns via federation it is
 	// recognised as already seen and not re-delivered locally.
@@ -404,6 +407,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 			Origin:        env.Origin,
 			PayloadType:   env.PayloadType,
 			CorrelationID: env.CorrelationID,
+			ServiceName:   env.ServiceName,
 			Payload:       payload,
 			Timestamp:     env.Ts,
 		})

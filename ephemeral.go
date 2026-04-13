@@ -129,12 +129,14 @@ func (m *EphemeralMessenger) Subscribe(channel string, handler func(msg Message)
 	m.client.AddHandler(channel, func(env *envelope.Envelope) error {
 		payload, _ := reg.Decode(env.PayloadType, env.Payload)
 		handler(Message{
-			ID:          env.ID,
-			Channel:     env.Channel,
-			Origin:      env.Origin,
-			PayloadType: env.PayloadType,
-			Payload:     payload,
-			Timestamp:   env.Ts,
+			ID:            env.ID,
+			Channel:       env.Channel,
+			Origin:        env.Origin,
+			PayloadType:   env.PayloadType,
+			CorrelationID: env.CorrelationID,
+			ServiceName:   env.ServiceName,
+			Payload:       payload,
+			Timestamp:     env.Ts,
 		})
 		return nil
 	})
@@ -167,8 +169,9 @@ func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType s
 	if err != nil {
 		return fmt.Errorf("ephemeral publish: create envelope: %w", err)
 	}
-	// Stamp correlation ID from context if present
+	// Stamp correlation ID and service name from context if present
 	env.CorrelationID = CorrelationIDFromContext(ctx)
+	env.ServiceName = ServiceNameFromContext(ctx)
 	return m.client.Publish(ctx, &env)
 }
 

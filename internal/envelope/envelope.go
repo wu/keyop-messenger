@@ -49,6 +49,10 @@ type Envelope struct {
 	// related messages across a multi-step process. Omitted from JSON if empty.
 	CorrelationID string `json:"correlation_id,omitempty"`
 
+	// ServiceName is the name of the service that published this message.
+	// Preserved across hub forwarding. Omitted from JSON if empty.
+	ServiceName string `json:"service_name,omitempty"`
+
 	// Payload is the application-defined body. Its structure is described by
 	// PayloadType and decoded via the payload registry.
 	Payload json.RawMessage `json:"payload"`

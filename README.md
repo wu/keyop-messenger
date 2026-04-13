@@ -72,12 +72,17 @@ func main() {
     // Subscribe before publishing so the handler sees the message.
     m.Subscribe(ctx, "alerts", "worker-1", func(ctx context.Context, msg messenger.Message) error {
         a := msg.Payload.(Alert)
-        slog.Info("received", "message", a.Message, "origin", msg.Origin)
+        slog.Info("received",
+            "message", a.Message,
+            "origin", msg.Origin,
+            "service", msg.ServiceName,
+        )
         return nil
     })
 
-    // Publish blocks until the write is confirmed to disk.
-    m.Publish(ctx, "alerts", "com.example.Alert", Alert{Message: "system heat!"})
+    // Publish with service identification. Blocks until the write is confirmed to disk.
+    pubCtx := messenger.WithServiceName(ctx, "monitor-service")
+    m.Publish(pubCtx, "alerts", "com.example.Alert", Alert{Message: "system heat!"})
 }
 ```
 
@@ -104,6 +109,35 @@ m.Subscribe(ctx, "orders", "processor", func(ctx context.Context, msg messenger.
 
     return nil
 })
+```
+
+### Service Names
+
+Service names identify which service published a message. Set a service name via context before publishing, and it will be stamped on the envelope and delivered to subscribers. Useful for debugging and log triage.
+
+```go
+// Publish from a specific service
+ctx := messenger.WithServiceName(context.Background(), "payment-processor")
+m.Publish(ctx, "payments", "com.example.ChargeCompleted", &charge)
+
+// Subscribers can see which service published the message
+m.Subscribe(ctx, "payments", "auditor", func(ctx context.Context, msg messenger.Message) error {
+    slog.Info("payment processed",
+        "service", msg.ServiceName,  // "payment-processor"
+        "origin", msg.Origin,        // instance name
+        "id", msg.ID,
+    )
+    return nil
+})
+```
+
+Service names work well with correlation IDs — both can be set in the same context:
+
+```go
+ctx := messenger.WithServiceName(context.Background(), "orders")
+ctx = messenger.WithCorrelationID(ctx, "order-789")
+
+m.Publish(ctx, "orders", "com.example.OrderCreated", &order)
 ```
 
 ### Certificate Generation (for Federation)
