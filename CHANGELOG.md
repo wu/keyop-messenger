@@ -1,3 +1,9 @@
+## [0.11.0](https://github.com/wu/keyop-messenger/compare/v0.10.1...v0.11.0) (2026-04-15)
+
+### Features
+
+* update federated clients to work more like local clients ([7d05a1a](https://github.com/wu/keyop-messenger/commit/7d05a1a0319a42ca6de3882c7ddaee6634f82223))
+
 ## [0.10.1](https://github.com/wu/keyop-messenger/compare/v0.10.0...v0.10.1) (2026-04-13)
 
 ### Bug Fixes
