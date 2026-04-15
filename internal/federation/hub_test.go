@@ -271,52 +271,35 @@ func TestBatching(t *testing.T) {
 	assert.Less(t, frames, 200, "messages should be batched")
 }
 
-func TestReplayFrom(t *testing.T) {
-	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "orders")
-	require.NoError(t, os.MkdirAll(channelDir, 0o755))
-
-	envs := make([]envelope.Envelope, 5)
-	for i := range envs {
-		env, err := envelope.NewEnvelope("orders", "hub", "t", map[string]any{"i": i})
-		require.NoError(t, err)
-		envs[i] = env
-	}
-	segPath := filepath.Join(channelDir, "00000000000000000000.jsonl")
-	f, err := os.Create(segPath)
-	require.NoError(t, err)
-	for _, env := range envs {
-		data, err := envelope.Marshal(env)
-		require.NoError(t, err)
-		_, err = fmt.Fprintf(f, "%s\n", data)
-		require.NoError(t, err)
-	}
-	_ = f.Close()
-
+// TestNotifyChannel_NoopAfterDisconnect verifies that NotifyChannel does not
+// panic after a peer disconnects and its readers are deregistered from the
+// notify registry.
+func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
 	auditL := &fakeAuditLog{}
-	dd, _ := dedup.NewLRUDedup(1000)
-	log := &testutil.FakeLogger{}
-	hub := federation.NewHub("hub", federation.HubConfig{}, nil,
-		func(*envelope.Envelope) error { return nil }, dd, auditL, log, 100, 65536, dir)
-
-	// Replay from envs[1] → should get envs[2..4].
-	ch := hub.ReplayFrom(envs[1].ID, []string{"orders"})
-	var got []string
-	for env := range ch {
-		got = append(got, env.ID)
+	cw := &countingWriter{}
+	cfg := federation.HubConfig{
+		AllowedPeers: []federation.AllowedPeer{{
+			Name:      "notify-test",
+			Subscribe: []string{"orders"},
+		}},
 	}
-	require.Len(t, got, 3)
-	assert.Equal(t, envs[2].ID, got[0])
-	assert.Equal(t, envs[4].ID, got[2])
+	hub := newHub(t, cfg, cw, auditL)
 
-	// Unknown lastID → EventReplayGap + replay from beginning.
-	ch2 := hub.ReplayFrom("no-such-id", []string{"orders"})
-	var got2 []string
-	for env := range ch2 {
-		got2 = append(got2, env.ID)
-	}
-	assert.Len(t, got2, 5)
-	assert.True(t, auditL.has(audit.EventReplayGap))
+	srv, cli := newWSPair(t)
+	hub.ServeTestConn(srv, nil)
+	clientHandshake(t, cli, "notify-test")
+	time.Sleep(50 * time.Millisecond)
+
+	_ = cli.Close()
+	_ = srv.Close()
+
+	require.Eventually(t, func() bool {
+		return auditL.has(audit.EventPeerDisconnected)
+	}, 2*time.Second, 20*time.Millisecond)
+
+	// NotifyChannel must not panic when no readers are registered.
+	assert.NotPanics(t, func() { hub.NotifyChannel("orders") })
+	assert.NotPanics(t, func() { hub.NotifyChannel("unknown-channel") })
 }
 
 func TestReconnectReplay(t *testing.T) {
@@ -457,19 +440,9 @@ func TestChannelSubscribersCleanupOnDisconnect(t *testing.T) {
 		return auditL.has(audit.EventPeerDisconnected)
 	}, 2*time.Second, 20*time.Millisecond)
 
-	// After cleanup, verify the hub handles EnqueueToAll without panic or sending to dead peers.
-	// This ensures the reverse index was properly cleaned up.
-	env1, _ := envelope.NewEnvelope("ch-a", "sender", "t", nil)
-	env2, _ := envelope.NewEnvelope("ch-b", "sender", "t", nil)
-
-	// These should be no-ops (no peers to send to) and not crash.
-	hub.EnqueueToAll(&env1)
-	hub.EnqueueToAll(&env2)
-
-	time.Sleep(100 * time.Millisecond)
-
-	// No panic occurred and cleanup was successful.
-	assert.True(t, true, "cleanup completed without panic")
+	// After cleanup, NotifyChannel must not panic (notify registry was cleaned up).
+	assert.NotPanics(t, func() { hub.NotifyChannel("ch-a") })
+	assert.NotPanics(t, func() { hub.NotifyChannel("ch-b") })
 }
 
 func TestChannelSubscribersEmptyChannelDeletion(t *testing.T) {
@@ -498,13 +471,8 @@ func TestChannelSubscribersEmptyChannelDeletion(t *testing.T) {
 		return auditL.has(audit.EventPeerDisconnected)
 	}, 2*time.Second, 20*time.Millisecond)
 
-	// Verify the hub can handle EnqueueToAll for the now-empty channel without leaking memory.
-	// This would fail if empty channel entries weren't being deleted from the reverse index.
-	env, _ := envelope.NewEnvelope("exclusive-ch", "sender", "t", nil)
-	hub.EnqueueToAll(&env)
-
-	time.Sleep(100 * time.Millisecond)
-	assert.True(t, true, "empty channel handling succeeded")
+	// NotifyChannel must not panic when the channel's reader list is empty.
+	assert.NotPanics(t, func() { hub.NotifyChannel("exclusive-ch") })
 }
 
 func TestChannelSubscribersStressConnectDisconnect(t *testing.T) {
@@ -543,19 +511,15 @@ func TestChannelSubscribersStressConnectDisconnect(t *testing.T) {
 
 		time.Sleep(50 * time.Millisecond) // Let cleanup complete
 
-		// Try to enqueue to both channels to verify no panics and proper index cleanup.
-		env1, _ := envelope.NewEnvelope("stress-ch-a", "sender", "t", nil)
-		env2, _ := envelope.NewEnvelope("stress-ch-b", "sender", "t", nil)
-		hub.EnqueueToAll(&env1)
-		hub.EnqueueToAll(&env2)
+		// NotifyChannel must not panic after all peers disconnect.
+		hub.NotifyChannel("stress-ch-a")
+		hub.NotifyChannel("stress-ch-b")
 	}
 
-	// Final enqueue to verify hub is still functional.
-	env1, _ := envelope.NewEnvelope("stress-ch-a", "sender", "t", nil)
-	env2, _ := envelope.NewEnvelope("stress-ch-b", "sender", "t", nil)
-	hub.EnqueueToAll(&env1)
-	hub.EnqueueToAll(&env2)
+	// Final NotifyChannel to verify hub is still functional.
+	hub.NotifyChannel("stress-ch-a")
+	hub.NotifyChannel("stress-ch-b")
 
-	// Test completed without panic; reverse index survived the stress.
+	// Test completed without panic; notify registry survived the stress.
 	assert.True(t, true, "stress test completed without panic or memory issues")
 }

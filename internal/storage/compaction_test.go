@@ -224,3 +224,69 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	require.GreaterOrEqual(t, len(segsAfter), 1)
 	assert.Greater(t, segsAfter[len(segsAfter)-1].size, int64(0))
 }
+
+// TestCompactor_FedOffsetConstrainsCompaction verifies that a fed-*.offset file
+// in the offset directory constrains compaction even when no local subscriber
+// has been registered. This ensures federation peers block segment deletion
+// until their offset advances past the segment boundary.
+func TestCompactor_FedOffsetConstrainsCompaction(t *testing.T) {
+	c, channelDir, offsetDir := newTestCompactor(t)
+
+	// Write two sealed segments plus one active segment.
+	seg0Size := writeSegment(t, channelDir, 0, 10)
+	seg1Size := writeSegment(t, channelDir, seg0Size, 10)
+	_ = writeSegment(t, channelDir, seg0Size+seg1Size, 5) // active
+
+	// Register a local subscriber whose offset is at the end of both sealed segments.
+	localOffset := seg0Size + seg1Size
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "local.offset"), localOffset))
+	c.RegisterSubscriber("local")
+
+	// Write a fed-*.offset file whose offset is still within segment 0.
+	// This should prevent both sealed segments from being deleted.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), seg0Size/2))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 3, "no segment should be deleted while fed peer offset is in segment 0")
+
+	// Advance the fed offset past segment 0 but still within segment 1.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), seg0Size+seg1Size/2))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err = listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 2, "segment 0 should be deleted once fed offset advances past it")
+
+	// Advance the fed offset to the end of both sealed segments.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), seg0Size+seg1Size))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err = listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 1, "both sealed segments should be deleted when fed offset advances to active")
+}
+
+// TestCompactor_FedOffsetWithNoLocalSubscribers verifies that a fed-*.offset
+// file alone does not trigger compaction (at least one local subscriber must
+// be registered for MaybeCompact to proceed).
+func TestCompactor_FedOffsetWithNoLocalSubscribers(t *testing.T) {
+	c, channelDir, offsetDir := newTestCompactor(t)
+
+	seg0Size := writeSegment(t, channelDir, 0, 5)
+	_ = writeSegment(t, channelDir, seg0Size, 5) // active
+
+	// Only a fed offset file — no registered subscribers.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), seg0Size))
+
+	// MaybeCompact should skip deletion because no local subscribers are registered.
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 2, "no compaction should occur without registered local subscribers")
+}

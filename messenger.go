@@ -218,6 +218,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 			cfg.Federation.MaxBatchBytes,
 			cfg.Storage.DataDir,
 		)
+		m.hub.SetFedClientOffsetTTL(cfg.Hub.FedClientOffsetTTL.Duration)
 		if err := m.hub.Listen(cfg.Hub.ListenAddr); err != nil {
 			return nil, fmt.Errorf("start hub listener: %w", err)
 		}
@@ -334,9 +335,9 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 		return fmt.Errorf("publish %q: write: %w", channel, err)
 	}
 
-	// Enqueue to hub peer senders (hub's forward policy decides which peers).
+	// Notify hub channel readers that new data is available for this channel.
 	if m.hub != nil {
-		m.hub.EnqueueToAll(&env)
+		m.hub.NotifyChannel(env.Channel)
 	}
 	// Enqueue to client senders (client's publish policy decides acceptance).
 	for _, c := range m.clients {
@@ -603,10 +604,9 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 		return err
 	}
 
-	// Forward to all connected peers. All peers have senders created at connection
-	// time (even those without subscriptions), so messages can be forwarded to them.
+	// Notify hub channel readers that new data is available for this channel.
 	if m.hub != nil {
-		m.hub.EnqueueToAll(env)
+		m.hub.NotifyChannel(env.Channel)
 	}
 
 	return nil

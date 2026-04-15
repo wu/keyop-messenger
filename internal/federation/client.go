@@ -82,10 +82,10 @@ func NewClient(
 // Returns the PeerSender the caller can use to enqueue outbound messages.
 // On disconnect, Done() fires; call Dial again or use ConnectWithReconnect.
 func (c *Client) Dial(hubAddr string) (*PeerSender, error) {
-	return c.dial(hubAddr, "")
+	return c.dial(hubAddr)
 }
 
-func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
+func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	dialer := websocket.Dialer{TLSClientConfig: c.tlsCfg}
 	url := "wss://" + hubAddr
 	if c.tlsCfg == nil {
@@ -96,12 +96,13 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 		return nil, fmt.Errorf("federation: client dial %s: %w", hubAddr, err)
 	}
 
-	// Send handshake first.
+	// Send handshake. LastID is omitted — the hub tracks delivery progress
+	// server-side via per-channel offset files and no longer relies on the
+	// client to report its position.
 	if err := SendHandshake(conn, HandshakeMsg{
 		InstanceName: c.instanceName,
 		Role:         "client",
 		Version:      wireVersion,
-		LastID:       lastID,
 		Subscribe:    c.subscribeChannels,
 	}); err != nil {
 		_ = conn.Close()
@@ -116,7 +117,7 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 	// When the hub pushes messages back to this client both a PeerSender and a
 	// PeerReceiver share the same conn. Route acks through an internal channel
 	// so the PeerReceiver owns all reads and avoids a concurrent-read race.
-	connWriteMu := &sync.Mutex{} // shared mutex for protecting concurrent writes to conn
+	connWriteMu := &sync.Mutex{}
 	var sender *PeerSender
 	if c.localWriter != nil {
 		ackCh := make(chan AckMsg, 4)
@@ -139,7 +140,7 @@ func (c *Client) dial(hubAddr, lastID string) (*PeerSender, error) {
 // It returns after the first successful connection. Subsequent reconnects happen
 // in the background. Use Sender() to get the current PeerSender.
 func (c *Client) ConnectWithReconnect(hubAddr string) error {
-	sender, err := c.dial(hubAddr, "")
+	sender, err := c.dial(hubAddr)
 	if err != nil {
 		return err
 	}
@@ -155,9 +156,8 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			case <-sender.Done():
 			}
 
-			// Gather unacked for replay.
+			// Gather unacked outbound messages for replay to hub.
 			unacked := sender.Unacked()
-			lastID := sender.LastAckedID()
 
 			c.log.Warn("federation: client disconnected, reconnecting",
 				"hub", hubAddr, "unacked", len(unacked))
@@ -177,13 +177,13 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 
 			var newSender *PeerSender
 			var dialErr error
-			for attempts := 0; ; attempts++ {
+			for {
 				select {
 				case <-c.stop:
 					return
 				default:
 				}
-				newSender, dialErr = c.dial(hubAddr, lastID)
+				newSender, dialErr = c.dial(hubAddr)
 				if dialErr == nil {
 					break
 				}
@@ -202,7 +202,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				}
 			}
 
-			// Replay unacked messages on new sender.
+			// Replay unacked outbound messages on new sender.
 			for _, env := range unacked {
 				newSender.Enqueue(env)
 			}
@@ -223,11 +223,9 @@ func (c *Client) Sender() *PeerSender {
 
 // AllowPublish reports whether the given channel is allowed to be published to the hub.
 func (c *Client) AllowPublish(channel string) bool {
-	// If no publish channels are configured, allow all
 	if len(c.publishChannels) == 0 {
 		return true
 	}
-	// Check if channel is in the allowed list
 	for _, ch := range c.publishChannels {
 		if ch == channel {
 			return true

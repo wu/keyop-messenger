@@ -6,9 +6,23 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// Duration is a time.Duration that unmarshals from a YAML string (e.g. "168h", "30m").
+type Duration struct{ time.Duration }
+
+// UnmarshalYAML implements yaml.Unmarshaler so Duration fields accept Go duration strings.
+func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
+	dur, err := time.ParseDuration(value.Value)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", value.Value, err)
+	}
+	d.Duration = dur
+	return nil
+}
 
 // SyncPolicy controls when channel file writes are flushed to stable storage.
 type SyncPolicy string
@@ -94,6 +108,12 @@ type HubConfig struct {
 	// AllowedPeers is the explicit list of peer instance names permitted to connect.
 	// Connections from instances not in this list are rejected after the mTLS handshake.
 	AllowedPeers []AllowedPeer `yaml:"allowed_peers"`
+
+	// FedClientOffsetTTL is how long a disconnected federation client's offset files
+	// are retained before the hub deletes them. Offset files block compaction, so
+	// stale files from clients that never reconnect must be cleaned up.
+	// Default: 168h (1 week). Set to 0 to disable the TTL sweep entirely.
+	FedClientOffsetTTL Duration `yaml:"fed_client_offset_ttl"`
 }
 
 // ClientHubRef is a hub address a client instance dials.
@@ -273,6 +293,10 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Audit.MaxFiles == 0 {
 		c.Audit.MaxFiles = 10
+	}
+
+	if c.Hub.FedClientOffsetTTL.Duration == 0 {
+		c.Hub.FedClientOffsetTTL = Duration{168 * time.Hour}
 	}
 }
 

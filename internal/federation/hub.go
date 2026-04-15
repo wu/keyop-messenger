@@ -1,13 +1,13 @@
 package federation
 
 import (
-	"bufio"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,33 +29,45 @@ const wireVersion = "1"
 
 // peerEntry tracks an active peer connection on the hub.
 type peerEntry struct {
-	name                  string
-	sender                *PeerSender   // may be nil if this peer only sends to us
-	receiver              *PeerReceiver // may be nil if we only send to this peer
-	policy                *AtomicPolicy
-	conn                  *websocket.Conn
-	connWriteMu           *sync.Mutex // protects concurrent writes to conn (from sender and receiver)
-	effectiveSubscription []string    // channels to forward to this peer (intersection of request and allowlist)
+	name        string
+	receiver    *PeerReceiver
+	coordinator *clientCoordinator // non-nil when peer has subscriptions
+	policy      *AtomicPolicy
+	conn        *websocket.Conn
+	connWriteMu *sync.Mutex
 }
 
-// Hub accepts incoming WebSocket connections and enforces the allowlist and receive policy.
+// Hub accepts incoming WebSocket connections and enforces the allowlist and
+// receive policy. Hub-to-peer delivery uses a file-reader pull model: one
+// channelReader goroutine per (peer, channel) reads segment files and delivers
+// batches via a clientCoordinator, writing per-peer byte offsets to
+//
+//	{dataDir}/subscribers/{channel}/fed-{peerName}.offset
+//
+// The compactor automatically includes federation peers in compaction boundary
+// calculations because it reads all files in subscribers/{channel}/.
 type Hub struct {
-	instanceName  string
-	tlsCfg        *tls.Config
-	localWriter   func(*envelope.Envelope) error
-	dedup         Deduplicator
-	auditL        audit.AuditLogger
-	log           logger
-	sendBufSize   int
-	maxBatchBytes int
-	dataDir       string
+	instanceName       string
+	tlsCfg             *tls.Config
+	localWriter        func(*envelope.Envelope) error
+	dedup              Deduplicator
+	auditL             audit.AuditLogger
+	log                logger
+	sendBufSize        int
+	maxBatchBytes      int
+	dataDir            string
+	fedClientOffsetTTL time.Duration
 
-	mu                 sync.RWMutex
-	cfg                HubConfig
-	peers              map[string]*peerEntry   // keyed by instance name
-	channelSubscribers map[string][]*peerEntry // channel -> list of subscribed peers (reverse index)
-	listener           net.Listener
-	httpSrv            *http.Server
+	mu       sync.RWMutex
+	cfg      HubConfig
+	peers    map[string]*peerEntry
+	listener net.Listener
+	httpSrv  *http.Server
+
+	// notifyMu protects notifyRegistry; use RLock for reads (NotifyChannel),
+	// Lock for writes (serveConn register/deregister).
+	notifyMu       sync.RWMutex
+	notifyRegistry map[string][]*channelReader // channel → readers for that channel
 
 	stop chan struct{}
 	wg   sync.WaitGroup
@@ -74,19 +86,19 @@ func NewHub(
 	dataDir string,
 ) *Hub {
 	return &Hub{
-		instanceName:       instanceName,
-		cfg:                cfg,
-		tlsCfg:             tlsCfg,
-		localWriter:        localWriter,
-		dedup:              dedup,
-		auditL:             auditL,
-		log:                log,
-		sendBufSize:        sendBufSize,
-		maxBatchBytes:      maxBatchBytes,
-		dataDir:            dataDir,
-		peers:              make(map[string]*peerEntry),
-		channelSubscribers: make(map[string][]*peerEntry),
-		stop:               make(chan struct{}),
+		instanceName:   instanceName,
+		cfg:            cfg,
+		tlsCfg:         tlsCfg,
+		localWriter:    localWriter,
+		dedup:          dedup,
+		auditL:         auditL,
+		log:            log,
+		sendBufSize:    sendBufSize,
+		maxBatchBytes:  maxBatchBytes,
+		dataDir:        dataDir,
+		peers:          make(map[string]*peerEntry),
+		notifyRegistry: make(map[string][]*channelReader),
+		stop:           make(chan struct{}),
 	}
 }
 
@@ -118,12 +130,27 @@ func (h *Hub) Listen(addr string) error {
 	h.httpSrv = srv
 	h.mu.Unlock()
 
+	if h.fedClientOffsetTTL > 0 && h.dataDir != "" {
+		h.wg.Add(1)
+		go func() {
+			defer h.wg.Done()
+			h.runTTLSweep(h.fedClientOffsetTTL)
+		}()
+	}
+
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
 		_ = srv.Serve(ln)
 	}()
 	return nil
+}
+
+// SetFedClientOffsetTTL configures the TTL for disconnected federation client
+// offset files. Must be called before Listen. A zero or negative value disables
+// the sweep.
+func (h *Hub) SetFedClientOffsetTTL(ttl time.Duration) {
+	h.fedClientOffsetTTL = ttl
 }
 
 // ServeTestConn is the same as the internal serveConn; exported so tests can
@@ -142,126 +169,14 @@ func (h *Hub) Addr() string {
 	return h.listener.Addr().String()
 }
 
-// EnqueueToAll enqueues env to every peer sender that is subscribed to the channel.
-// Only peers that explicitly subscribed to this channel will receive the message.
-// All peers have senders created at connection time to support forwarding.
-func (h *Hub) EnqueueToAll(env *envelope.Envelope) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	// Use reverse index for O(k) lookup where k = number of subscribers to this channel.
-	for _, entry := range h.channelSubscribers[env.Channel] {
-		if entry.sender != nil {
-			entry.sender.Enqueue(env)
-		}
+// NotifyChannel wakes all channelReader goroutines registered for channel.
+// Called by messenger.go after every write to that channel.
+func (h *Hub) NotifyChannel(channel string) {
+	h.notifyMu.RLock()
+	defer h.notifyMu.RUnlock()
+	for _, r := range h.notifyRegistry[channel] {
+		r.notify()
 	}
-}
-
-// ReplayFrom scans channel files under dataDir/channels for envelopes on any
-// of the listed channels, starting from (but not including) the record whose ID
-// equals lastID. If lastID is empty or not found, replay starts from the
-// earliest available record and logs EventReplayGap.
-func (h *Hub) ReplayFrom(lastID string, channels []string) <-chan *envelope.Envelope {
-	out := make(chan *envelope.Envelope, 64)
-	go func() {
-		defer close(out)
-		channelSet := make(map[string]bool, len(channels))
-		for _, ch := range channels {
-			channelSet[ch] = true
-		}
-
-		// Collect all (channel, segment) pairs in offset order.
-		type seg struct {
-			channelDir string
-			path       string
-		}
-		var segs []seg
-		for _, ch := range channels {
-			dir := filepath.Join(h.dataDir, "channels", ch)
-			entries, err := os.ReadDir(dir)
-			if err != nil {
-				continue
-			}
-			for _, e := range entries {
-				if e.IsDir() {
-					continue
-				}
-				segs = append(segs, seg{
-					channelDir: dir,
-					path:       filepath.Join(dir, e.Name()),
-				})
-			}
-		}
-
-		// Scan all segments to find lastID, then emit from there.
-		found := lastID == ""
-		if !found {
-			// First pass: locate lastID.
-		outer:
-			for _, s := range segs {
-				f, err := os.Open(s.path)
-				if err != nil {
-					continue
-				}
-				sc := bufio.NewScanner(f)
-				for sc.Scan() {
-					env, err := envelope.Unmarshal(sc.Bytes())
-					if err != nil {
-						continue
-					}
-					if env.ID == lastID {
-						found = true
-						_ = f.Close()
-						break outer
-					}
-				}
-				_ = f.Close()
-			}
-		}
-
-		if !found {
-			h.log.Warn("federation: replay gap: lastID not in local files",
-				"last_id", lastID)
-			_ = h.auditL.Log(audit.Event{
-				Event:     audit.EventReplayGap,
-				MessageID: lastID,
-			})
-		}
-
-		// Second pass: emit all envelopes after lastID (or all if gap/empty).
-		pastLastID := lastID == "" || !found
-
-		for _, s := range segs {
-			f, err := os.Open(s.path)
-			if err != nil {
-				continue
-			}
-			sc := bufio.NewScanner(f)
-			for sc.Scan() {
-				env, err := envelope.Unmarshal(sc.Bytes())
-				if err != nil {
-					continue
-				}
-				if !pastLastID {
-					if env.ID == lastID {
-						pastLastID = true
-					}
-					continue
-				}
-				if !channelSet[env.Channel] {
-					continue
-				}
-				envCopy := env
-				select {
-				case out <- &envCopy:
-				case <-h.stop:
-					_ = f.Close()
-					return
-				}
-			}
-			_ = f.Close()
-		}
-	}()
-	return out
 }
 
 // Close stops the listener and all active peer connections.
@@ -281,7 +196,7 @@ func (h *Hub) Close() error {
 
 // serveConn handles one incoming WebSocket connection: receives the peer
 // handshake, checks the allowlist, sends the hub handshake if allowed, then
-// starts the receiver (and optionally sender) goroutines.
+// starts the receiver and (if the peer has subscriptions) a clientCoordinator.
 func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	// Receive peer handshake first so we know its identity.
 	hs, err := ReceiveHandshake(conn)
@@ -302,9 +217,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	cfg := h.cfg
 	h.mu.RUnlock()
 
-	allowed := cfg.IsPeerAllowed(peerName)
-
-	if !allowed {
+	if !cfg.IsPeerAllowed(peerName) {
 		_ = conn.WriteMessage(websocket.CloseMessage,
 			websocket.FormatCloseMessage(4403, "not in allowlist"))
 		_ = conn.Close()
@@ -324,8 +237,8 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		return
 	}
 
-	// Compute the effective channels this hub will send to the peer:
-	// intersection of the peer's Subscribe request and the hub's allowlist.
+	// Compute effective channels: intersection of peer's Subscribe request and
+	// the hub's per-peer allowlist.
 	subChannels := effectiveSubscribeChannels(hs.Subscribe, peerName, cfg)
 	pubChannels := publishChannelsFor(peerName, cfg)
 	policy := NewAtomicPolicy(ForwardPolicy{
@@ -333,42 +246,50 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		Receive: pubChannels,
 	})
 
-	// Start receiver. Also start a sender for all peers (even those without subscriptions)
-	// so that messages from other peers can be forwarded to them. When both share a conn,
-	// route acks via an internal channel so the PeerReceiver owns all reads and avoids
-	// a concurrent-read race.
-	needSender := true
+	connWriteMu := &sync.Mutex{}
 
+	// Set up inbound receiver. When the peer also subscribes, the receiver owns
+	// all reads and routes text-frame acks to the coordinator via ackCh.
 	var receiver *PeerReceiver
-	var sender *PeerSender
-	connWriteMu := &sync.Mutex{} // shared mutex for protecting concurrent writes to conn
+	var coordinator *clientCoordinator
 
-	if needSender {
+	if len(subChannels) > 0 && h.dataDir != "" {
 		ackCh := make(chan AckMsg, 4)
 		receiver = newPeerReceiverWithAck(conn, connWriteMu, policy, h.dedup, h.localWriter,
 			h.auditL, h.log, peerName, h.maxBatchBytes, ackCh)
-		sender = newPeerSenderWithAck(conn, connWriteMu, h.sendBufSize, h.maxBatchBytes, h.log, ackCh)
+
+		readers, err := h.buildChannelReaders(peerName, subChannels, ackCh, connWriteMu, conn)
+		if err != nil {
+			h.log.Error("federation: hub build channel readers", "peer", peerName, "err", err)
+			_ = conn.Close()
+			return
+		}
+		coordinator = readers
+		coordinator.start()
+
+		// Register channel readers into the notify registry.
+		h.notifyMu.Lock()
+		for _, r := range coordinator.readers {
+			h.notifyRegistry[r.channel] = append(h.notifyRegistry[r.channel], r)
+		}
+		h.notifyMu.Unlock()
 	} else {
+		// No subscriptions: only receive inbound messages from the peer.
 		receiver = NewPeerReceiver(conn, connWriteMu, policy, h.dedup, h.localWriter,
 			h.auditL, h.log, peerName, h.maxBatchBytes)
 	}
 
 	entry := &peerEntry{
-		name:                  peerName,
-		sender:                sender,
-		receiver:              receiver,
-		policy:                policy,
-		conn:                  conn,
-		connWriteMu:           connWriteMu,
-		effectiveSubscription: subChannels,
+		name:        peerName,
+		receiver:    receiver,
+		coordinator: coordinator,
+		policy:      policy,
+		conn:        conn,
+		connWriteMu: connWriteMu,
 	}
 
 	h.mu.Lock()
 	h.peers[peerName] = entry
-	// Also add to reverse index by channel for fast EnqueueToAll lookups.
-	for _, ch := range subChannels {
-		h.channelSubscribers[ch] = append(h.channelSubscribers[ch], entry)
-	}
 	h.mu.Unlock()
 
 	_ = h.auditL.Log(audit.Event{Event: audit.EventClientConnected, Peer: peerName})
@@ -378,43 +299,140 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		h.log.Info("federation: hub accepted connection", "peer", peerName)
 	}
 
-	// Handle replay for reconnecting non-ephemeral peers. Ephemeral clients
-	// never receive replayed messages regardless of whether LastID is set.
-	if hs.LastID != "" && len(subChannels) > 0 && !hs.Ephemeral {
-		go func() {
-			for env := range h.ReplayFrom(hs.LastID, subChannels) {
-				if sender != nil {
-					sender.Enqueue(env)
-				}
-			}
-		}()
-	}
-
 	// Wait for receiver to finish, then clean up.
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
 		<-receiver.Done()
-		h.mu.Lock()
-		delete(h.peers, peerName)
-		// Remove from reverse index by channel.
-		for _, ch := range subChannels {
-			peers := h.channelSubscribers[ch]
-			for i, p := range peers {
-				if p == entry {
-					h.channelSubscribers[ch] = append(peers[:i], peers[i+1:]...)
-					break
+
+		// Deregister channel readers from the notify registry.
+		if coordinator != nil {
+			h.notifyMu.Lock()
+			for _, r := range coordinator.readers {
+				readers := h.notifyRegistry[r.channel]
+				for i, rr := range readers {
+					if rr == r {
+						h.notifyRegistry[r.channel] = append(readers[:i], readers[i+1:]...)
+						break
+					}
+				}
+				if len(h.notifyRegistry[r.channel]) == 0 {
+					delete(h.notifyRegistry, r.channel)
 				}
 			}
-			// Clean up empty channel entries.
-			if len(h.channelSubscribers[ch]) == 0 {
-				delete(h.channelSubscribers, ch)
-			}
+			h.notifyMu.Unlock()
+			coordinator.close()
 		}
+
+		h.mu.Lock()
+		delete(h.peers, peerName)
 		h.mu.Unlock()
-		if sender != nil {
-			sender.Close()
-		}
+
 		_ = h.auditL.Log(audit.Event{Event: audit.EventPeerDisconnected, Peer: peerName})
 	}()
+}
+
+// buildChannelReaders creates a clientCoordinator with one channelReader per
+// subscribed channel. The coordinator's requestCh is wired into all readers.
+func (h *Hub) buildChannelReaders(
+	peerName string,
+	subChannels []string,
+	ackCh <-chan AckMsg,
+	connWriteMu *sync.Mutex,
+	conn *websocket.Conn,
+) (*clientCoordinator, error) {
+	var readers []*channelReader
+	for _, ch := range subChannels {
+		channelDir := filepath.Join(h.dataDir, "channels", ch)
+		offsetDir := filepath.Join(h.dataDir, "subscribers", ch)
+
+		// Placeholder requestCh; newClientCoordinator will replace it.
+		placeholder := make(chan sendReq, 1)
+		r, err := newChannelReader(peerName, ch, channelDir, offsetDir,
+			h.maxBatchBytes, placeholder, h.log)
+		if err != nil {
+			return nil, fmt.Errorf("channel %q: %w", ch, err)
+		}
+		readers = append(readers, r)
+	}
+
+	cc := newClientCoordinator(conn, connWriteMu, ackCh, h.maxBatchBytes, h.log, readers)
+	return cc, nil
+}
+
+// runTTLSweep periodically deletes fed-*.offset files whose mtime is older
+// than ttl. This prevents stale files from indefinitely blocking compaction
+// for peers that disconnect and never reconnect.
+//
+// The sweep runs hourly (or less if ttl < 1h). It logs each deletion at Info.
+// Exits when h.stop is closed.
+func (h *Hub) runTTLSweep(ttl time.Duration) {
+	interval := time.Hour
+	if ttl < interval {
+		interval = ttl / 2
+		if interval < time.Minute {
+			interval = time.Minute
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+			h.sweepStaleOffsets(ttl)
+		}
+	}
+}
+
+// sweepStaleOffsets scans all subscribers/{channel}/fed-*.offset files and
+// deletes those whose mtime is older than ttl.
+func (h *Hub) sweepStaleOffsets(ttl time.Duration) {
+	if h.dataDir == "" {
+		return
+	}
+	subsDir := filepath.Join(h.dataDir, "subscribers")
+	entries, err := os.ReadDir(subsDir)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			h.log.Error("federation: TTL sweep read subscribers dir", "err", err)
+		}
+		return
+	}
+
+	cutoff := time.Now().Add(-ttl)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		channelDir := filepath.Join(subsDir, e.Name())
+		files, err := os.ReadDir(channelDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if f.IsDir() || !strings.HasPrefix(f.Name(), "fed-") || !strings.HasSuffix(f.Name(), ".offset") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().Before(cutoff) {
+				path := filepath.Join(channelDir, f.Name())
+				peerName := strings.TrimSuffix(strings.TrimPrefix(f.Name(), "fed-"), ".offset")
+				age := time.Since(info.ModTime()).Round(time.Minute)
+				if rmErr := os.Remove(path); rmErr == nil {
+					h.log.Info("federation: TTL sweep removed stale offset",
+						"peer", peerName, "channel", e.Name(), "age", age)
+				} else {
+					h.log.Error("federation: TTL sweep remove failed",
+						"path", path, "err", rmErr)
+				}
+			}
+		}
+	}
 }

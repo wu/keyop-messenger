@@ -254,7 +254,6 @@ After the TLS handshake, the application-level handshake exchanges a JSON text f
   "instance_name": "billing-host",
   "role":          "client",
   "version":       "1",
-  "last_id":       "01952c3e-...",
   "subscribe":     ["alerts", "metrics"]
 }
 ```
@@ -269,7 +268,9 @@ The hub responds with its own handshake (without a `subscribe` field):
 }
 ```
 
-The `role` field is informational. Authorization (see §6.4) determines whether the connection is accepted regardless of the declared role. `last_id` is omitted on first connection; `subscribe` is omitted when the client only publishes and does not want to receive any channels.
+The `role` field is informational. Authorization (see §6.4) determines whether the connection is accepted regardless of the declared role. `subscribe` is omitted when the client only publishes and does not want to receive any channels.
+
+The `last_id` field is present in the `HandshakeMsg` struct for wire compatibility with older peers but is not sent by clients and is ignored by hubs. The hub tracks delivery progress server-side via per-peer byte offset files (see §6.8).
 
 ### 6.3 Message Wire Format
 
@@ -314,7 +315,7 @@ When a client connects, the hub computes the effective subscribe channel set as:
 effective_subscribe = client.subscribe ∩ hub_subscribe_allowlist_for(client)
 ```
 
-The hub creates an outbound sender for the client only when the effective subscribe set is non-empty. A client that sends no `subscribe` list (or an empty one) will not receive any messages from the hub.
+The hub creates a `clientCoordinator` with one `channelReader` per subscribed channel only when the effective subscribe set is non-empty. A client that sends no `subscribe` list (or an empty one) will not receive any messages from the hub.
 
 There are no wildcards; all channel names are exact strings.
 
@@ -378,14 +379,29 @@ Practical scenarios the dedup handles today:
 - A publisher's own message arrives back via a federated receive path (self-loop prevention)
 - Reconnect replay delivering messages already written in a previous session
 
-### 6.8 Reconnection and Replay
+### 6.8 Hub-Side File-Reader Delivery and Reconnection
 
-When a peer hub connection is lost:
+The hub delivers messages to subscribed peers using a **file-reader pull model**, mirroring the local subscriber delivery path:
 
-1. The hub begins buffering outbound messages for that peer (up to a configurable limit, default 10,000 messages). Messages beyond the buffer limit are dropped with a warning logged.
-2. Reconnection is attempted with exponential backoff (base 500ms, max 60s, jitter ±20%).
-3. On reconnect, the reconnecting side sends its last-acknowledged message ID. The peer replays any messages in its local `.jsonl` file with an ID after that point that match the agreed forward channels.
-4. If the last-acknowledged message ID is no longer in the peer's file (compacted away), an error is logged and delivery continues from the earliest available record. This is a gap — messages compacted before the reconnecting peer could receive them are permanently missed. The gap is recorded in the audit log.
+- For each `(peer, subscribed channel)` pair, the hub runs a `channelReader` goroutine.
+- When a message is written to a channel (via `Publish` or inbound federation), the hub calls `NotifyChannel(channel)`, which wakes all `channelReader` goroutines registered for that channel.
+- Each `channelReader` reads from the segment files starting at its current byte offset, accumulates envelopes up to the configured batch size, and delivers them to the peer via the `clientCoordinator`.
+- The `clientCoordinator` serialises sends across all channel readers for a single peer: one batch is in-flight at a time; the next batch is not sent until the peer acknowledges the current one.
+- After the peer acks the batch, the reader persists the new byte offset atomically to:
+  ```
+  {dataDir}/subscribers/{channel}/fed-{peerName}.offset
+  ```
+  This is the same format as local subscriber offset files (`{id}.offset`).
+
+**Offset files and compaction:** Because federation offset files live under `subscribers/{channel}/`, the compactor automatically includes them in its minimum-offset boundary calculation. The hub cannot compact a segment until all connected peers (and all federation clients whose offset files still exist) have consumed past it.
+
+**Reconnect:** When a peer reconnects, its `channelReader` goroutines resume from the stored byte offset. No `last_id` field is sent by the client; the hub is the authoritative source of delivery state. New messages published during the disconnection are delivered on the next `notify()` call after the readers start.
+
+**New subscriber starting position:** When a peer connects for the first time (no offset file exists), the reader starts at the current end of the channel — the peer receives only messages published after it first connects. This avoids replaying unbounded history.
+
+**Offset file TTL:** Offset files for peers that disconnect and never reconnect would otherwise block compaction indefinitely. The hub runs a background TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week) that deletes `fed-*.offset` files whose mtime is older than the TTL. Peers that are actively connected update their offset files on every acked batch, so their files are always recently modified.
+
+When a peer connection is lost, reconnection is attempted with exponential backoff (base 500ms, max 60s, jitter ±20%).
 
 ---
 
@@ -637,7 +653,7 @@ The ephemeral client sets `"ephemeral": true` in its handshake frame:
 
 The `ephemeral` field is `omitempty`; it is absent from non-ephemeral connections and from the hub's response. This ensures backward compatibility with hubs that do not yet understand the field.
 
-When the hub sees `ephemeral: true`, it skips the `ReplayFrom` step on connect — even if `last_id` is set. The hub also logs ephemeral connections at a distinct info message so operators can distinguish them from durable client connections.
+When the hub sees `ephemeral: true`, it does not create per-channel offset files for that peer — messages published before the connection are not delivered, and no offset file is written to disk. The hub logs ephemeral connections at a distinct info message so operators can distinguish them from durable client connections.
 
 ### 11.3 Publish Semantics
 

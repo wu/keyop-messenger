@@ -318,8 +318,9 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	sender.Close()
 }
 
-// TestClient_Dial_WithReplayID sends last_id in handshake.
-func TestClient_Dial_WithReplayID(t *testing.T) {
+// TestClient_Dial_NoLastID verifies the client does not send LastID in the handshake.
+// The hub now tracks delivery progress server-side via offset files.
+func TestClient_Dial_NoLastID(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
@@ -358,12 +359,10 @@ func TestClient_Dial_WithReplayID(t *testing.T) {
 	defer client.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	// Dial with internal method that accepts lastID
-	sender, err := client.dial(strings.TrimPrefix(wsURL, "ws://"), "previous-msg-id")
+	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
 	require.NoError(t, err)
 
-	// Verify last_id was sent
-	assert.Equal(t, "previous-msg-id", receivedLastID)
+	assert.Empty(t, receivedLastID, "client must not send LastID; hub tracks progress server-side")
 	time.Sleep(50 * time.Millisecond)
 	sender.Close()
 }

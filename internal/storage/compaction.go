@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -78,7 +79,40 @@ func (c *Compactor) MinOffset() (int64, error) {
 			minOffset = off
 		}
 	}
+
+	// Include federation peer offsets (fed-*.offset).
+	if fedMin, err := c.fedMinOffset(); err == nil && fedMin < minOffset {
+		minOffset = fedMin
+	}
+
 	return minOffset, nil
+}
+
+// fedMinOffset returns the minimum byte offset across all fed-*.offset files
+// in c.offsetDir. Returns (math.MaxInt64, nil) when none are present, and
+// (0, err) on a read error that prevents a safe calculation.
+func (c *Compactor) fedMinOffset() (int64, error) {
+	entries, err := os.ReadDir(c.offsetDir)
+	if os.IsNotExist(err) {
+		return math.MaxInt64, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read offset dir for fed offsets: %w", err)
+	}
+	min := int64(math.MaxInt64)
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasPrefix(e.Name(), "fed-") || !strings.HasSuffix(e.Name(), ".offset") {
+			continue
+		}
+		off, err := ReadOffset(filepath.Join(c.offsetDir, e.Name()))
+		if err != nil {
+			return 0, fmt.Errorf("read fed offset %q: %w", e.Name(), err)
+		}
+		if off < min {
+			min = off
+		}
+	}
+	return min, nil
 }
 
 // MaybeCompact deletes any sealed segment files in channelDir whose contents
@@ -121,6 +155,13 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 		if off < minOffset {
 			minOffset = off
 		}
+	}
+
+	// Also include federation peer offset files (fed-*.offset) in the minimum.
+	// These are written by channelReader goroutines and must be respected to
+	// prevent compacting data that federation peers have not yet consumed.
+	if fedMin, err := c.fedMinOffset(); err == nil && fedMin < minOffset {
+		minOffset = fedMin
 	}
 
 	// Lag warnings: compute total stream size from last segment's end.

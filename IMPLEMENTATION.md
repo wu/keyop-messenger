@@ -1,605 +1,291 @@
-# keyop-messenger — Implementation Plan
+# keyop-messenger — Federation File-Reader Delivery
 
-This document describes the phased implementation plan for the `keyop-messenger` Go library. Each phase has concrete deliverables, a test strategy, and an explicit statement of which earlier phases it depends on.
-
----
-
-## 1. Module and Package Structure
-
-### 1.1 Go Module Name
-
-```
-github.com/wu/keyop-messenger
-```
-
-### 1.2 Directory Layout
-
-```
-keyop-messenger/
-├── go.mod
-├── go.sum
-│
-├── messenger.go            # Top-level public API (Messenger type, New, Close, Publish, Subscribe)
-├── config.go               # Config struct, YAML loading, defaults, validation
-├── options.go              # Functional options for Messenger construction
-│
-├── internal/
-│   ├── envelope/
-│   │   ├── envelope.go     # Envelope struct, marshal/unmarshal, schema version constants
-│   │   └── envelope_test.go
-│   │
-│   ├── registry/
-│   │   ├── registry.go     # PayloadRegistry interface + defaultRegistry implementation
-│   │   └── registry_test.go
-│   │
-│   ├── storage/
-│   │   ├── writer.go       # Per-channel writer goroutine, sync policies, backpressure
-│   │   ├── writer_test.go
-│   │   ├── subscriber.go   # Subscriber goroutine, offset tracking, dead-letter routing
-│   │   ├── subscriber_test.go
-│   │   ├── offset.go       # Offset file read/write/fsync
-│   │   ├── offset_test.go
-│   │   ├── watcher.go      # fsnotify wrapper with polling fallback
-│   │   ├── watcher_test.go
-│   │   ├── compaction.go   # File rotation/compaction logic
-│   │   └── compaction_test.go
-│   │
-│   ├── dedup/
-│   │   ├── dedup.go        # LRU seen-ID set, thread-safe
-│   │   └── dedup_test.go
-│   │
-│   ├── audit/
-│   │   ├── audit.go        # Audit writer goroutine, rotation, event types
-│   │   └── audit_test.go
-│   │
-│   ├── tlsutil/
-│   │   ├── tlsutil.go      # TLS config builder, cert hot-reload, expiry warning
-│   │   ├── keygen.go       # P-384 key+cert generation (CA and instance)
-│   │   └── tlsutil_test.go
-│   │
-│   ├── testutil/
-│   │   └── fakes.go        # Shared fake implementations of Logger, ChannelWriter,
-│   │                       # AuditLogger, ChannelWatcher for use across test packages
-│   │
-│   └── federation/
-│       ├── handshake.go    # Application-level handshake structs and framing
-│       ├── framing.go      # Length-prefix binary frame encoding/decoding
-│       ├── hub.go          # Hub: listen, accept clients, accept peer hubs
-│       ├── hub_test.go
-│       ├── peersender.go   # Per-peer sender goroutine (queue, batch, ack, replay)
-│       ├── peerreceiver.go # Per-peer receiver goroutine (dedup, local write, policy check)
-│       ├── client.go       # Client: dial hubs, reconnect backoff
-│       ├── client_test.go
-│       ├── policy.go       # ForwardPolicy, allowlist, atomic swap
-│       └── policy_test.go
-│
-└── cmd/
-    └── keyop-messenger/
-        └── main.go         # CLI entrypoint (cobra root + keygen subcommands)
-```
-
-### 1.3 Public vs Internal
-
-Everything under `internal/` is unexported to callers of the library. The root package (`github.com/wu/keyop-messenger`) is the sole public surface. The `cmd/` subtree is a standalone binary, not part of the library API.
+This document describes the implementation plan for replacing the hub→subscriber push delivery model with a file-reader pull model, giving federation subscribers the same at-least-once delivery guarantees and compaction integration as local subscribers.
 
 ---
 
-## 2. External Dependencies
+## Background and Motivation
 
-| Dependency | Role | Rationale |
-|---|---|---|
-| `github.com/gorilla/websocket` v1.5.x | WebSocket transport | Proven, widely used; supports binary frames and custom TLS config cleanly |
-| `github.com/fsnotify/fsnotify` v1.7.x | File change notification | Standard Go file-watch library; cross-platform (inotify/kqueue/FSEvents) |
-| `github.com/google/uuid` v1.6.x | UUID v4 generation | Zero external C dependencies; correct random-based UUID generation |
-| `gopkg.in/yaml.v3` v3.0.x | Config file parsing | Supports struct tags; round-trips cleanly |
-| `encoding/json` (stdlib) | Envelope and audit serialization | Sufficient for correctness; `sync.Pool`-backed buffers handle allocation. No additional JSON library was added — the stdlib overhead is acceptable given the file-I/O-bound write path. |
-| `github.com/hashicorp/golang-lru/v2` v2.0.x | LRU seen-ID set | Typed, fixed-capacity LRU with atomic `ContainsOrAdd`; well-maintained |
-| `github.com/spf13/cobra` v1.10.x | CLI framework | Standard for multi-command CLIs in Go |
-| `github.com/stretchr/testify` v1.11.x | Test assertions | `require` + `assert` reduce test boilerplate significantly |
+### Current (broken) model
 
-No CGO dependencies are introduced. The module targets Go 1.22+.
+When a peer connects to the hub and subscribes to channels, the hub delivers messages by:
+
+1. Calling `hub.EnqueueToAll(&env)` from `Publish` and `writeLocalEnvelope`, pushing in-memory envelopes into each peer's `PeerSender` buffer.
+2. On reconnect, the client sends a `LastID` field in the handshake; the hub calls `ReplayFrom` which does a sequential scan of all channel segment files to find that ID and replay from there.
+
+This has several fundamental problems:
+
+- **No persistent delivery state on the hub.** If the hub restarts, it has no record of what each subscriber received. The only recovery mechanism is `LastID` sent by the client, which is itself broken: `ConnectWithReconnect` sends `sender.LastAckedID()`, which tracks the *outbound* (client→hub) direction, not the *inbound* (hub→client) direction. For subscribe-only clients this value is always empty, so the hub replays everything from the beginning on every restart.
+- **`ReplayFrom` is incorrect for multiple channels.** Segments are collected in channel order and scanned sequentially. Any channel whose segments appear after the channel containing `lastID` is fully replayed regardless of whether it was already delivered.
+- **No compaction integration.** The compactor only knows about local subscribers (via `subscribers/{channel}/` offset files). Federation subscribers are invisible to it, so the hub cannot safely determine when segments are safe to delete.
+
+### New model
+
+The hub reads from segment files on behalf of each connected subscriber, exactly as local subscribers do. Each subscribed channel gets its own `channelReader` goroutine that tracks a byte offset in the segment files and writes that offset to `subscribers/{channel}/fed-{peerName}.offset` after each acked batch. The compactor already reads all files in `subscribers/{channel}/`, so federation subscribers are automatically included in compaction boundary calculations.
+
+All incoming connections — whether `Role: "client"` or `Role: "hub"` — use the same delivery mechanism. There is no distinction.
 
 ---
 
-## 3. Key Interfaces Defined Early
+## What Changes
 
-These interfaces are established before implementation begins so that later phases can code to them independently and tests can use fakes.
+### Removed
 
+| Item | Reason |
+|---|---|
+| `Hub.EnqueueToAll` | Replaced by `Hub.NotifyChannel` + file readers |
+| `Hub.ReplayFrom` | No longer needed; reconnect resumes from stored offset |
+| `hub.channelSubscribers` reverse index | Was only used by `EnqueueToAll` |
+| `PeerSender` on hub side (outbound to subscribers) | Replaced by `clientCoordinator` |
+| Replay goroutine in `hub.serveConn` | Replaced by file reader resuming from offset |
+| `LastID` field sent by client on reconnect | Hub is authoritative; client no longer sends it |
+| `lastReceivedFromHub` / `receiver` fields added to `Client` in earlier partial work | No longer needed; revert those changes |
+
+### Added
+
+| Item | Purpose |
+|---|---|
+| `internal/federation/channelreader.go` | Per-`(peer, channel)` file reader goroutine |
+| `internal/federation/clientcoordinator.go` | Per-peer coordinator serialising sends across channels |
+| `Hub.NotifyChannel(channel string)` | Wakes all channel readers for that channel |
+| `Hub.notifyRegistry` | `map[string][]*channelReader` maintained by `serveConn` |
+| `FedClientOffsetTTL time.Duration` on `HubConfig` | Configurable TTL for disconnected peer offset files; default 168h |
+| TTL sweep goroutine on `Hub` | Deletes stale `fed-` offset files whose mtime exceeds TTL |
+
+### Modified
+
+| Item | Change |
+|---|---|
+| `hub.serveConn` | Creates `clientCoordinator` instead of `PeerSender` + replay goroutine for all connections with subscriptions |
+| `messenger.go` `Publish` and `writeLocalEnvelope` | Call `hub.NotifyChannel(channel)` instead of `hub.EnqueueToAll(&env)` |
+| `HandshakeMsg` | `LastID` field kept in struct (wire compat, `omitempty`) but hub ignores it and client stops sending it |
+| `internal/federation/client.go` | Revert partial `lastReceivedFromHub`/`receiver` changes; stop sending `LastID` in handshake |
+| `config.go` | Add `FedClientOffsetTTL` to `HubConfig` with default 168h |
+
+### Unchanged
+
+- `PeerReceiver` on hub (client→hub inbound messages)
+- `PeerSender` on client (client→hub outbound messages)
+- `PeerReceiver` on client (hub→client inbound messages — still receives batches)
+- mTLS, allowlists, audit logging, wire framing, ack protocol
+- `PeerReceiver.LastReceivedID()` added earlier — harmless, keep it
+
+---
+
+## New Components
+
+### `channelReader`
+
+**File:** `internal/federation/channelreader.go`
+
+One instance per `(peer, subscribed channel)`. Lifecycle:
+
+1. **Start:** Read stored offset from `subscribers/{channel}/fed-{peerName}.offset`. If the file does not exist (first connection), use the current end-of-channel offset so the subscriber receives only new messages.
+2. **Watch:** Block on a `LocalNotifier`-style notification channel. The hub calls `NotifyChannel(channel)` after every write to that channel, which sends a non-blocking notification to all registered readers for that channel.
+3. **Read:** On notification, scan from the stored offset through the segment files, accumulating envelopes up to `maxBatchBytes` into a single-channel batch. Track the byte offset of the end of the last envelope read.
+4. **Send:** Put the batch and the new offset into the coordinator's `requestCh`.
+5. **Ack:** Wait for the coordinator to confirm the ack was received (via a per-request `doneCh`).
+6. **Persist:** Write the new byte offset to `subscribers/{channel}/fed-{peerName}.offset` using `storage.WriteOffset` (atomic: write to `.tmp`, fsync, rename).
+7. **Loop:** Return to step 2.
+
+On close: stop goroutine. Do **not** delete the offset file — it is needed by the compactor and the TTL sweep.
+
+**Key fields:**
+```
+channelDir   string          // path to channel segment directory
+offsetPath   string          // path to fed-{peer}.offset file
+notifyCh     chan struct{}    // non-blocking, coalesced notifications
+requestCh    chan<- sendReq   // shared with coordinator
+log          logger
+```
+
+### `clientCoordinator`
+
+**File:** `internal/federation/clientcoordinator.go`
+
+One instance per connected peer. Owns N `channelReader`s (one per subscribed channel).
+
+Runs a single send goroutine:
+1. Wait for the next `sendReq` on `requestCh` (blocks until any channel reader has a batch ready).
+2. Encode the batch using the existing `WriteFrame` / binary WebSocket framing.
+3. Write to the WebSocket connection using `connWriteMu`.
+4. Wait for the ack via `ackCh` (fed by the existing `PeerReceiver` ack-routing mechanism — unchanged).
+5. Signal completion to the channel reader via `req.doneCh`.
+6. Loop.
+
+`sendReq` struct:
+```
+channel  string
+envs     []*envelope.Envelope
+newOffset int64
+doneCh   chan<- struct{}
+```
+
+On disconnect: close `requestCh`, stop all channel readers, close the coordinator goroutine. Offset files remain on disk.
+
+---
+
+## Offset File Naming and Compaction
+
+Offset files for federation peers are written to:
+
+```
+{dataDir}/subscribers/{channel}/fed-{peerName}.offset
+```
+
+The file format is identical to local subscriber offset files (a decimal integer followed by a newline). The compactor reads all files in `subscribers/{channel}/` and uses the minimum offset as the safe compaction boundary. No changes to the compactor are required — federation peers are automatically included.
+
+The `fed-` prefix distinguishes these files from local subscriber files for logging and the TTL sweep; the compactor treats them identically.
+
+---
+
+## TTL Sweep
+
+Connected peers update their offset files on every acked batch, so the file's mtime reflects the last time the peer was active. Peers that disconnect and never reconnect leave their offset files behind, which would otherwise block compaction indefinitely.
+
+The hub runs a background TTL sweep goroutine (separate from the Messenger's compaction ticker) that:
+
+1. Scans all `subscribers/{channel}/fed-*.offset` files across all channel directories under `dataDir`.
+2. Compares each file's mtime to `time.Now() - FedClientOffsetTTL`.
+3. Deletes files whose mtime is older than the TTL.
+4. Logs each deletion at `Info` level with the peer name, channel, and age.
+
+The sweep runs on a ticker. A reasonable interval is once per hour; the TTL is much longer so hourly checks are sufficient to keep things tidy.
+
+**Config:**
+```yaml
+hub:
+  fed_client_offset_ttl: 168h   # default: 1 week
+```
+
+Zero or negative TTL disables the sweep entirely.
+
+---
+
+## Notification Wiring
+
+When a message is written to a channel (either via `Publish` or `writeLocalEnvelope`), the hub must wake all `channelReader`s registered for that channel.
+
+`Hub` gains:
 ```go
-// Logger is the structured logging interface injected by callers.
-// Signature matches slog.Logger for drop-in compatibility.
-type Logger interface {
-    Debug(msg string, args ...any)
-    Info(msg string, args ...any)
-    Warn(msg string, args ...any)
-    Error(msg string, args ...any)
-}
-
-// PayloadRegistry maps type discriminator strings to Go types.
-type PayloadRegistry interface {
-    Register(typeStr string, prototype any) error
-    Decode(typeStr string, raw json.RawMessage) (any, error)
-    KnownTypes() []string
-}
-
-// ChannelWriter appends a pre-marshaled envelope to a channel file.
-// Blocks until confirmed (rendezvous — no in-memory queue).
-type ChannelWriter interface {
-    Write(env *envelope.Envelope) error
-    Close() error
-}
-
-// ChannelWatcher abstracts fsnotify vs polling so subscriber code is testable.
-type ChannelWatcher interface {
-    Watch(path string) (<-chan struct{}, error)
-    Close() error
-}
-
-// AuditLogger writes structured audit events.
-type AuditLogger interface {
-    Log(event audit.Event) error
-    Close() error
-}
-
-// Deduplicator is the seen-ID set.
-type Deduplicator interface {
-    SeenOrAdd(id string) bool // returns true if already seen
-}
-
-// PeerSender enqueues a message for forwarding to a peer hub.
-type PeerSender interface {
-    Enqueue(env *envelope.Envelope) bool // false if buffer full
-    Close() error
-}
+notifyMu       sync.RWMutex
+notifyRegistry map[string][]*channelReader  // channel → readers
 ```
 
----
-
-## 4. Implementation Phases
-
----
-
-### Phase 1 — Module Scaffold and Configuration
-
-**Depends on:** nothing
-
-**Deliverables:**
-
-- `go.mod` with module path, Go version, and all external dependencies pre-declared.
-- `go.sum` populated via `go mod tidy`.
-- `config.go`: `Config` struct with all fields from the YAML reference in DESIGN.md. `Load(path string) (*Config, error)` reads YAML, applies defaults, validates. `Validate() error`. `ApplyDefaults()`.
-
-  Defaults: `sync_policy="periodic"`, `sync_interval_ms=200`, `max_retries=5`, `reconnect_base_ms=500`, `reconnect_max_ms=60000`, `reconnect_jitter=0.2`, `send_buffer_messages=10000`, `max_batch_bytes=65536`, `seen_id_lru_size=100000`, `audit.max_size_mb=100`, `audit.max_files=10`, `compaction_threshold_mb=256`, `max_subscriber_lag_mb=512`, `tls.expiry_warn_days=30`.
-
-- `options.go`: `Option` functional option type; `WithLogger`, `WithConfig`, `WithDataDir` constructors.
-
-**Test strategy:**
-
-- Table-driven `Validate()` tests: missing `data_dir`, invalid `sync_policy`, negative `max_retries`, zero `sync_interval_ms` with `periodic` policy, `hub.enabled=true` with empty `listen_addr`, `tls.cert` set without `tls.key`.
-- Round-trip: marshal `Config` → YAML → `Load` → assert all fields equal. Verifies `ApplyDefaults` does not clobber explicitly-set values.
-- File-not-found returns a wrapped error distinguishable via `errors.Is`.
-
----
-
-### Phase 2 — Envelope and Payload Registry
-
-**Depends on:** Phase 1
-
-**Deliverables:**
-
-- `internal/envelope/envelope.go`: `Envelope` struct with JSON tags (`v`, `id`, `ts`, `channel`, `origin`, `payload_type`, `payload`). `Marshal(env Envelope) ([]byte, error)` using `sync.Pool`-backed `bytes.Buffer`. `Unmarshal(data []byte) (Envelope, error)` with version check: unknown `v` returns `ErrUnknownVersion` (callers log and continue — never drop). `NewEnvelope(channel, origin, payloadType string, payload any) (Envelope, error)` generates UUID v4, sets `ts` to `time.Now().UTC()`, marshals `payload` into `json.RawMessage`.
-- `DeadLetterPayload` struct: `Original Envelope`, `Retries int`, `LastError string`, `FailedAt time.Time`.
-- `internal/registry/registry.go`: `defaultRegistry` implementing `PayloadRegistry`. `Register` uses `reflect.TypeOf(prototype)` to store the type; rejects duplicates with `ErrPayloadTypeAlreadyRegistered`. `Decode` JSON-round-trips into the registered type; if unregistered, returns `map[string]any` and logs a warning (never drops). `KnownTypes` returns sorted slice.
-
-**Test strategy:**
-
-- `Marshal`/`Unmarshal` round-trip for a complete envelope.
-- Unknown `v` returns `ErrUnknownVersion`; caller can still access raw bytes.
-- `NewEnvelope` produces a valid UUID v4 `id` and RFC3339Nano `ts`.
-- Registry `Register`/`Decode` with a concrete struct; verify field values after decode.
-- Registry `Decode` with unregistered type returns `map[string]any` (not error).
-- Duplicate registration returns `ErrPayloadTypeAlreadyRegistered`.
-- `sync.Pool` buffer test: call `Marshal` 10,000 times concurrently with `-race`.
-
----
-
-### Phase 3 — Storage: Writer Goroutine
-
-**Depends on:** Phase 2
-
-**Deliverables:**
-
-- `internal/storage/writer.go`: `channelWriter` implementing `ChannelWriter`. `NewChannelWriter(channelPath string, policy SyncPolicy, syncInterval time.Duration, notifyFn func()) (*channelWriter, error)` opens the channel file with `O_APPEND|O_CREATE|O_WRONLY`.
-
-  Internal goroutine loop: receive `writeRequest{data []byte, done chan<- error}` via an **unbuffered** channel (rendezvous); call `os.File.Write`; on error, retry with 10ms sleep (indefinitely — backpressure); on success, call `notifyFn()`, signal `done`. For `sync_policy=always`, `fsync` before signaling `done`. For `sync_policy=periodic`, a background ticker calls `fsync` at the configured interval.
-
-  `flock` advisory lock for records exceeding `PIPE_BUF` (4096-byte conservative floor). `Close()` drains the goroutine and closes the file.
-
-- `SyncPolicy` type: `SyncPolicyNone`, `SyncPolicyPeriodic`, `SyncPolicyAlways`.
-
-**Test strategy:**
-
-- Functional: write 1000 envelopes sequentially; read back, assert line count and each line parses as valid JSON.
-- Concurrent with `-race`: 50 goroutines each calling `Write` simultaneously; verify no torn lines.
-- `SyncPolicyAlways`: mock `os.File` to assert `Sync()` called once per write.
-- `SyncPolicyPeriodic`: assert `Sync()` called on timer tick, not per write.
-- Backpressure: fake file returns `ENOSPC` for first N writes then succeeds; assert `Write` eventually returns and record is in the file.
-- `Close()`: goroutine exits cleanly; subsequent `Write` calls return an error.
-
----
-
-### Phase 4 — Storage: Offset Tracking and File Watcher
-
-**Depends on:** Phase 3
-
-**Deliverables:**
-
-- `internal/storage/offset.go`: `ReadOffset(path string) (int64, error)`. `WriteOffset(path string, offset int64) error` — writes to a `.tmp` file, fsyncs, renames (atomic). `OffsetFileExists(path string) bool`.
-- `internal/storage/watcher.go`: `NewChannelWatcher(logger Logger) (ChannelWatcher, error)` wraps `fsnotify`. `Watch(path string) (<-chan struct{}, error)` — registers path; returns a coalesced `chan struct{}` (multiple rapid FS events collapse to one send via non-blocking send). Fallback: if fsnotify fails to watch a path, log warning and start a 100ms polling goroutine writing to the same channel. `Close()` removes all watches.
-- Same-process fast path: `LocalNotifier` — a `chan struct{}` passed as `notifyFn` from the channel writer directly to a subscriber's select, bypassing the FS watcher.
-
-**Test strategy:**
-
-- `WriteOffset`/`ReadOffset` round-trip at 0, max int64, and a mid-file value.
-- Atomic write: simulate crash between write and rename using a fake filesystem; verify original offset file unchanged.
-- Watcher integration: create temp file, start watcher, append a line, assert notification arrives within 500ms.
-- Coalescing: write 100 lines rapidly; assert notification channel has far fewer than 100 tokens.
-- Polling fallback: fsnotify returns a watch error; verify polling emits notifications.
-
----
-
-### Phase 5 — Storage: Subscriber Goroutine and Dead-Letter
-
-**Depends on:** Phases 3, 4
-
-**Deliverables:**
-
-- `internal/storage/subscriber.go`: `Subscriber` struct. `NewSubscriber(id, channelPath, offsetDir string, reg PayloadRegistry, maxRetries int, dlWriter ChannelWriter, watcher ChannelWatcher, logger Logger) (*Subscriber, error)`. On construction: if offset file missing, write current EOF offset (new subscriber); otherwise read existing offset (resuming subscriber).
-
-  Internal goroutine: wait on watcher or `LocalNotifier`; on wake, seek to current offset, read to EOF with `bufio.Scanner`; for each line: `envelope.Unmarshal` → `registry.Decode` → call `HandlerFunc`; retry up to `maxRetries` on error or panic (recovered via `recover()`); on final failure: build `DeadLetterPayload`, publish to `{channel}.dead-letter` via `dlWriter`, advance offset, log error. After each successful dispatch or dead-letter routing, call `WriteOffset`.
-
-  Dead-letter channels are not themselves dead-lettered: detect via `strings.HasSuffix(channel, ".dead-letter")`; on handler failure, log and advance offset only.
-
-**Test strategy:**
-
-- Happy path: write 3 envelopes to temp file, start subscriber, assert handler called 3 times with correct payloads.
-- At-least-once: handler succeeds; stop and restart subscriber; assert handler is not called again (offset persisted).
-- Retry: handler fails `maxRetries-1` times then succeeds; assert called exactly `maxRetries` times, offset advanced.
-- Dead-letter: handler always fails; assert `DeadLetterPayload` published to dlWriter; offset advanced; delivery continues with next message.
-- Panic recovery: handler panics; assert goroutine continues; dead-letter triggered.
-- Dead-letter-channel subscriber: handler always fails; assert no dead-letter published, offset advanced, error logged.
-
----
-
-### Phase 6 — Storage: Compaction
-
-**Depends on:** Phases 3, 4, 5
-
-**Deliverables:**
-
-- `internal/storage/compaction.go`: `Compactor` struct. `RegisterSubscriber(id string)`, `DeregisterSubscriber(id string)` (removes offset file). `MinOffset() int64` returns minimum offset across all registered subscribers. `MaybeCompact(channelPath string, threshold int64, writer ChannelWriter) error`: if `MinOffset() > threshold`, pause the writer goroutine (signal it to hold), rewrite file from `MinOffset()` to EOF into a temp file, rename over original, adjust all offsets by subtracting `MinOffset()`, resume writer. Lag warning: if any subscriber offset is more than `max_subscriber_lag_mb` behind EOF, log warning.
-
-**Test strategy:**
-
-- Trigger: file with 10 MB of data, subscriber at offset 9 MB; assert file shrinks and offset adjusts.
-- No compaction when min offset below threshold: file unchanged.
-- Writer pause: no `Write` calls succeed while compaction holds the pause; they succeed immediately after.
-- Multi-subscriber: min offset is correctly the minimum across all.
-- Deregister: subscriber removed; compaction advances to higher offset.
-- Lag warning: subscriber at offset 0 in a 600 MB file; assert warning logged.
-
----
-
-### Phase 7 — Deduplication
-
-**Depends on:** Phase 1 *(independent of Phases 2–6; can be developed in parallel)*
-
-**Deliverables:**
-
-- `internal/dedup/dedup.go`: `LRUDedup` implementing `Deduplicator`. Wraps `github.com/hashicorp/golang-lru/v2` with size `seen_id_lru_size`. `SeenOrAdd(id string) bool` uses the cache's atomic `ContainsOrAdd` method to avoid TOCTOU. `NewLRUDedup(size int) (*LRUDedup, error)`.
-
-**Test strategy:**
-
-- First call with new ID returns `false`; second call returns `true`.
-- LRU eviction: add `size+1` unique IDs; first ID evicted; `SeenOrAdd` returns `false` again.
-- Race test with `-race`: 100 goroutines each adding 1000 IDs; no data race.
-- Benchmark `SeenOrAdd` at size 100,000 to establish latency baseline.
-
----
-
-### Phase 8 — Audit Log
-
-**Depends on:** Phase 1 *(independent of Phases 2–7; can be developed in parallel)*
-
-**Deliverables:**
-
-- `internal/audit/audit.go`: `Event` struct: `Ts time.Time`, `Event string`, `MessageID string`, `Channel string`, `Direction string`, `Peer string`, `PeerAddr string`, `Detail string` (all optional except `Event` and `Ts`). Event name constants: `EventForward`, `EventPolicyViolation`, `EventReplayGap`, `EventPeerConnected`, `EventPeerDisconnected`, `EventClientConnected`, `EventClientRejected`, `EventClientDrain`, `EventPolicyReloaded`, `EventPolicyReloadFailed`.
-
-  `AuditWriter` implementing `AuditLogger`. `NewAuditWriter(dir string, maxSizeMB, maxFiles int, logger Logger) (*AuditWriter, error)`. Internal goroutine: receive `Event` from a buffered channel (capacity 1000 to absorb bursts); marshal to JSON line; write to `audit.jsonl`; check file size; rotate if needed. Rotation: rename `audit.jsonl` → `audit.jsonl.1`, shift `.1`→`.2` etc., delete files beyond `max_files`, open new `audit.jsonl`. If channel full: drop event and log to stderr — audit must not block message delivery. `Close()` drains channel, closes file.
-
-**Test strategy:**
-
-- Write 5 events, close writer, read file, assert 5 valid JSON lines with correct fields.
-- Rotation: set `max_size_mb=1`, write until rotation triggers; assert `audit.jsonl.1` exists and all events accounted for.
-- `max_files=3`: write enough for 4 rotated files; assert `.4` is deleted.
-- Concurrent `Log`: 50 goroutines, 100 events each; no data race.
-- `Close` test: goroutine exits and file closed cleanly.
-
----
-
-### Phase 9 — TLS Utilities and Certificate Generation
-
-**Depends on:** Phase 1 *(independent of Phases 2–8; can be developed in parallel)*
-
-**Deliverables:**
-
-- `internal/tlsutil/keygen.go`: `GenerateCA(validityDays int) (certPEM, keyPEM []byte, err error)` — P-384 EC key, self-signed CA cert. `GenerateInstance(caCertPEM, caKeyPEM []byte, name string, validityDays int) (certPEM, keyPEM []byte, err error)` — P-384 instance key; cert with `CN=name` and `DNS SAN=name`; signed by CA. PEM output.
-- `internal/tlsutil/tlsutil.go`: `BuildTLSConfig(certFile, keyFile, caFile string, logger Logger) (*tls.Config, error)` — `MinVersion: tls.VersionTLS13`, `ClientAuth: tls.RequireAndVerifyClientCert`. `ExtractCN(cert *x509.Certificate) string`. `CheckExpiry(cert *x509.Certificate, warnDays int, logger Logger)`. `HotReloadTLSConfig(certFile, keyFile, caFile string, watcher ChannelWatcher, logger Logger) (*HotReloadTLS, error)` — watches files via `ChannelWatcher`; on change rebuilds and atomically swaps via `sync/atomic.Pointer`; `tls.Config.GetConfigForClient` reads current pointer so new connections use the new cert.
-
-**Test strategy:**
-
-- `GenerateCA`: parse PEM, assert `IsCA=true`, key is P-384.
-- `GenerateInstance`: assert `CN=name`, DNS SAN contains name, cert verifies against CA.
-- `BuildTLSConfig` with valid files: `MinVersion=TLS13`, non-nil `ClientCAs`.
-- `BuildTLSConfig` with missing files: wrapped error.
-- `CheckExpiry`: cert with `NotAfter=now+15 days`; assert warning logged.
-- `HotReloadTLS`: write initial cert, overwrite file, assert `GetConfigForClient` returns new cert within 1 second.
-
----
-
-### Phase 10 — Federation: Wire Framing and Handshake
-
-**Depends on:** Phase 2
-
-**Deliverables:**
-
-- `internal/federation/framing.go`: `WriteFrame(w io.Writer, records [][]byte) error` — writes `[4-byte big-endian length][record bytes]` for each record into one buffer, sends as a single binary WebSocket message. `ReadFrame(r io.Reader) ([][]byte, error)` — reads one frame, splits on length prefixes. Returns `ErrFrameTooLarge` if a record exceeds `max_batch_bytes`.
-- `internal/federation/handshake.go`: `HandshakeMsg{InstanceName, Role, Version}`. `SendHandshake`, `ReceiveHandshake` (text frames, separate from binary data frames). `AckMsg{LastID string}`. `SendAck`, `ReceiveAck`.
-
-**Test strategy:**
-
-- `WriteFrame`/`ReadFrame` round-trip with 0, 1, and 100 records of varying sizes.
-- Record larger than max returns `ErrFrameTooLarge`.
-- Empty frame (0 records) round-trips cleanly.
-- Handshake round-trip over a `net.Pipe`-backed connection pair.
-- Simulated `io.ErrUnexpectedEOF` mid-frame: error returned to caller.
-
----
-
-### Phase 11 — Federation: Policy Engine
-
-**Depends on:** Phases 8, 10
-
-**Deliverables:**
-
-- `internal/federation/policy.go`: `ForwardPolicy{Forward, Receive []string}`. `AtomicPolicy` wraps `sync/atomic.Pointer[ForwardPolicy]` for lock-free reads. `AllowForward(channel string) bool`, `AllowReceive(channel string) bool` — linear scan (channel lists are small). `HubConfig{AllowedPeers}`. `IsClientAllowed(name string) bool`.
-
-**Test strategy:**
-
-- `AllowForward`/`AllowReceive`: exact match returns `true`; non-match returns `false`; empty list returns `false` for Forward, `true` for Receive.
-- `AtomicPolicy` swap: readers calling `AllowForward` concurrently while writer swaps; no data race.
-
----
-
-### Phase 12 — Federation: Hub, Client, and Peer Goroutines
-
-**Depends on:** Phases 7, 8, 9, 10, 11
-
-**Deliverables:**
-
-- `internal/federation/hub.go`: `Hub`. `NewHub(cfg HubConfig, tlsCfg *tls.Config, localWriter func(*envelope.Envelope) error, dedup Deduplicator, audit AuditLogger, logger Logger) (*Hub, error)`. `Listen(addr string) error` — TLS-wrapped `net.Listener`; accepts connections; upgrades to WebSocket; exchanges handshake; extracts CN from peer cert; checks against allowlist. On rejection: close frame 4403, log `EventClientRejected`. On acceptance: start `peerReceiver` goroutine.
-- `internal/federation/peersender.go`: `PeerSender` goroutine. Buffered channel of `*envelope.Envelope` (`send_buffer_messages` capacity). `Enqueue` — non-blocking; drops with warning if full. Internal goroutine: batch up to `max_batch_bytes` or until channel empty; `WriteFrame`; wait for ack; advance last-acked ID. On write error: trigger reconnect. Replay: on reconnect, re-send all unacked buffered messages. Exponential backoff with jitter.
-- `internal/federation/peerreceiver.go`: `PeerReceiver` goroutine. Reads binary frames; for each record: `dedup.SeenOrAdd(id)` → skip if seen; `localWriter(env)` (blocks on disk full — backpressure propagates to TCP); check `AtomicPolicy.AllowReceive(channel)` → log `EventPolicyViolation` and discard if violated (still acked); log `EventForward` for each accepted message; send ack after each batch.
-- `internal/federation/client.go`: `Client`. `Dial(hubAddr string, tlsCfg *tls.Config, ...) error` — connects, exchanges handshake, starts sender+receiver goroutines. On disconnect: reconnect with backoff; on reconnect, send last-acked ID so hub can replay.
-- `Hub.ReplayFrom(lastID string, channels []string) <-chan *envelope.Envelope` — scans channel files forward from record matching `lastID`, emitting envelopes on matching channels. If `lastID` not found (compacted): log `EventReplayGap`, start from earliest available.
-- `Hub.ApplyPolicy(newCfg HubConfig)` — atomic swap of channel lists; dial new peers; drain-then-close removed peers and removed allowlist clients.
-
-**Test strategy:**
-
-- Hub/client integration over `net.Pipe`: hub listens, client dials, sends 10 messages, assert `localWriter` called 10 times.
-- mTLS: client with wrong CA cert rejected at TLS layer.
-- Allowlist: valid cert but unknown name receives close 4403; `EventClientRejected` logged.
-- Deduplication: same message ID sent twice; `localWriter` called once.
-- Policy violation: peer sends on channel not in `receive`; discarded; `EventPolicyViolation` logged.
-- Backpressure: `localWriter` blocks 200ms; receiver does not read further frames during that time.
-- Reconnect replay: disconnect mid-stream, reconnect, assert buffered messages replayed exactly once.
-- `ReplayFrom` with compacted-away lastID: `EventReplayGap` logged, replay from earliest.
-- Batching: 200 small messages batched into fewer than 200 frames.
-- Send buffer full: `send_buffer_messages` exceeded; warning logged, excess messages dropped.
-
----
-
-### Phase 13 — Root Messenger API
-
-**Depends on:** Phases 5, 6, 7, 8, 12
-
-**Deliverables:**
-
-- `messenger.go`: `Messenger` struct. `New(cfg *Config, opts ...Option) (*Messenger, error)` — constructs all internal components; validates data directory; creates directory structure (`channels/`, `subscribers/`, audit file). On construction: calls `CheckExpiry` on instance cert and CA cert.
-- `Publish(ctx context.Context, channel, payloadType string, payload any) error` — looks up or creates `ChannelWriter`; calls `envelope.NewEnvelope`; adds to dedup set; calls `writer.Write(env)`; notifies same-process subscribers via `LocalNotifier`; enqueues to peer senders whose forward policy includes the channel.
-- `Subscribe(ctx context.Context, channel, subscriberID string, handler HandlerFunc) error` — registers subscriber, creates offset file if needed, starts subscriber goroutine.
-- `Unsubscribe(channel, subscriberID string) error` — stops goroutine, removes offset file.
-- `RegisterPayloadType(typeStr string, prototype any) error` — delegates to registry.
-- `Close() error` — graceful shutdown: stop new publishes; drain subscribers; close peer connections (drain-then-close); close audit writer; close channel writers. Idempotent.
-- `config.go`: `EnsureDirectories(cfg *Config) error`.
-- Channel name validation: `ValidateChannelName(name string) error` — `[a-zA-Z0-9._-]+`, non-empty, ≤255 bytes.
-
-**Test strategy:**
-
-- End-to-end: `New` → `RegisterPayloadType` → `Subscribe` → `Publish` → assert handler called with correctly typed payload within 500ms.
-- At-least-once: stop `Messenger`, restart with same data dir, re-subscribe same ID, publish nothing; assert no phantom deliveries.
-- Multiple subscribers on same channel: each receives all messages independently.
-- Federation end-to-end: two `Messenger` instances with hub/client config; publisher on one, subscriber on other; assert cross-instance delivery.
-- `Close` is idempotent: call twice, assert no panic.
-- Invalid channel name: `Publish` returns `ErrInvalidChannelName`.
-- `ctx` cancellation: cancelled context passed to `Subscribe`; goroutine exits within 1 second.
-
----
-
-### Phase 14 — CLI: keygen Subcommands
-
-**Depends on:** Phase 9
-
-**Deliverables:**
-
-- `cmd/keyop-messenger/main.go`: cobra root command. Subcommands under `keygen`:
-  - `keygen ca [--out-cert ca.crt] [--out-key ca.key] [--days 730]` — calls `tlsutil.GenerateCA`, writes PEM files.
-  - `keygen instance --ca ca.crt --ca-key ca.key --name billing-host [--out-cert billing-host.crt] [--out-key billing-host.key] [--days 730]` — calls `tlsutil.GenerateInstance`, writes PEM files.
-- Both commands: refuse to overwrite without `--force`. Print cert subject, validity period, and SHA-256 fingerprint on success.
-- `version` subcommand: prints module version from `debug.ReadBuildInfo`.
-
-**Test strategy:**
-
-- `keygen ca` in temp dir: assert both files written, parse PEM, verify `IsCA=true`, key is P-384.
-- `keygen instance` with CA files: assert cert parses, `CN=--name`, chain verifies against CA.
-- Refuse overwrite: create target file, run without `--force`, assert non-zero exit and file unchanged.
-- `--force`: file is overwritten.
-- Missing required flag `--ca`: assert usage error.
-
----
-
-### Phase 15 — Hardening, Benchmarks, and Integration Tests ✓
-
-**Depends on:** Phases 13, 14
-
-**Deliverables:**
-
-- `messenger_bench_test.go`: benchmark `Publish` throughput (single channel, no federation), `Subscribe` read latency (time from `Publish` return to handler invocation), federation round-trip latency.
-- `integration_test.go` (build tag `//go:build integration`): hub + 2 clients; dedup via dual-path forwarding; subscription-based filtering; disk-full backpressure; compaction during active subscribers.
-- `Makefile`: targets `build`, `test`, `test-integration`, `bench`, `lint`.
-- `.golangci.yml`: enable `revive`, `govet`, `staticcheck`, `gosec`, `errcheck`, `exhaustive`.
-- `CLAUDE.md` update: build/run/test commands, architecture overview, environment variables (`KEYOP_MESSENGER_DATA_DIR`, `KEYOP_MESSENGER_CONFIG`).
-
-**Test strategy:**
-
-- All unit tests pass: `go test -race ./...`
-- Integration tests pass: `go test -race -tags integration -timeout 60s ./...`
-- Benchmarks run without failure: `go test -run='^$' -bench=. -benchmem -benchtime=3s ./...`
-- `golangci-lint run` and `go vet ./...` produce zero warnings.
-
-**Implementation notes:**
-
-- The dedup integration test (`TestIntegrationRingDedup`) uses a dual-client topology rather than a Hub1→Hub2→Hub1 ring, because `writeLocalEnvelope` does not re-enqueue received messages for outbound forwarding. Two `ClientHubRef` entries with the same address create two simultaneous connections from one Messenger to another; both enqueue the same envelope, and the shared dedup LRU on the receiving hub accepts only the first.
-- JSON numbers in `map[string]any` payloads are decoded as `float64` by the standard library, not `int`. Tests that assert on specific integer payload values must cast via `float64`.
-
----
-
-### Phase 16 — Ephemeral Client ✓
-
-**Depends on:** Phase 12 (federation hub, PeerReceiver), Phase 13 (root Messenger API)
-
-**Deliverables:**
-
-- `internal/federation/handshake.go` (modified): added `Ephemeral bool \`json:"ephemeral,omitempty"\`` field to `HandshakeMsg`. The `omitempty` tag ensures the field is absent from non-ephemeral connections and hub responses, preserving wire compatibility with pre-Phase 16 hubs.
-
-- `internal/federation/hub.go` (modified): in `serveConn`, the hub now checks `hs.Ephemeral` before starting replay (`ReplayFrom`). Replay is skipped entirely for ephemeral connections even if `LastID` is set. Ephemeral connections are logged at a distinct info message.
-
-- `internal/federation/ephemeral_client.go` (new): `EphemeralClientConfig`, `EphemeralClient`, `ephemeralWriteItem`. Key methods: `NewEphemeralClient`, `AddHandler`, `Connect`, `ConnectWithReconnect`, `Publish`, `Close`. Internal: `startConn`, `dispatchEnvelope`, `writeLoop`, `reconnectLoop`. See DESIGN.md §11 for semantics. `noopAuditLogger` satisfies `audit.AuditLogger` by discarding all events.
-
-  Goroutine design: three goroutines per connection (PeerReceiver, watcher, write loop) plus one optional reconnect loop. All tracked in `EphemeralClient.wg`; `Close` calls `wg.Wait()`. The watcher goroutine ensures `conn.Close()` is called before `wg.Wait()` returns, preventing goroutine leaks if the write loop is blocked.
-
-  Per-message ack: `Publish` enqueues an `ephemeralWriteItem` with a buffered `doneCh` (cap 1). The write loop batches items from `writeQ`, sends one binary frame, then blocks on `ackCh` for the hub's text-frame ack. All items in the batch are signalled together via non-blocking sends to `doneCh`.
-
-- `ephemeral.go` (new, root package): `EphemeralConfig`, `EphemeralMessenger`. Public methods: `NewEphemeralMessenger`, `RegisterPayloadType`, `Subscribe(channel string, handler func(Message))`, `Connect(ctx)`, `Publish(ctx, channel, payloadType, payload)`, `Close`. Re-exports `ErrEphemeralConnLost`.
-
-- `ephemeral_test.go` (new, `//go:build integration`): 7 integration tests covering: publish-to-hub delivery, subscribe-from-hub delivery, no-replay on connect, context-cancelled publish, registered payload type decoding, auto-reconnect lifecycle, and concurrent multi-publish.
-
-**Test strategy:**
-
-- `TestEphemeralMessenger_Publish_ToHub`: publish via ephemeral client; assert hub subscriber receives the message.
-- `TestEphemeralMessenger_Subscribe_FromHub`: hub publishes; assert ephemeral handler fires.
-- `TestEphemeralMessenger_Subscribe_NoReplay`: publish before ephemeral connects; assert pre-connect message is not delivered; post-connect messages are.
-- `TestEphemeralMessenger_Publish_ContextCancelled`: pre-cancelled context; assert `context.Canceled` returned immediately.
-- `TestEphemeralMessenger_RegisterPayloadType`: typed payload decoded correctly in handler.
-- `TestEphemeralMessenger_AutoReconnect`: connect, publish, close hub, close ephemeral; verify no deadlock.
-- `TestEphemeralMessenger_MultiplePublish`: 20 concurrent publishes all succeed and are acked.
-
-All tests use `hubLocalAddr(t, hub)` (returns `localhost:PORT`) and hub cert CN `"localhost"` so TLS hostname verification passes without IP SANs.
-
----
-
-## 5. Public API Surface
-
+`Hub.NotifyChannel(channel string)` acquires a read lock and sends a non-blocking notification to each registered reader:
 ```go
-package messenger
-
-type Config struct { ... }  // see config.go
-
-func LoadConfig(path string) (*Config, error)
-
-type Option func(*Messenger)
-
-func WithLogger(l Logger) Option
-func WithConfig(cfg *Config) Option
-
-func New(cfg *Config, opts ...Option) (*Messenger, error)
-
-type Messenger struct { ... }
-
-func (m *Messenger) RegisterPayloadType(typeStr string, prototype any) error
-func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, payload any) error
-func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string, handler HandlerFunc) error
-func (m *Messenger) Unsubscribe(channel, subscriberID string) error
-func (m *Messenger) Close() error
-
-type HandlerFunc func(ctx context.Context, msg Message) error
-
-type Message struct {
-    ID          string
-    Channel     string
-    Origin      string    // instance name of original publisher
-    PayloadType string
-    Payload     any       // decoded Go struct, or map[string]any for unregistered types
-    Timestamp   time.Time
+for _, r := range h.notifyRegistry[channel] {
+    select {
+    case r.notifyCh <- struct{}{}:
+    default:
+    }
 }
-
-type Logger interface {
-    Debug(msg string, args ...any)
-    Info(msg string, args ...any)
-    Warn(msg string, args ...any)
-    Error(msg string, args ...any)
-}
-
-var (
-    ErrPayloadTypeAlreadyRegistered = errors.New("payload type already registered")
-    ErrInvalidChannelName           = errors.New("invalid channel name")
-    ErrMessengerClosed              = errors.New("messenger is closed")
-    ErrEphemeralConnLost            = errors.New("ephemeral client: connection lost before ack")
-)
-
-// EphemeralMessenger — stateless hub client (Phase 16)
-
-type EphemeralConfig struct {
-    HubAddr         string
-    InstanceName    string
-    Subscribe       []string
-    TLS             TLSConfig
-    AutoReconnect   bool
-    ReconnectBase   time.Duration
-    ReconnectMax    time.Duration
-    ReconnectJitter float64
-    MaxBatchBytes   int
-    WriteQueueSize  int
-}
-
-func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMessenger, error)
-
-type EphemeralMessenger struct { ... }
-
-func (m *EphemeralMessenger) RegisterPayloadType(typeStr string, prototype any) error
-func (m *EphemeralMessenger) Subscribe(channel string, handler func(msg Message)) error
-func (m *EphemeralMessenger) Connect(ctx context.Context) error
-func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType string, payload any) error
-func (m *EphemeralMessenger) Close() error
 ```
+
+In `serveConn`, after creating `channelReader`s, they are registered into `notifyRegistry` under a write lock. On disconnect, they are removed.
+
+In `messenger.go`, `Publish` and `writeLocalEnvelope` call `hub.NotifyChannel(env.Channel)`. The existing `hub.EnqueueToAll` call is removed.
 
 ---
 
-## 6. Testing Conventions
+## Handshake Change
 
-- All tests use `testify/require` (fatal) and `testify/assert` (non-fatal).
-- All tests run with `-race` in CI. No test is exempt.
-- Temporary files and directories use `t.TempDir()` (auto-cleaned).
-- Fake implementations of `Logger`, `ChannelWriter`, `AuditLogger`, and `ChannelWatcher` live in `internal/testutil/fakes.go` so they can be imported across test packages without import cycles.
-- Integration tests use build tag `//go:build integration` and are excluded from the default `go test ./...` run.
-- Benchmarks live alongside unit tests but require `-bench` to run; they do not gate CI.
+`LastID` is kept in `HandshakeMsg` with `omitempty` for wire compatibility with older peers. The hub ignores it entirely. The client stops sending it (passes `""` which omits the field from JSON).
+
+---
+
+## Implementation Steps
+
+### Step 1 — Revert partial work
+Revert the `lastReceivedFromHub` / `receiver` / `lastID`-direction changes in `internal/federation/client.go` added during the earlier investigation. Keep `PeerReceiver.LastReceivedID()` — it is harmless and may be useful later.
+
+### Step 2 — Config
+Add `FedClientOffsetTTL time.Duration` to `HubConfig` in `config.go`. Default: `168 * time.Hour`. Add to YAML parsing and `ApplyDefaults`.
+
+### Step 3 — `channelReader`
+Implement `internal/federation/channelreader.go`:
+- `channelReader` struct and constructor
+- `start()` — launches goroutine, loads or initialises offset
+- `notify()` — non-blocking send to `notifyCh`
+- `close()` — stops goroutine
+- Internal read loop: open segments at offset, read batch, send to coordinator, wait for done, persist offset
+- Unit tests: verify offset persistence, new-subscriber start-at-end behaviour, batch size limit, notification wake-up
+
+### Step 4 — `clientCoordinator`
+Implement `internal/federation/clientcoordinator.go`:
+- `clientCoordinator` struct and constructor (takes conn, connWriteMu, ackCh, list of channelReaders)
+- Single send goroutine
+- `close()` — stops goroutine and all channel readers
+- Unit tests: verify sequential delivery, ack propagation to reader, clean shutdown
+
+### Step 5 — Hub wiring
+Modify `internal/federation/hub.go`:
+- Add `notifyRegistry` and `notifyMu`
+- Add `NotifyChannel(channel string)` method
+- Add TTL sweep goroutine started in `NewHub` (or `Listen`)
+- Modify `serveConn`: for peers with subscriptions, create `clientCoordinator` with one `channelReader` per subscribed channel; register readers into `notifyRegistry`; on disconnect, deregister and close coordinator
+- Remove `EnqueueToAll`, `ReplayFrom`, `channelSubscribers`, the replay goroutine
+- Keep `PeerReceiver` creation in `serveConn` (inbound path unchanged)
+
+### Step 6 — Messenger wiring
+Modify `messenger.go`:
+- In `Publish`: replace `hub.EnqueueToAll(&env)` with `hub.NotifyChannel(env.Channel)`
+- In `writeLocalEnvelope`: replace `hub.EnqueueToAll(env)` with `hub.NotifyChannel(env.Channel)`
+
+### Step 7 — Client cleanup
+Modify `internal/federation/client.go`:
+- Stop sending `LastID` in handshake (pass `""`)
+- Confirm revert of partial changes from Step 1 is complete
+
+### Step 8 — Compactor verification
+Confirm the compactor's minimum-offset calculation reads all files in `subscribers/{channel}/` including `fed-` prefixed files. Add a focused test: create a channel with a local subscriber offset and a `fed-` prefixed offset file; assert `MaybeCompact` uses the minimum of both.
+
+### Step 9 — Integration test
+Add a test (in `integration_test.go` or a new `federation_restart_test.go` with build tag `integration`) that:
+1. Starts a hub with a data directory
+2. Connects a subscriber peer to two channels
+3. Hub publishes N messages on each channel; subscriber receives all
+4. Hub closes and restarts (new `Messenger` instance, same data directory)
+5. Subscriber reconnects
+6. Hub publishes M more messages
+7. Assert: subscriber receives exactly M messages (no re-delivery of the first N)
+
+### Step 10 — Remove stale tests
+Remove or update any tests that relied on `ReplayFrom`, `EnqueueToAll`, or the old `LastID`-based replay behaviour.
+
+### Step 11 — Run full test suite
+```bash
+go test -race ./...
+go test -race -tags integration -timeout 60s ./...
+```
+All packages must show `ok`. Zero failures.
+
+### Step 12 — Update `README.md` and `DESIGN.md`
+- `DESIGN.md`: update the Federation section to describe the file-reader delivery model, offset file naming convention, TTL sweep, and removal of `ReplayFrom`/`LastID`. Remove references to `EnqueueToAll` and the push model.
+- `README.md`: update any architecture overview or federation configuration sections that reference the old push behaviour or `LastID`.
+
+---
+
+## File Map Summary
+
+```
+internal/federation/
+├── channelreader.go          NEW  per-(peer,channel) file reader
+├── clientcoordinator.go      NEW  per-peer sequential send coordinator
+├── hub.go                    MOD  remove EnqueueToAll/ReplayFrom; add NotifyChannel, TTL sweep
+├── client.go                 MOD  stop sending LastID; revert partial earlier changes
+├── handshake.go              MOD  LastID kept in struct but omitempty; no functional change
+├── peersender.go             UNCHANGED (used by client→hub direction only)
+├── peerreceiver.go           UNCHANGED (plus LastReceivedID() added earlier, kept)
+├── policy.go                 UNCHANGED
+└── framing.go                UNCHANGED
+
+messenger.go                  MOD  NotifyChannel instead of EnqueueToAll
+config.go                     MOD  FedClientOffsetTTL field on HubConfig
+
+internal/storage/
+└── compaction.go             VERIFY only (no expected changes)
+
+DESIGN.md                     MOD  federation section rewrite
+README.md                     MOD  architecture overview update
+```

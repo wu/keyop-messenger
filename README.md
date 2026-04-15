@@ -6,6 +6,8 @@ Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is 
 
 NOTE: This is still Beta, the API should now be relatively stable.
 
+See also:  [DESIGN.md](./DESIGN.md) for detailed design rationale and architecture.
+
 ## Key Features
 
 - **At-Least-Once Delivery**: Messages are only committed (offset advanced) after successful handler execution.
@@ -234,10 +236,21 @@ Set `AutoReconnect: true` to reconnect automatically with exponential backoff af
 ## Architecture
 
 Keyop Messenger follows a **Hub-and-Spoke** model:
-- **Clients**: Connect to a local Hub to publish or subscribe to channels.
-- **Hubs**: Manage local `.jsonl` files and coordinate with peer Hubs.
-- **Channels**: Each channel is a directory of append-only `.jsonl` segment files. Once all subscribers consume a segment it is deleted — no copying, no writer pauses.
-- **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position across all segments.
+- **Clients**: Connect to a Hub to publish or subscribe to channels.
+- **Hubs**: Manage local `.jsonl` files, coordinate with peer Hubs, and deliver messages to subscribers using a **file-reader pull model**.
+- **Channels**: Each channel is a directory of append-only `.jsonl` segment files. Once all subscribers (local and federation) have consumed a segment it is deleted — no copying, no writer pauses.
+- **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position across all segments. Federation peer offsets are stored under `subscribers/{channel}/fed-{peerName}.offset` and are automatically included in compaction boundary calculations.
+
+### Federation Delivery Model
+
+The hub delivers messages to subscribed federation peers using the same mechanism as local subscribers:
+
+1. When a message is written to a channel, the hub calls `NotifyChannel(channel)`, waking a `channelReader` goroutine for each peer subscribed to that channel.
+2. The `channelReader` reads from segment files starting at the peer's last byte offset, batches envelopes (up to `max_batch_bytes`), and delivers them via WebSocket.
+3. After the peer acknowledges the batch, the byte offset is persisted atomically to `subscribers/{channel}/fed-{peerName}.offset`.
+4. On reconnect, delivery resumes from the stored offset — no `last_id` handshake field is needed.
+
+Offset files for peers that disconnect and never reconnect are cleaned up by a TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week).
 
 ## Development Commands
 
@@ -257,29 +270,6 @@ go test -race -tags integration -timeout 60s ./...
 go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
 golangci-lint run ./...
 ```
-
-## Project Status
-
-All 16 phases are complete. The library is feature-complete and integration-tested.
-
-- [x] Phase 1: Module Scaffold & Configuration
-- [x] Phase 2: Message Envelope & Payload Registry
-- [x] Phase 3: Durable Writer Goroutine (Atomic Append, Segment Rolling)
-- [x] Phase 4: Offset Tracking & File Watcher
-- [x] Phase 5: Subscriber Engine & Dead-Letter Queues
-- [x] Phase 6: Storage Compaction (Segment Deletion)
-- [x] Phase 7: Deduplication (LRU Seen-ID Set)
-- [x] Phase 8: Audit Log
-- [x] Phase 9: TLS Utilities & Certificate Generation
-- [x] Phase 10: Federation Wire Framing & Handshake
-- [x] Phase 11: Federation Policy Engine & Hot-Reload
-- [x] Phase 12: Federation Hub, Client & Peer Goroutines
-- [x] Phase 13: Root Messenger API
-- [x] Phase 14: CLI (`keygen` subcommands)
-- [x] Phase 15: Hardening, Benchmarks & Integration Tests
-- [x] Phase 16: Ephemeral Client
-
-See [DESIGN.md](./DESIGN.md) for architecture details and [IMPLEMENTATION.md](./IMPLEMENTATION.md) for the full roadmap.
 
 ## License
 

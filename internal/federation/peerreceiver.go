@@ -36,8 +36,21 @@ type PeerReceiver struct {
 	maxBatchBytes int
 	ackRouteCh    chan<- AckMsg // non-nil when sharing conn with a PeerSender
 
+	mu             sync.Mutex
+	lastReceivedID string // ID of the last envelope successfully acked; safe to read after Done()
+
 	stop chan struct{}
 	done chan struct{}
+}
+
+// LastReceivedID returns the envelope ID of the last batch this receiver
+// processed and sent an ack for. Intended to be read after the receiver
+// goroutine exits (i.e. after Done() fires) to capture the inbound progress
+// cursor for use in reconnect handshakes.
+func (pr *PeerReceiver) LastReceivedID() string {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.lastReceivedID
 }
 
 // NewPeerReceiver creates a PeerReceiver and starts its goroutine.
@@ -203,6 +216,13 @@ func (pr *PeerReceiver) run() {
 				Direction: "inbound",
 			})
 			lastID = env.ID
+		}
+
+		// Persist the inbound cursor so ConnectWithReconnect can use it.
+		if lastID != "" {
+			pr.mu.Lock()
+			pr.lastReceivedID = lastID
+			pr.mu.Unlock()
 		}
 
 		// Ack the full batch — even policy-violated records are acked so the
