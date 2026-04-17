@@ -4,7 +4,7 @@
 
 Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is designed for systems where durability and delivery guarantees are paramount, offering a simple yet robust architecture based on append-only `.jsonl` files, persistent offset tracking, and mTLS-secured federation.
 
-NOTE: This is still Beta, the API should now be relatively stable.
+NOTE: This is still Beta, but the API should now be relatively stable.
 
 See also:  [DESIGN.md](./DESIGN.md) for detailed design rationale and architecture.
 
@@ -84,7 +84,7 @@ func main() {
 
     // Publish with service identification. Blocks until the write is confirmed to disk.
     pubCtx := messenger.WithServiceName(ctx, "monitor-service")
-    m.Publish(pubCtx, "alerts", "com.example.Alert", Alert{Message: "system heat!"})
+    m.Publish(pubCtx, "alerts", "com.example.Alert", Alert{Message: "system problem!"})
 }
 ```
 
