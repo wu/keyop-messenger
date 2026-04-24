@@ -1,3 +1,9 @@
+## [0.13.0](https://github.com/wu/keyop-messenger/compare/v0.12.0...v0.13.0) (2026-04-24)
+
+### Features
+
+* update MaxBatchBytes default value to 4 MiB, log stop error ([11d4a15](https://github.com/wu/keyop-messenger/commit/11d4a15da2c20a711979269c336ea4b1a606f3d4))
+
 ## [0.12.0](https://github.com/wu/keyop-messenger/compare/v0.11.0...v0.12.0) (2026-04-24)
 
 ### Features
