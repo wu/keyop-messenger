@@ -252,6 +252,36 @@ The hub delivers messages to subscribed federation peers using the same mechanis
 
 Offset files for peers that disconnect and never reconnect are cleaned up by a TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week).
 
+### Federation Observability
+
+Every connection lifecycle event is written to the audit log (`{data_dir}/audit/audit.jsonl`):
+
+| Event | When | Key fields |
+|---|---|---|
+| `client_connected` | Peer connects to hub | `peer`, `peer_addr`, `detail` (remote addr + subscribed/publish channels) |
+| `peer_disconnected` | Peer disconnects from hub | `peer`, `peer_addr`, `detail` (connection duration + error if unexpected) |
+| `peer_connected` | Client connects to hub | `peer_addr` |
+| `peer_disconnected` | Client detects hub disconnect | `peer_addr`, `detail` (`unacked=N` — messages in-flight at disconnect time) |
+| `peer_connected` | Client reconnect attempt fails | `peer_addr`, `detail` (`attempt=N err=...`) |
+
+### Oversized Message Handling
+
+If a single message exceeds `max_batch_bytes` on the receiving side, it is logged and silently skipped — the sender receives an ack so it advances past the message and the connection stays alive.
+
+```
+ERROR federation: receiver record too large, skipping
+      peer=sender id=abc123 channel=attachments size=921600 max=4194304
+```
+
+The default `max_batch_bytes` is **4 MiB** (raised from 64 KiB in earlier versions). Adjust in config if your payloads are larger:
+
+```yaml
+federation:
+  max_batch_bytes: 16777216  # 16 MiB
+```
+
+Set to `0` to disable the limit entirely.
+
 ## Development Commands
 
 ```bash

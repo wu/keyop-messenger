@@ -19,8 +19,9 @@ func roundTrip(t *testing.T, records [][]byte, maxBytes int) [][]byte {
 	t.Helper()
 	var buf bytes.Buffer
 	require.NoError(t, federation.WriteFrame(&buf, records))
-	got, err := federation.ReadFrame(&buf, maxBytes)
+	got, skipped, err := federation.ReadFrame(&buf, maxBytes)
 	require.NoError(t, err)
+	require.Empty(t, skipped, "unexpected skipped records")
 	return got
 }
 
@@ -58,13 +59,28 @@ func TestFrameRoundTripZeroLengthRecord(t *testing.T) {
 	assert.Equal(t, []byte{}, got[0])
 }
 
-func TestFrameTooLarge(t *testing.T) {
+func TestFrameOversizedRecordIsSkipped(t *testing.T) {
 	big := make([]byte, 1024)
 	var buf bytes.Buffer
 	require.NoError(t, federation.WriteFrame(&buf, [][]byte{big}))
 
-	_, err := federation.ReadFrame(&buf, 512)
-	assert.ErrorIs(t, err, federation.ErrFrameTooLarge)
+	records, skipped, err := federation.ReadFrame(&buf, 512)
+	require.NoError(t, err, "oversized record must not return an error")
+	assert.Empty(t, records, "oversized record must not appear in records")
+	require.Len(t, skipped, 1, "oversized record must appear in skipped")
+	assert.Len(t, skipped[0], 1024)
+}
+
+func TestFrameMixedSizeRecords(t *testing.T) {
+	small := []byte("small")
+	big := make([]byte, 1024)
+	var buf bytes.Buffer
+	require.NoError(t, federation.WriteFrame(&buf, [][]byte{small, big, small}))
+
+	records, skipped, err := federation.ReadFrame(&buf, 512)
+	require.NoError(t, err)
+	assert.Len(t, records, 2, "two small records should be accepted")
+	assert.Len(t, skipped, 1, "one oversized record should be skipped")
 }
 
 func TestFrameMaxBytesZeroMeansNoLimit(t *testing.T) {
@@ -77,7 +93,7 @@ func TestFrameMaxBytesZeroMeansNoLimit(t *testing.T) {
 func TestFrameTruncatedLengthPrefix(t *testing.T) {
 	// Only 2 bytes of a 4-byte length prefix.
 	buf := bytes.NewReader([]byte{0x00, 0x01})
-	_, err := federation.ReadFrame(buf, 0)
+	_, _, err := federation.ReadFrame(buf, 0)
 	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 
@@ -89,7 +105,7 @@ func TestFrameTruncatedRecordBody(t *testing.T) {
 	buf.Write(hdr)
 	buf.Write(make([]byte, 50))
 
-	_, err := federation.ReadFrame(&buf, 0)
+	_, _, err := federation.ReadFrame(&buf, 0)
 	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 
@@ -97,7 +113,7 @@ func TestFrameReaderReturnsUnexpectedEOF(t *testing.T) {
 	// A reader that returns io.ErrUnexpectedEOF partway through; ReadFrame must
 	// propagate it.
 	r := &errReader{data: []byte{0x00, 0x00}, err: io.ErrUnexpectedEOF}
-	_, err := federation.ReadFrame(r, 0)
+	_, _, err := federation.ReadFrame(r, 0)
 	assert.True(t, errors.Is(err, io.ErrUnexpectedEOF), "expected ErrUnexpectedEOF, got %v", err)
 }
 

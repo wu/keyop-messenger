@@ -179,7 +179,7 @@ func (pr *PeerReceiver) run() {
 			continue
 		}
 
-		records, err := ReadFrame(r, pr.maxBatchBytes)
+		records, skipped, err := ReadFrame(r, pr.maxBatchBytes)
 		if err != nil {
 			pr.log.Error("federation: receiver read frame", "peer", pr.peerName, "err", err)
 			pr.mu.Lock()
@@ -188,7 +188,18 @@ func (pr *PeerReceiver) run() {
 			return
 		}
 
+		// Log and ack oversized records. The message is not written locally, but
+		// we still advance the sender's window so it does not replay indefinitely.
 		var lastID string
+		for _, raw := range skipped {
+			if env, uErr := envelope.Unmarshal(raw); uErr == nil {
+				pr.log.Error("federation: receiver record too large, skipping",
+					"peer", pr.peerName, "id", env.ID, "channel", env.Channel,
+					"size", len(raw), "max", pr.maxBatchBytes)
+				lastID = env.ID
+			}
+		}
+
 		for _, rec := range records {
 			env, err := envelope.Unmarshal(rec)
 			if err != nil {

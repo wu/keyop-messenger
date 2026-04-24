@@ -6,14 +6,9 @@ package federation
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 )
-
-// ErrFrameTooLarge is returned by ReadFrame when a record's declared length
-// exceeds the configured maxRecordBytes limit.
-var ErrFrameTooLarge = errors.New("federation: record exceeds max batch bytes")
 
 // WriteFrame encodes records using the length-prefix scheme
 // [4-byte big-endian uint32 length][record bytes] and writes the result to w
@@ -37,33 +32,38 @@ func WriteFrame(w io.Writer, records [][]byte) error {
 // so it yields exactly one frame's worth of bytes before EOF.
 //
 // If maxRecordBytes > 0, any record whose declared length exceeds that limit
-// returns ErrFrameTooLarge. If the byte stream is truncated mid-record or
-// mid-header, ReadFrame returns an error wrapping io.ErrUnexpectedEOF.
-func ReadFrame(r io.Reader, maxRecordBytes int) ([][]byte, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("federation: read frame: %w", err)
+// is placed in skipped rather than records. Its raw bytes are preserved so the
+// caller can unmarshal the envelope ID and send an ack — ensuring the sender
+// advances past the oversized message rather than retrying it indefinitely.
+//
+// If the byte stream is truncated mid-record or mid-header, ReadFrame returns
+// an error wrapping io.ErrUnexpectedEOF.
+func ReadFrame(r io.Reader, maxRecordBytes int) (records [][]byte, skipped [][]byte, err error) {
+	data, readErr := io.ReadAll(r)
+	if readErr != nil {
+		return nil, nil, fmt.Errorf("federation: read frame: %w", readErr)
 	}
 
-	var records [][]byte
 	for len(data) > 0 {
 		if len(data) < 4 {
-			return nil, fmt.Errorf("federation: truncated length prefix: %w", io.ErrUnexpectedEOF)
+			return nil, nil, fmt.Errorf("federation: truncated length prefix: %w", io.ErrUnexpectedEOF)
 		}
 		n := int(binary.BigEndian.Uint32(data[:4]))
 		data = data[4:]
 
-		if maxRecordBytes > 0 && n > maxRecordBytes {
-			return nil, ErrFrameTooLarge
-		}
 		if len(data) < n {
-			return nil, fmt.Errorf("federation: truncated record body: %w", io.ErrUnexpectedEOF)
+			return nil, nil, fmt.Errorf("federation: truncated record body: %w", io.ErrUnexpectedEOF)
 		}
 
 		rec := make([]byte, n)
 		copy(rec, data[:n])
-		records = append(records, rec)
 		data = data[n:]
+
+		if maxRecordBytes > 0 && n > maxRecordBytes {
+			skipped = append(skipped, rec)
+		} else {
+			records = append(records, rec)
+		}
 	}
-	return records, nil
+	return records, skipped, nil
 }
