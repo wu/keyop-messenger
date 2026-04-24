@@ -1,3 +1,9 @@
+## [0.12.0](https://github.com/wu/keyop-messenger/compare/v0.11.0...v0.12.0) (2026-04-24)
+
+### Features
+
+* enhance audit logging for client connection and disconnection events ([e773f72](https://github.com/wu/keyop-messenger/commit/e773f72c9f918948aa71fab2b16ea275862b30b8))
+
 ## [0.11.0](https://github.com/wu/keyop-messenger/compare/v0.10.1...v0.11.0) (2026-04-15)
 
 ### Features
