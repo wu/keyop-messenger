@@ -1,3 +1,9 @@
+## [0.14.0](https://github.com/wu/keyop-messenger/compare/v0.13.0...v0.14.0) (2026-04-24)
+
+### Features
+
+* enhance ReadFrame to skip oversized records ([bf6df07](https://github.com/wu/keyop-messenger/commit/bf6df0782f47e7a5718a0e887d74c58daeb954e7))
+
 ## [0.13.0](https://github.com/wu/keyop-messenger/compare/v0.12.0...v0.13.0) (2026-04-24)
 
 ### Features
