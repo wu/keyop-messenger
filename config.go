@@ -173,7 +173,7 @@ type FederationConfig struct {
 	SendBufferMessages int `yaml:"send_buffer_messages"`
 
 	// MaxBatchBytes is the maximum size of a single WebSocket frame payload in bytes.
-	// Default: 65536.
+	// Default: 4194304 (4 MiB). Set to 0 to disable the limit.
 	MaxBatchBytes int `yaml:"max_batch_bytes"`
 }
 
@@ -281,7 +281,7 @@ func (c *Config) ApplyDefaults() {
 		c.Federation.SendBufferMessages = 10_000
 	}
 	if c.Federation.MaxBatchBytes == 0 {
-		c.Federation.MaxBatchBytes = 65_536
+		c.Federation.MaxBatchBytes = 4 * 1024 * 1024 // 4 MiB
 	}
 
 	if c.Dedup.SeenIDLRUSize == 0 {

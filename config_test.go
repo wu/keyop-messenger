@@ -186,7 +186,7 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 60_000, c.Federation.ReconnectMaxMS)
 		assert.Equal(t, 0.2, c.Federation.ReconnectJitter)
 		assert.Equal(t, 10_000, c.Federation.SendBufferMessages)
-		assert.Equal(t, 65_536, c.Federation.MaxBatchBytes)
+		assert.Equal(t, 4*1024*1024, c.Federation.MaxBatchBytes)
 		assert.Equal(t, 100_000, c.Dedup.SeenIDLRUSize)
 		assert.Equal(t, 100, c.Audit.MaxSizeMB)
 		assert.Equal(t, 10, c.Audit.MaxFiles)

@@ -182,6 +182,9 @@ func (pr *PeerReceiver) run() {
 		records, err := ReadFrame(r, pr.maxBatchBytes)
 		if err != nil {
 			pr.log.Error("federation: receiver read frame", "peer", pr.peerName, "err", err)
+			pr.mu.Lock()
+			pr.stopErr = err
+			pr.mu.Unlock()
 			return
 		}
 

@@ -34,7 +34,7 @@ type EphemeralClientConfig struct {
 	// Subscribe is the list of channels to receive from the hub.
 	// Sent in the handshake; the hub may deliver a subset per its policy.
 	Subscribe []string
-	// MaxBatchBytes is the max WebSocket frame payload size. Default: 65536.
+	// MaxBatchBytes is the max WebSocket frame payload size. Default: 4194304 (4 MiB). Set to 0 to disable.
 	MaxBatchBytes int
 	// WriteQueueSize is the outbound buffer depth. Default: 256.
 	WriteQueueSize int
@@ -89,7 +89,7 @@ type ephemeralWriteItem struct {
 // ConnectWithReconnect to dial the hub.
 func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient {
 	if cfg.MaxBatchBytes == 0 {
-		cfg.MaxBatchBytes = 65536
+		cfg.MaxBatchBytes = 4 * 1024 * 1024 // 4 MiB
 	}
 	if cfg.WriteQueueSize == 0 {
 		cfg.WriteQueueSize = 256

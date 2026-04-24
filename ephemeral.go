@@ -40,7 +40,7 @@ type EphemeralConfig struct {
 	ReconnectMax time.Duration
 	// ReconnectJitter is the fractional backoff jitter (0–1). Default: 0.2.
 	ReconnectJitter float64
-	// MaxBatchBytes is the maximum WebSocket frame payload in bytes. Default: 65536.
+	// MaxBatchBytes is the maximum WebSocket frame payload in bytes. Default: 4194304 (4 MiB). Set to 0 to disable.
 	MaxBatchBytes int
 	// WriteQueueSize is the outbound buffer depth. Default: 256.
 	WriteQueueSize int
