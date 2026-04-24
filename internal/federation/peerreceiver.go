@@ -38,6 +38,7 @@ type PeerReceiver struct {
 
 	mu             sync.Mutex
 	lastReceivedID string // ID of the last envelope successfully acked; safe to read after Done()
+	stopErr        error  // non-nil error that caused the receiver to exit; safe to read after Done()
 
 	stop chan struct{}
 	done chan struct{}
@@ -119,6 +120,14 @@ func newPeerReceiverWithAck(
 // Done returns a channel closed when the receiver goroutine exits.
 func (pr *PeerReceiver) Done() <-chan struct{} { return pr.done }
 
+// Err returns the error that caused the receiver to exit, or nil for a clean
+// shutdown. Safe to call only after Done() has been closed.
+func (pr *PeerReceiver) Err() error {
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+	return pr.stopErr
+}
+
 // Close signals the receiver to stop and waits for exit.
 func (pr *PeerReceiver) Close() {
 	select {
@@ -143,6 +152,9 @@ func (pr *PeerReceiver) run() {
 			case <-pr.stop:
 			default:
 				pr.log.Error("federation: receiver read error", "peer", pr.peerName, "err", err)
+				pr.mu.Lock()
+				pr.stopErr = err
+				pr.mu.Unlock()
 			}
 			return
 		}

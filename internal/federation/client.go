@@ -149,6 +149,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 	go func() {
 		defer c.wg.Done()
 		backoff := c.reconnectBase
+		attempt := 0
 		for {
 			select {
 			case <-c.stop:
@@ -158,6 +159,14 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 
 			// Gather unacked outbound messages for replay to hub.
 			unacked := sender.Unacked()
+
+			// Audit the disconnect so the cause is visible in the log.
+			disconnDetail := fmt.Sprintf("unacked=%d", len(unacked))
+			_ = c.auditL.Log(audit.Event{
+				Event:    audit.EventPeerDisconnected,
+				PeerAddr: hubAddr,
+				Detail:   disconnDetail,
+			})
 
 			c.log.Warn("federation: client disconnected, reconnecting",
 				"hub", hubAddr, "unacked", len(unacked))
@@ -183,11 +192,17 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 					return
 				default:
 				}
+				attempt++
 				newSender, dialErr = c.dial(hubAddr)
 				if dialErr == nil {
 					break
 				}
-				c.log.Error("federation: client reconnect failed", "err", dialErr)
+				c.log.Error("federation: client reconnect failed", "err", dialErr, "attempt", attempt)
+				_ = c.auditL.Log(audit.Event{
+					Event:    audit.EventPeerConnected,
+					PeerAddr: hubAddr,
+					Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, dialErr.Error()),
+				})
 				backoff = minDuration(backoff*2, c.reconnectMax)
 				//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 				jitter = time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
@@ -208,6 +223,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			}
 
 			backoff = c.reconnectBase // reset on success
+			attempt = 0
 			sender = newSender
 		}
 	}()

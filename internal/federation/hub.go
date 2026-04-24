@@ -17,6 +17,18 @@ import (
 	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
+// connDetail builds a Detail string for audit events from connection metadata.
+func connDetail(peerAddr string, subChannels, pubChannels []string) string {
+	s := "addr=" + peerAddr
+	if len(subChannels) > 0 {
+		s += " sub=[" + strings.Join(subChannels, ",") + "]"
+	}
+	if len(pubChannels) > 0 {
+		s += " pub=[" + strings.Join(pubChannels, ",") + "]"
+	}
+	return s
+}
+
 // logger is a minimal logging interface used by federation components.
 type logger interface {
 	Debug(msg string, args ...any)
@@ -288,15 +300,23 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		connWriteMu: connWriteMu,
 	}
 
+	peerAddr := conn.RemoteAddr().String()
+	connectedAt := time.Now()
+
 	h.mu.Lock()
 	h.peers[peerName] = entry
 	h.mu.Unlock()
 
-	_ = h.auditL.Log(audit.Event{Event: audit.EventClientConnected, Peer: peerName})
+	_ = h.auditL.Log(audit.Event{
+		Event:    audit.EventClientConnected,
+		Peer:     peerName,
+		PeerAddr: peerAddr,
+		Detail:   connDetail(peerAddr, subChannels, pubChannels),
+	})
 	if hs.Ephemeral {
-		h.log.Info("federation: hub accepted ephemeral connection", "peer", peerName)
+		h.log.Info("federation: hub accepted ephemeral connection", "peer", peerName, "addr", peerAddr)
 	} else {
-		h.log.Info("federation: hub accepted connection", "peer", peerName)
+		h.log.Info("federation: hub accepted connection", "peer", peerName, "addr", peerAddr)
 	}
 
 	// Wait for receiver to finish, then clean up.
@@ -328,7 +348,17 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		delete(h.peers, peerName)
 		h.mu.Unlock()
 
-		_ = h.auditL.Log(audit.Event{Event: audit.EventPeerDisconnected, Peer: peerName})
+		duration := time.Since(connectedAt).Round(time.Millisecond)
+		detail := "duration=" + duration.String()
+		if err := receiver.Err(); err != nil {
+			detail += " err=" + err.Error()
+		}
+		_ = h.auditL.Log(audit.Event{
+			Event:    audit.EventPeerDisconnected,
+			Peer:     peerName,
+			PeerAddr: peerAddr,
+			Detail:   detail,
+		})
 	}()
 }
 
