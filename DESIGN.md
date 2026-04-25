@@ -342,20 +342,7 @@ The `publish` allowlist is an inbound filter: if a peer sends a message on a cha
 
 Forwarding is independent of whether any local subscriber currently exists for the channel. Messages are written to the local `.jsonl` file regardless of local subscriber presence.
 
-### 6.6 Policy Hot-Reload
-
-The hub watches its configuration file using `fsnotify`. When the file changes:
-
-1. The new configuration is parsed and validated. If invalid, the reload is aborted and an error is logged; the existing policy remains active.
-2. For each existing peer connection, the effective channel sets are recomputed as `stored_subscribe ∩ new_subscribe_allowlist` and swapped atomically. This means admin changes to `subscribe` or `publish` allowlists take effect immediately for in-flight connections without requiring reconnection. If the new allowlist removes a channel that a peer subscribed to, the hub stops sending that channel to that peer immediately.
-3. Peers whose names have been removed from the allowlist have their connections drained gracefully before closing.
-4. Peer allowlist additions take effect immediately for new connections. Removals allow existing connections to drain before closing — no in-progress delivery is interrupted.
-
-**Note on allowlist expansion:** If an admin adds new channels to a peer's subscribe allowlist after the peer has already connected, the peer will not automatically receive those new channels — it can only receive channels it originally subscribed to at connect time. The peer must reconnect and include the new channels in its `subscribe` list to pick them up.
-
-Policy reload does not restart the hub, drop existing connections mid-message, or interrupt local message delivery. A `policy_reloaded` event is written to the audit log on every successful reload.
-
-### 6.7 Message Deduplication
+### 6.6 Message Deduplication
 
 Every instance (hub and client alike) maintains an in-memory LRU set of recently-seen message IDs. The set holds the last 100,000 IDs (configurable). TTL-based expiry is not used; the LRU eviction bound is sufficient for the expected message rates.
 
@@ -379,7 +366,7 @@ Practical scenarios the dedup handles today:
 - A publisher's own message arrives back via a federated receive path (self-loop prevention)
 - Reconnect replay delivering messages already written in a previous session
 
-### 6.8 Hub-Side File-Reader Delivery and Reconnection
+### 6.7 Hub-Side File-Reader Delivery and Reconnection
 
 The hub delivers messages to subscribed peers using a **file-reader pull model**, mirroring the local subscriber delivery path:
 

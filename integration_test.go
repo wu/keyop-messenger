@@ -248,8 +248,6 @@ func TestIntegrationRingDedup(t *testing.T) {
 		"Hub2 should receive the message exactly once despite dual forwarding paths (dedup)")
 }
 
-// ---- TestIntegrationPolicyHotReload -----------------------------------------
-
 // ---- TestIntegrationBackpressure --------------------------------------------
 
 // TestIntegrationBackpressure verifies at-least-once delivery when the receiving
