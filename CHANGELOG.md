@@ -1,3 +1,10 @@
+## [0.14.1](https://github.com/wu/keyop-messenger/compare/v0.14.0...v0.14.1) (2026-04-26)
+
+### Refactoring
+
+* clean up lint warnings ([7d24d5b](https://github.com/wu/keyop-messenger/commit/7d24d5bae2e0de85605f1d98d7a8814d05a7fc75))
+* remove 'hot reload' section from docs ([3076528](https://github.com/wu/keyop-messenger/commit/307652846d14d7fed693912ad86e61fbc0b06940))
+
 ## [0.14.0](https://github.com/wu/keyop-messenger/compare/v0.13.0...v0.14.0) (2026-04-24)
 
 ### Features
