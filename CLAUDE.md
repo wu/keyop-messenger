@@ -50,16 +50,16 @@ Keyop Messenger is a Go pub-sub library with:
 
 ## Key Packages
 
-| Package | Role |
-|---|---|
+| Package                         | Role                                                             |
+|---------------------------------|------------------------------------------------------------------|
 | `github.com/wu/keyop-messenger` | Public API (`Messenger`, `New`, `Publish`, `Subscribe`, `Close`) |
-| `internal/storage` | Writer goroutine, subscriber goroutine, offset files, compaction |
-| `internal/federation` | Hub, Client, PeerSender, PeerReceiver, policy hot-reload |
-| `internal/envelope` | Envelope struct, marshal/unmarshal, payload registry |
-| `internal/tlsutil` | TLS config builder, cert generation, expiry checks |
-| `internal/audit` | Audit writer with rotation |
-| `internal/dedup` | LRU seen-ID deduplication |
-| `cmd/keyop-messenger` | CLI entry point (`keygen ca`, `keygen instance`, `version`) |
+| `internal/storage`              | Writer goroutine, subscriber goroutine, offset files, compaction |
+| `internal/federation`           | Hub, Client, PeerSender, PeerReceiver                            |
+| `internal/envelope`             | Envelope struct, marshal/unmarshal, payload registry             |
+| `internal/tlsutil`              | TLS config builder, cert generation, expiry checks               |
+| `internal/audit`                | Audit writer with rotation                                       |
+| `internal/dedup`                | LRU seen-ID deduplication                                        |
+| `cmd/keyop-messenger`           | CLI entry point (`keygen ca`, `keygen instance`, `version`)      |
 
 ---
 
