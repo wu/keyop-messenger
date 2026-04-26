@@ -15,18 +15,11 @@ import (
 	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
-// makeSendCh returns a bidirectional chan sendReq to pass into newChannelReader
-// (which accepts a chan<- sendReq) while keeping the read end for tests.
-func makeSendCh(n int) (chan<- sendReq, <-chan sendReq) {
-	ch := make(chan sendReq, n)
-	return ch, ch
-}
-
 // writeTestSegment writes JSONL envelopes to a segment file in channelDir and
 // returns the raw bytes written (including trailing newlines).
 func writeTestSegment(t *testing.T, channelDir string, startOffset int64, envs []envelope.Envelope) []byte {
 	t.Helper()
-	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
 	name := fmt.Sprintf("%020d.jsonl", startOffset)
 	path := filepath.Join(channelDir, name)
 	var data []byte
@@ -36,7 +29,7 @@ func writeTestSegment(t *testing.T, channelDir string, startOffset int64, envs [
 		data = append(data, b...)
 		data = append(data, '\n')
 	}
-	require.NoError(t, os.WriteFile(path, data, 0o644))
+	require.NoError(t, os.WriteFile(path, data, 0o600))
 	return data
 }
 
@@ -227,8 +220,8 @@ func TestChannelReader_ResumeFromOffset(t *testing.T) {
 	channelDir := filepath.Join(dir, "channels", "resume")
 	offsetDir := filepath.Join(dir, "subscribers", "resume")
 	log := &testutil.FakeLogger{}
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
-	require.NoError(t, os.MkdirAll(channelDir, 0o755))
+	require.NoError(t, os.MkdirAll(offsetDir, 0o750))
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
 
 	// Write 3 messages.
 	env1 := makeEnvelope(t, "resume", "m1")
@@ -348,8 +341,8 @@ func TestListChannelSegments_Empty(t *testing.T) {
 func TestListChannelSegments_IgnoresNonSegmentFiles(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.txt"), []byte("hi"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "00000000000000000000.jsonl"), []byte{}, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.txt"), []byte("hi"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "00000000000000000000.jsonl"), []byte{}, 0o600))
 
 	segs, err := listChannelSegments(dir)
 	assert.NoError(t, err)

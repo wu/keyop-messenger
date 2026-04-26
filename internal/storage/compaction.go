@@ -99,7 +99,7 @@ func (c *Compactor) fedMinOffset() (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("read offset dir for fed offsets: %w", err)
 	}
-	min := int64(math.MaxInt64)
+	minOffset := int64(math.MaxInt64)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasPrefix(e.Name(), "fed-") || !strings.HasSuffix(e.Name(), ".offset") {
 			continue
@@ -108,11 +108,11 @@ func (c *Compactor) fedMinOffset() (int64, error) {
 		if err != nil {
 			return 0, fmt.Errorf("read fed offset %q: %w", e.Name(), err)
 		}
-		if off < min {
-			min = off
+		if off < minOffset {
+			minOffset = off
 		}
 	}
-	return min, nil
+	return minOffset, nil
 }
 
 // MaybeCompact deletes any sealed segment files in channelDir whose contents

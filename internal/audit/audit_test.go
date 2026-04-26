@@ -386,7 +386,7 @@ func TestRotationHandlesNonexistentFiles(t *testing.T) {
 
 	// Verify at least one rotation occurred.
 	rotated := filepath.Join(dir, "audit.jsonl.1")
-	_, err = os.Stat(rotated)
 	// Either the file exists or rotation handling was graceful enough to continue.
 	// The test passes as long as no panic occurred.
+	_, _ = os.Stat(rotated)
 }

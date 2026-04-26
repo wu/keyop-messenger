@@ -1,3 +1,4 @@
+// Package main provides example host1 that publishes messages.
 package main
 
 import (
@@ -40,7 +41,11 @@ func host1(ctx context.Context, logger *slog.Logger, baseDir string) {
 	if err != nil {
 		panic(err)
 	}
-	defer m.Close()
+	defer func() {
+		if err := m.Close(); err != nil {
+			logger.Error("failed to close messenger", "error", err)
+		}
+	}()
 
 	// Register payload types for typed decoding.
 	if err := m.RegisterPayloadType("com.example.Alert", Alert{}); err != nil {

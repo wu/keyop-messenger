@@ -1,3 +1,4 @@
+// Package main provides example host2 that subscribes to messages.
 package main
 
 import (
@@ -44,7 +45,11 @@ func host2(ctx context.Context, logger *slog.Logger, baseDir string) {
 		panic(err)
 	}
 	logger.Info("host2: messenger created successfully")
-	defer m.Close()
+	defer func() {
+		if err := m.Close(); err != nil {
+			logger.Error("failed to close messenger", "error", err)
+		}
+	}()
 
 	// Register payload types for typed decoding.
 	if err := m.RegisterPayloadType("com.example.Alert", Alert{}); err != nil {
@@ -54,7 +59,7 @@ func host2(ctx context.Context, logger *slog.Logger, baseDir string) {
 
 	// Subscribe before publishing so the handler sees the message.
 	logger.Info("host2: subscribing to alerts topic on worker-1")
-	if err := m.Subscribe(ctx, "alerts", "worker-1", func(ctx context.Context, msg messenger.Message) error {
+	if err := m.Subscribe(ctx, "alerts", "worker-1", func(_ context.Context, msg messenger.Message) error {
 		a, ok := msg.Payload.(Alert)
 		if !ok {
 			logger.Error("failed to cast payload to Alert")

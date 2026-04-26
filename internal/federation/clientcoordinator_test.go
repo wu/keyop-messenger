@@ -50,7 +50,11 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	var serverMu sync.Mutex
 
 	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Logf("failed to close connection: %v", err)
+			}
+		}()
 		for {
 			msgType, _, err := conn.NextReader()
 			if err != nil {
@@ -114,7 +118,11 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	received := make(chan []byte, 16)
 
 	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Logf("failed to close connection: %v", err)
+			}
+		}()
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
@@ -188,7 +196,11 @@ func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	ackCh := make(chan AckMsg, 4)
 
 	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Logf("failed to close connection: %v", err)
+			}
+		}()
 		time.Sleep(200 * time.Millisecond)
 	})
 
@@ -209,7 +221,11 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	ackCh := make(chan AckMsg, 4)
 
 	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Logf("failed to close connection: %v", err)
+			}
+		}()
 		time.Sleep(500 * time.Millisecond)
 	})
 
@@ -261,14 +277,20 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	ackCh := make(chan AckMsg, 4)
 
 	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer conn.Close()
+		defer func() {
+			if err := conn.Close(); err != nil {
+				t.Logf("failed to close connection: %v", err)
+			}
+		}()
 		for {
 			msgType, _, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
 			if msgType == websocket.BinaryMessage {
-				_ = conn.WriteJSON(AckMsg{LastID: "ok"})
+				if err := conn.WriteJSON(AckMsg{LastID: "ok"}); err != nil {
+					t.Logf("failed to write ack: %v", err)
+				}
 			}
 		}
 	})

@@ -46,6 +46,8 @@ func main() {
 	wg.Wait()
 
 	logger.Warn("removing temp directory", "path", baseDir)
+	// G703: baseDir is controlled via environment variable for testing purposes
+	// #nosec G703
 	if err := os.RemoveAll(baseDir); err != nil {
 		slog.Error("failed to remove temp directory", "error", err)
 	}

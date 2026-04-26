@@ -1,24 +1,8 @@
-// Package servicename provides context helpers for stamping service names on messages.
+// Package messenger is a Go pub-sub library with persistent message storage, federation,
+// and at-least-once delivery semantics.
 //
-// Service names identify which service published a message. They are useful for
-// debugging and log triage, allowing operators to quickly identify the source of
-// a message even when multiple services publish to the same channel on the same instance.
-//
-// Set a service name in context before publishing, and it will be automatically
-// stamped on the envelope and delivered to subscribers:
-//
-//	ctx := messenger.WithServiceName(context.Background(), "payment-processor")
-//	messenger.Publish(ctx, "payments", "event.type", payload)
-//
-// Subscribers receive the service name in the Message:
-//
-//	messenger.Subscribe(ctx, "payments", "sub-id", func(ctx context.Context, msg Message) error {
-//	    slog.Info("message", "service", msg.ServiceName)
-//	    return nil
-//	})
-//
-// Service names are preserved across hub forwarding, making them available for
-// tracing in distributed message flows.
+// See the servicename subpackage documentation for context helpers that stamp service names on messages.
+// Service names identify which service published a message and are useful for debugging and log triage.
 package messenger
 
 import "context"
