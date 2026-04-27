@@ -29,6 +29,8 @@ Unlike memory-based message brokers, Keyop Messenger treats the filesystem as th
 
 ## Quick Start
 
+See: https://blog.geekfarm.org/introducing-keyop-messenger.html
+
 ### Installation
 
 ```bash
