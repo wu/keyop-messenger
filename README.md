@@ -6,7 +6,10 @@ Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is 
 
 NOTE: This is still Beta, but the API should now be relatively stable.
 
-See also:  [DESIGN.md](./DESIGN.md) for detailed design rationale and architecture.
+## See Also
+
+  * [DESIGN.md](./DESIGN.md) for detailed design rationale and architecture.
+  * [Quick Start](https://blog.geekfarm.org/introducing-keyop-messenger.html)
 
 ## Key Features
 
@@ -27,9 +30,6 @@ Unlike memory-based message brokers, Keyop Messenger treats the filesystem as th
 2. **Transparent**: Debugging a stuck subscriber is as simple as `cat subscriber.offset`.
 3. **Low-Overhead**: No separate broker process is required for local-only messaging.
 
-## Quick Start
-
-See: https://blog.geekfarm.org/introducing-keyop-messenger.html
 
 ### Installation
 
