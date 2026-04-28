@@ -20,8 +20,7 @@ func testConfig(dataDir string) *Config {
 	cfg := &Config{
 		Name: "test-instance",
 		Storage: StorageConfig{
-			DataDir:    dataDir,
-			SyncPolicy: SyncPolicyNone,
+			DataDir: dataDir,
 		},
 	}
 	cfg.ApplyDefaults()
@@ -177,8 +176,7 @@ func TestFederationEndToEnd(t *testing.T) {
 	hubCfg := &Config{
 		Name: "test-hub",
 		Storage: StorageConfig{
-			DataDir:    hubDir,
-			SyncPolicy: SyncPolicyNone,
+			DataDir: hubDir,
 		},
 		Hub: HubConfig{
 			Enabled:      true,
@@ -210,8 +208,7 @@ func TestFederationEndToEnd(t *testing.T) {
 	clientCfg := &Config{
 		Name: "test-client",
 		Storage: StorageConfig{
-			DataDir:    clientDir,
-			SyncPolicy: SyncPolicyNone,
+			DataDir: clientDir,
 		},
 		Client: ClientConfig{
 			Enabled: true,
@@ -422,8 +419,7 @@ func TestInstanceNameDefault(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &Config{
 		Storage: StorageConfig{
-			DataDir:    dir,
-			SyncPolicy: SyncPolicyNone,
+			DataDir: dir,
 		},
 	}
 	cfg.ApplyDefaults()

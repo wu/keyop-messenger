@@ -53,8 +53,7 @@ func TestMessenger_Client_PublishAllowlist(t *testing.T) {
 	clientCfg := &Config{
 		Name: "restricted-client",
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(tmpDir, "restricted-client"),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(tmpDir, "restricted-client"),
 		},
 		Client: ClientConfig{
 			Enabled: true,
@@ -168,8 +167,7 @@ func TestMessenger_Client_ReceiveAllowlist(t *testing.T) {
 	clientCfg := &Config{
 		Name: "restricted-client",
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(tmpDir, "restricted-client"),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(tmpDir, "restricted-client"),
 		},
 		Client: ClientConfig{
 			Enabled: true,

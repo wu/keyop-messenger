@@ -13,12 +13,12 @@ import (
 )
 
 // BenchmarkPublishThroughput measures the sustained write rate for Publish on a
-// single channel with no subscribers and no federation (SyncPolicyNone).
+// single channel with no subscribers and no federation.
 func BenchmarkPublishThroughput(b *testing.B) {
 	dir := b.TempDir()
 	cfg := &Config{
 		Name:    "bench",
-		Storage: StorageConfig{DataDir: dir, SyncPolicy: SyncPolicyNone},
+		Storage: StorageConfig{DataDir: dir},
 	}
 	cfg.ApplyDefaults()
 	m, err := New(cfg)
@@ -43,7 +43,7 @@ func BenchmarkSubscribeLatency(b *testing.B) {
 	dir := b.TempDir()
 	cfg := &Config{
 		Name:    "bench",
-		Storage: StorageConfig{DataDir: dir, SyncPolicy: SyncPolicyNone},
+		Storage: StorageConfig{DataDir: dir},
 	}
 	cfg.ApplyDefaults()
 	m, err := New(cfg)
@@ -97,8 +97,7 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 	hubCfg := &Config{
 		Name: "bench-hub",
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, "hub"),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(dir, "hub"),
 		},
 		Hub: HubConfig{
 			Enabled:      true,
@@ -122,8 +121,7 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 	clientCfg := &Config{
 		Name: "bench-client",
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, "client"),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(dir, "client"),
 		},
 		Client: ClientConfig{
 			Enabled: true,

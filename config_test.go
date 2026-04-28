@@ -50,17 +50,9 @@ func TestValidate_Errors(t *testing.T) {
 			wantMsg: "storage.data_dir is required",
 		},
 		{
-			name:    "invalid sync_policy",
-			mutate:  func(c *Config) { c.Storage.SyncPolicy = "turbo" },
-			wantMsg: `storage.sync_policy "turbo" is invalid`,
-		},
-		{
-			name: "zero sync_interval_ms with periodic policy",
-			mutate: func(c *Config) {
-				c.Storage.SyncPolicy = SyncPolicyPeriodic
-				c.Storage.SyncIntervalMS = 0
-			},
-			wantMsg: "storage.sync_interval_ms must be positive",
+			name:    "negative sync_interval_ms",
+			mutate:  func(c *Config) { c.Storage.SyncIntervalMS = -1 },
+			wantMsg: "storage.sync_interval_ms must be non-negative",
 		},
 		{
 			name:    "negative max_retries",
@@ -174,8 +166,7 @@ func TestApplyDefaults(t *testing.T) {
 		var c Config
 		c.ApplyDefaults()
 
-		assert.Equal(t, SyncPolicyPeriodic, c.Storage.SyncPolicy)
-		assert.Equal(t, 200, c.Storage.SyncIntervalMS)
+		assert.Equal(t, 0, c.Storage.SyncIntervalMS)
 		assert.Equal(t, 512, c.Storage.MaxSubscriberLagMB)
 		assert.Equal(t, 256, c.Storage.CompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
@@ -195,7 +186,6 @@ func TestApplyDefaults(t *testing.T) {
 	t.Run("explicit values are not overwritten", func(t *testing.T) {
 		c := Config{
 			Storage: StorageConfig{
-				SyncPolicy:            SyncPolicyAlways,
 				SyncIntervalMS:        999,
 				MaxSubscriberLagMB:    1024,
 				CompactionThresholdMB: 512,
@@ -214,7 +204,6 @@ func TestApplyDefaults(t *testing.T) {
 		}
 		c.ApplyDefaults()
 
-		assert.Equal(t, SyncPolicyAlways, c.Storage.SyncPolicy)
 		assert.Equal(t, 999, c.Storage.SyncIntervalMS)
 		assert.Equal(t, 1024, c.Storage.MaxSubscriberLagMB)
 		assert.Equal(t, 512, c.Storage.CompactionThresholdMB)
@@ -261,7 +250,6 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 name: billing-host
 storage:
   data_dir: /var/keyop
-  sync_policy: always
   sync_interval_ms: 500
   max_subscriber_lag_mb: 1024
   compaction_threshold_mb: 512
@@ -308,7 +296,6 @@ audit:
 
 	assert.Equal(t, "billing-host", cfg.Name)
 	assert.Equal(t, "/var/keyop", cfg.Storage.DataDir)
-	assert.Equal(t, SyncPolicyAlways, cfg.Storage.SyncPolicy)
 	assert.Equal(t, 500, cfg.Storage.SyncIntervalMS)
 	assert.Equal(t, 1024, cfg.Storage.MaxSubscriberLagMB)
 	assert.Equal(t, 512, cfg.Storage.CompactionThresholdMB)
@@ -381,8 +368,7 @@ func TestLoadConfig_ValidationFailure(t *testing.T) {
 	// data_dir is absent; defaults will not supply it.
 	const yaml = `
 name: test-host
-storage:
-  sync_policy: periodic
+storage: {}
 `
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(yaml), 0600))

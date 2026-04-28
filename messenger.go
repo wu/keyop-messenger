@@ -301,7 +301,7 @@ func (m *Messenger) RegisterPayloadType(typeStr string, prototype any) error {
 
 // Publish creates an envelope for payload, writes it to channel's storage
 // file, notifies local subscribers, and enqueues it for any configured peer
-// senders. Publish blocks until the write is confirmed (per sync_policy).
+// senders. Publish blocks until the write is confirmed (per sync_interval_ms).
 func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, payload any) error {
 	if err := ValidateChannelName(channel); err != nil {
 		return err
@@ -579,8 +579,7 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 	cs.writer, err = storage.NewChannelWriter(
 		m.channelDir(channel),
 		int64(m.cfg.Storage.CompactionThresholdMB)*1024*1024,
-		storage.SyncPolicy(m.cfg.Storage.SyncPolicy),
-		time.Duration(m.cfg.Storage.SyncIntervalMS)*time.Millisecond,
+		m.cfg.Storage.SyncIntervalMS,
 		notifyFn,
 		m.log,
 	)

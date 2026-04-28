@@ -190,7 +190,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 
 	// Create two sealed segments and one active via a real writer with rolling.
 	const maxSeg = 300
-	writer, err := NewChannelWriter(channelDir, maxSeg, SyncPolicyNone, 0, nil, nil)
+	writer, err := NewChannelWriter(channelDir, maxSeg, 0, nil, nil)
 	require.NoError(t, err)
 
 	for i := 0; i < 15; i++ {

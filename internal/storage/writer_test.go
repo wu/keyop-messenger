@@ -84,11 +84,12 @@ func makeTestEnvelope(t *testing.T, orderID string) *envelope.Envelope {
 
 // newFakeWriter creates a channelWriter backed by a single fakeFile.
 // maxSegmentBytes=0 disables rolling (all writes go to the same fake file).
-func newFakeWriter(policy SyncPolicy, syncInterval time.Duration, notifyFn func()) (*channelWriter, *fakeFile, *testutil.FakeLogger) {
+// syncIntervalMS: 0 syncs after every write, > 0 syncs periodically.
+func newFakeWriter(syncIntervalMS int, notifyFn func()) (*channelWriter, *fakeFile, *testutil.FakeLogger) {
 	f := &fakeFile{}
 	log := &testutil.FakeLogger{}
 	sf := &fakeSegmentFactory{f: f}
-	w := newChannelWriterWithFactory("", 0, sf, policy, syncInterval, notifyFn, log)
+	w := newChannelWriterWithFactory("", 0, sf, syncIntervalMS, notifyFn, log)
 	return w, f, log
 }
 
@@ -115,7 +116,7 @@ func readAllSegments(t *testing.T, channelDir string) []string {
 // ---- tests ------------------------------------------------------------------
 
 func TestWriter_Sequential(t *testing.T) {
-	w, f, _ := newFakeWriter(SyncPolicyNone, 0, nil)
+	w, f, _ := newFakeWriter(1000000, nil)
 	const n = 1000
 	for i := 0; i < n; i++ {
 		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
@@ -131,7 +132,7 @@ func TestWriter_Sequential(t *testing.T) {
 }
 
 func TestWriter_Concurrent(t *testing.T) {
-	w, f, _ := newFakeWriter(SyncPolicyNone, 0, nil)
+	w, f, _ := newFakeWriter(1000000, nil)
 	const goroutines = 50
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
@@ -152,38 +153,38 @@ func TestWriter_Concurrent(t *testing.T) {
 	}
 }
 
-func TestWriter_SyncPolicyAlways(t *testing.T) {
-	w, f, _ := newFakeWriter(SyncPolicyAlways, 0, nil)
+func TestWriter_SyncAlwaysWhenZero(t *testing.T) {
+	w, f, _ := newFakeWriter(0, nil)
 	const n = 10
 	for i := 0; i < n; i++ {
 		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
 	}
 	require.NoError(t, w.Close())
-	assert.Equal(t, int64(n), f.syncCount.Load(), "SyncPolicyAlways must Sync once per write")
+	assert.Equal(t, int64(n), f.syncCount.Load(), "syncIntervalMS=0 must Sync once per write")
 }
 
-func TestWriter_SyncPolicyPeriodic(t *testing.T) {
-	const interval = 50 * time.Millisecond
-	w, f, _ := newFakeWriter(SyncPolicyPeriodic, interval, nil)
+func TestWriter_SyncPeriodic(t *testing.T) {
+	const intervalMS = 50
+	w, f, _ := newFakeWriter(intervalMS, nil)
 	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
-	assert.Zero(t, f.syncCount.Load(), "SyncPolicyPeriodic must not Sync on each write")
-	time.Sleep(3 * interval)
-	assert.GreaterOrEqual(t, f.syncCount.Load(), int64(1), "SyncPolicyPeriodic must Sync on tick")
+	assert.Zero(t, f.syncCount.Load(), "syncIntervalMS>0 must not Sync on each write")
+	time.Sleep(3 * time.Duration(intervalMS) * time.Millisecond)
+	assert.GreaterOrEqual(t, f.syncCount.Load(), int64(1), "syncIntervalMS>0 must Sync on tick")
 	require.NoError(t, w.Close())
 }
 
-func TestWriter_SyncPolicyNone_NoSync(t *testing.T) {
-	w, f, _ := newFakeWriter(SyncPolicyNone, 0, nil)
+func TestWriter_PeriodicNoSyncWithoutInterval(t *testing.T) {
+	w, f, _ := newFakeWriter(1000000, nil)
 	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
 	require.NoError(t, w.Close())
-	assert.Zero(t, f.syncCount.Load(), "SyncPolicyNone must never Sync")
+	assert.Zero(t, f.syncCount.Load(), "periodic sync without waiting for interval must not Sync")
 }
 
 func TestWriter_Backpressure(t *testing.T) {
 	const failFirst = 5
 	ff := &fakeFile{failFirst: failFirst}
 	sf := &fakeSegmentFactory{f: ff}
-	w := newChannelWriterWithFactory("", 0, sf, SyncPolicyNone, 0, nil, nil)
+	w := newChannelWriterWithFactory("", 0, sf, 1000000, nil, nil)
 	require.NoError(t, w.Write(makeTestEnvelope(t, "ord-1")))
 	require.NoError(t, w.Close())
 
@@ -196,7 +197,7 @@ func TestWriter_Backpressure(t *testing.T) {
 
 func TestWriter_NotifyFn(t *testing.T) {
 	var calls atomic.Int64
-	w, _, _ := newFakeWriter(SyncPolicyNone, 0, func() { calls.Add(1) })
+	w, _, _ := newFakeWriter(1000000, func() { calls.Add(1) })
 	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
 	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
 	require.NoError(t, w.Close())
@@ -204,20 +205,20 @@ func TestWriter_NotifyFn(t *testing.T) {
 }
 
 func TestWriter_Close_SubsequentWriteErrors(t *testing.T) {
-	w, _, _ := newFakeWriter(SyncPolicyNone, 0, nil)
+	w, _, _ := newFakeWriter(1000000, nil)
 	require.NoError(t, w.Close())
 	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
 }
 
 func TestWriter_Close_Idempotent(t *testing.T) {
-	w, _, _ := newFakeWriter(SyncPolicyNone, 0, nil)
+	w, _, _ := newFakeWriter(1000000, nil)
 	assert.NoError(t, w.Close())
 	assert.NoError(t, w.Close())
 }
 
 func TestWriter_RealFile(t *testing.T) {
 	channelDir := filepath.Join(t.TempDir(), "orders")
-	w, err := NewChannelWriter(channelDir, 0, SyncPolicyNone, 0, nil, nil)
+	w, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
 	require.NoError(t, err)
 
 	const n = 100
@@ -236,7 +237,7 @@ func TestWriter_RealFile(t *testing.T) {
 
 func TestWriter_RealFile_Concurrent(t *testing.T) {
 	channelDir := filepath.Join(t.TempDir(), "orders")
-	w, err := NewChannelWriter(channelDir, 0, SyncPolicyNone, 0, nil, nil)
+	w, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
 	require.NoError(t, err)
 
 	const goroutines = 50
@@ -266,7 +267,7 @@ func TestWriter_SegmentRolling(t *testing.T) {
 
 	// Small segment limit so a few writes trigger a roll.
 	const maxSeg = 200
-	w, err := NewChannelWriter(channelDir, maxSeg, SyncPolicyNone, 0, nil, nil)
+	w, err := NewChannelWriter(channelDir, maxSeg, 1000000, nil, nil)
 	require.NoError(t, err)
 
 	const n = 20

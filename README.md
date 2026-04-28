@@ -90,6 +90,25 @@ func main() {
 }
 ```
 
+### Trading Durability for Speed
+
+By default, the system performs an fsync after every publish and subscriber offset update. This ensures maximum durability but limits throughput as volume grows.
+
+To increase performance, you can set periodic sync intervals:
+
+  * SyncIntervalMS (Publishing): A non-zero value flushes channel log files periodically. Setting this to a non-zero value introduces a risk of message loss if the system crashes before the sync occurs.
+  * OffsetFlushIntervalMS (Subscribing): A non-zero value flushes client offset files periodically. If a crash occurs before the sync, some messages may be redelivered upon restart.
+
+Changing these values from 0 to 200ms can result in a 50x to 100x increase in throughput.
+
+```go
+	cfg := &messenger.Config{
+		Storage: messenger.StorageConfig{
+			SyncIntervalMS: 200,
+			OffsetFlushIntervalMS: 200, 
+			...
+```
+
 ### Correlation IDs
 
 Correlation IDs track related messages across multi-step processes. Set a correlation ID via context before publishing, and it will be stamped on the envelope and delivered to subscribers. Useful for tracing a request through multiple services.

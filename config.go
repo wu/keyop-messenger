@@ -24,36 +24,15 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-// SyncPolicy controls when channel file writes are flushed to stable storage.
-type SyncPolicy string
-
-const (
-	// SyncPolicyNone lets the OS flush at its own discretion.
-	// Publish() returns after write() succeeds. Fastest; data in OS page cache only.
-	SyncPolicyNone SyncPolicy = "none"
-
-	// SyncPolicyPeriodic flushes via a background fsync ticker.
-	// Publish() returns after write() succeeds; fsync runs on a separate timer.
-	// Durable against application crashes; not against OS crashes between intervals.
-	SyncPolicyPeriodic SyncPolicy = "periodic"
-
-	// SyncPolicyAlways fsyncs after every write before Publish() returns.
-	// Slowest; durable against OS crashes and power failure.
-	SyncPolicyAlways SyncPolicy = "always"
-)
-
 // StorageConfig controls the on-disk message store.
 type StorageConfig struct {
 	// DataDir is the root directory for channel files, subscriber offsets, and the audit log.
 	// Required.
 	DataDir string `yaml:"data_dir"`
 
-	// SyncPolicy controls when writes are flushed to stable storage.
-	// Default: "periodic".
-	SyncPolicy SyncPolicy `yaml:"sync_policy"`
-
-	// SyncIntervalMS is the fsync interval in milliseconds when SyncPolicy is "periodic".
-	// Default: 200.
+	// SyncIntervalMS controls when writes are flushed to stable storage.
+	// 0 fsyncs after every write (default, strictest durability, slowest).
+	// > 0 fsyncs periodically at this interval in milliseconds (batched, faster).
 	SyncIntervalMS int `yaml:"sync_interval_ms"`
 
 	// MaxSubscriberLagMB triggers a warning log when a subscriber's unread backlog
@@ -243,12 +222,6 @@ func (c *Config) ApplyDefaults() {
 		}
 	}
 
-	if c.Storage.SyncPolicy == "" {
-		c.Storage.SyncPolicy = SyncPolicyPeriodic
-	}
-	if c.Storage.SyncIntervalMS == 0 {
-		c.Storage.SyncIntervalMS = 200
-	}
 	if c.Storage.MaxSubscriberLagMB == 0 {
 		c.Storage.MaxSubscriberLagMB = 512
 	}
@@ -331,18 +304,8 @@ func (c *Config) Validate() error {
 		errs = append(errs, errors.New("storage.data_dir is required"))
 	}
 
-	switch c.Storage.SyncPolicy {
-	case SyncPolicyNone, SyncPolicyPeriodic, SyncPolicyAlways:
-		// valid
-	default:
-		errs = append(errs, fmt.Errorf(
-			"storage.sync_policy %q is invalid: must be %q, %q, or %q",
-			c.Storage.SyncPolicy, SyncPolicyNone, SyncPolicyPeriodic, SyncPolicyAlways,
-		))
-	}
-
-	if c.Storage.SyncPolicy == SyncPolicyPeriodic && c.Storage.SyncIntervalMS <= 0 {
-		errs = append(errs, errors.New("storage.sync_interval_ms must be positive when sync_policy is \"periodic\""))
+	if c.Storage.SyncIntervalMS < 0 {
+		errs = append(errs, errors.New("storage.sync_interval_ms must be non-negative"))
 	}
 
 	if c.Subscribers.MaxRetries != nil && *c.Subscribers.MaxRetries < 0 {

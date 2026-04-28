@@ -13,16 +13,6 @@ import (
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
-// SyncPolicy controls when channel file writes are flushed to stable storage.
-type SyncPolicy string
-
-// SyncPolicy constants.
-const (
-	SyncPolicyNone     SyncPolicy = "none"
-	SyncPolicyPeriodic SyncPolicy = "periodic"
-	SyncPolicyAlways   SyncPolicy = "always"
-)
-
 // ChannelWriter appends envelopes to a channel's segment files.
 // Write blocks until confirmed (rendezvous — no in-memory queue).
 type ChannelWriter interface {
@@ -81,20 +71,21 @@ type channelWriter struct {
 
 // NewChannelWriter creates channelDir if needed and starts the writer goroutine.
 // maxSegmentBytes controls when the writer rolls to a new segment file; 0 means
-// never roll (all data goes into one segment). notifyFn is called after each
-// successful write; it may be nil. log may be nil.
+// never roll (all data goes into one segment). syncIntervalMS controls fsync behavior:
+// 0 syncs after every write (strictest), > 0 syncs periodically at that interval.
+// notifyFn is called after each successful write; it may be nil. log may be nil.
 //
 //nolint:revive // unexported-return is acceptable for unexported implementation of exported interface
-func NewChannelWriter(channelDir string, maxSegmentBytes int64, policy SyncPolicy, syncInterval time.Duration, notifyFn func(), log logger) (*channelWriter, error) {
+func NewChannelWriter(channelDir string, maxSegmentBytes int64, syncIntervalMS int, notifyFn func(), log logger) (*channelWriter, error) {
 	if err := os.MkdirAll(channelDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create channel directory %q: %w", channelDir, err)
 	}
-	return newChannelWriterWithFactory(channelDir, maxSegmentBytes, osSegmentFactory{}, policy, syncInterval, notifyFn, log), nil
+	return newChannelWriterWithFactory(channelDir, maxSegmentBytes, osSegmentFactory{}, syncIntervalMS, notifyFn, log), nil
 }
 
 // newChannelWriterWithFactory is the testable constructor. channelDir may be
 // empty when the segmentFactory handles all file operations (e.g. a fake).
-func newChannelWriterWithFactory(channelDir string, maxSegmentBytes int64, sf segmentFactory, policy SyncPolicy, syncInterval time.Duration, notifyFn func(), log logger) *channelWriter {
+func newChannelWriterWithFactory(channelDir string, maxSegmentBytes int64, sf segmentFactory, syncIntervalMS int, notifyFn func(), log logger) *channelWriter {
 	if log == nil {
 		log = nopLogger{}
 	}
@@ -107,7 +98,7 @@ func newChannelWriterWithFactory(channelDir string, maxSegmentBytes int64, sf se
 		doneCh:          make(chan struct{}),
 		log:             log,
 	}
-	go w.run(policy, syncInterval, notifyFn)
+	go w.run(syncIntervalMS, notifyFn)
 	return w
 }
 
@@ -139,8 +130,8 @@ func (w *channelWriter) Close() error {
 
 // run is the writer goroutine. It opens or creates the active segment on
 // startup, handles writes with segment rolling, and runs the periodic fsync
-// tick when configured.
-func (w *channelWriter) run(policy SyncPolicy, syncInterval time.Duration, notifyFn func()) {
+// tick when syncIntervalMS > 0.
+func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 	defer close(w.doneCh)
 
 	f, segStart, segSize, err := w.openActive()
@@ -151,8 +142,8 @@ func (w *channelWriter) run(policy SyncPolicy, syncInterval time.Duration, notif
 	defer func() { _ = f.Close() }()
 
 	var tickCh <-chan time.Time
-	if policy == SyncPolicyPeriodic && syncInterval > 0 {
-		t := time.NewTicker(syncInterval)
+	if syncIntervalMS > 0 {
+		t := time.NewTicker(time.Duration(syncIntervalMS) * time.Millisecond)
 		defer t.Stop()
 		tickCh = t.C
 	}
@@ -179,7 +170,7 @@ func (w *channelWriter) run(policy SyncPolicy, syncInterval time.Duration, notif
 				segStart = newStart
 				segSize = 0
 			}
-			w.doWrite(f, req, &segSize, policy, notifyFn)
+			w.doWrite(f, req, &segSize, syncIntervalMS, notifyFn)
 
 		case <-tickCh:
 			if err := f.Sync(); err != nil {
@@ -218,7 +209,7 @@ func (w *channelWriter) openActive() (fileWriter, int64, int64, error) {
 
 // doWrite performs the write with retry-on-error (backpressure) and optional
 // fsync. It signals req.done exactly once before returning.
-func (w *channelWriter) doWrite(f fileWriter, req writeRequest, segSize *int64, policy SyncPolicy, notifyFn func()) {
+func (w *channelWriter) doWrite(f fileWriter, req writeRequest, segSize *int64, syncIntervalMS int, notifyFn func()) {
 	needLock := len(req.data) > pipeBuf
 
 	for {
@@ -248,7 +239,7 @@ func (w *channelWriter) doWrite(f fileWriter, req writeRequest, segSize *int64, 
 
 	*segSize += int64(len(req.data))
 
-	if policy == SyncPolicyAlways {
+	if syncIntervalMS == 0 {
 		if err := f.Sync(); err != nil {
 			w.log.Error("fsync failed", "err", err)
 			req.done <- fmt.Errorf("fsync channel file: %w", err)

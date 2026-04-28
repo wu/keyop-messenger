@@ -62,8 +62,7 @@ func newHubMessenger(
 	cfg := &Config{
 		Name: name,
 		Storage: StorageConfig{
-			DataDir:    dir,
-			SyncPolicy: SyncPolicyNone,
+			DataDir: dir,
 		},
 		Hub: hubCfg,
 		TLS: TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
@@ -84,8 +83,7 @@ func newClientMessenger(
 	cfg := &Config{
 		Name: name,
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, name),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(dir, name),
 		},
 		Client: ClientConfig{
 			Enabled: true,
@@ -194,8 +192,7 @@ func TestIntegrationRingDedup(t *testing.T) {
 	hub1Cfg := &Config{
 		Name: "hub1",
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, "hub1"),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(dir, "hub1"),
 		},
 		Client: ClientConfig{
 			Enabled: true,
@@ -251,7 +248,7 @@ func TestIntegrationRingDedup(t *testing.T) {
 // ---- TestIntegrationBackpressure --------------------------------------------
 
 // TestIntegrationBackpressure verifies at-least-once delivery when the receiving
-// hub uses a durability policy (SyncPolicyAlways) that makes each write slower,
+// hub uses immediate sync (SyncIntervalMS: 0) that makes each write slower,
 // creating realistic backpressure in the federation path.  All published messages
 // must be received with no loss.
 func TestIntegrationBackpressure(t *testing.T) {
@@ -260,13 +257,13 @@ func TestIntegrationBackpressure(t *testing.T) {
 	dir := t.TempDir()
 	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "publisher")
 
-	// Hub2 uses SyncPolicyAlways to slow down local writes (simulates a slow disk).
+	// Hub2 uses SyncIntervalMS: 0 to slow down local writes (simulates a slow disk).
 	hub2Dir := filepath.Join(dir, "hub2")
 	hub2Cfg := &Config{
 		Name: "hub2",
 		Storage: StorageConfig{
-			DataDir:    hub2Dir,
-			SyncPolicy: SyncPolicyAlways,
+			DataDir:        hub2Dir,
+			SyncIntervalMS: 0,
 		},
 		Hub: HubConfig{
 			Enabled:      true,
@@ -306,7 +303,7 @@ func TestIntegrationBackpressure(t *testing.T) {
 			map[string]any{"i": i}))
 	}
 
-	// All messages must arrive; timeout generous for SyncPolicyAlways.
+	// All messages must arrive; timeout generous for immediate sync (SyncIntervalMS: 0).
 	deadline := time.After(30 * time.Second)
 	got := 0
 	for got < numMessages {
@@ -338,7 +335,6 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 		Name: "compact-test",
 		Storage: StorageConfig{
 			DataDir:               dir,
-			SyncPolicy:            SyncPolicyNone,
 			CompactionThresholdMB: 1, // 1 MB; in practice will never trigger automatically but lets MaybeCompact run
 		},
 	}
@@ -409,8 +405,7 @@ func newClientMessengerWithPolicy(
 	cfg := &Config{
 		Name: name,
 		Storage: StorageConfig{
-			DataDir:    filepath.Join(dir, name),
-			SyncPolicy: SyncPolicyNone,
+			DataDir: filepath.Join(dir, name),
 		},
 		Client: ClientConfig{
 			Enabled: true,

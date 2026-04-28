@@ -142,15 +142,14 @@ Multiple goroutines calling `Publish()` concurrently on the same channel seriali
 
 The writer appends with `O_APPEND` and issues a single `write()` syscall per record, which is atomic for records under `PIPE_BUF` on POSIX systems. For larger records, the writer holds an advisory `flock` for the duration of the write.
 
-What "write confirmed" means depends on the sync policy:
+What "write confirmed" means depends on `sync_interval_ms`:
 
-| Sync policy | `Publish()` returns after | Durable against |
-|---|---|---|
-| `none` | `write()` syscall returns | Application restart (data in OS page cache) |
-| `periodic` | `write()` syscall returns; fsync runs on a background timer | Application restart; OS crash only between fsync intervals |
-| `always` | `fsync()` completes | OS crash, power failure |
+| `sync_interval_ms` | `Publish()` returns after                                                    | Durable against                                            |
+|--------------------|------------------------------------------------------------------------------|------------------------------------------------------------|
+| `0`                | `fsync()` completes                                                          | OS crash, power failure                                    |
+| `> 0`              | `write()` syscall returns; fsync runs on a background timer at that interval | Application restart; OS crash only between fsync intervals |
 
-For `sync_policy=always`, an fsync failure is returned as an error to the caller. For `sync_policy=periodic`, fsync failures are logged as warnings and retried on the next timer tick; `Publish()` is not affected.
+For `sync_interval_ms=0`, an fsync failure is returned as an error to the caller. For `sync_interval_ms>0`, fsync failures are logged as warnings and retried on the next timer tick; `Publish()` is not affected.
 
 ### 5.3 Backpressure on Disk Full
 
@@ -502,7 +501,7 @@ writer goroutine (one per channel)
   └─ receive next write request
   └─ single write() syscall
   └─ retry on I/O error until success (see §5.3)
-  └─ fsync if sync_policy = "always"
+  └─ fsync if sync_interval_ms = 0
   └─ signal publisher: write confirmed
   └─ signal waiting subscribers via fsnotify or internal channel
 ```
@@ -549,7 +548,43 @@ No shared mutable state is accessed without synchronization. Per-channel and per
 
 ---
 
-## 10. Configuration Reference
+## 10. Configuration
+
+### 10.1 Loading Configuration
+
+Configuration can be loaded from a YAML file or constructed programmatically in Go.
+
+**From YAML file:**
+
+```go
+cfg, err := messenger.LoadConfig("/path/to/config.yaml")
+if err != nil {
+    log.Fatal(err)
+}
+m, err := messenger.New(cfg)
+```
+
+**Programmatically:**
+
+```go
+cfg := &messenger.Config{
+    Name: "my-instance",
+    Storage: messenger.StorageConfig{
+        DataDir:               "/var/keyop",
+        SyncIntervalMS:        200,
+        OffsetFlushIntervalMS: 200,
+    },
+}
+cfg.ApplyDefaults()  // Fill in unset fields with defaults
+if err := cfg.Validate(); err != nil {
+    log.Fatal(err)
+}
+m, err := messenger.New(cfg)
+```
+
+`ApplyDefaults()` fills in zero-valued fields with their documented defaults. `Validate()` checks that all required fields are set and values are in valid ranges.
+
+### 10.2 Configuration Reference
 
 ```yaml
 # Full configuration with all fields and defaults
@@ -559,8 +594,8 @@ name: ""                   # Instance name. Defaults to OS hostname. Use "hostna
 
 storage:
   data_dir: "/var/keyop"   # Required. Root directory for channel files, offset files, audit log.
-  sync_policy: "periodic"  # "none" | "periodic" | "always"
-  sync_interval_ms: 200    # Used when sync_policy = "periodic"
+  sync_interval_ms: 0      # 0 = fsync after every write (default, strictest durability, slowest);
+                           # > 0 = fsync periodically at interval in milliseconds (batched, faster).
   max_subscriber_lag_mb: 512   # Warn when a subscriber is this far behind
   max_segment_bytes: 67108864  # 64 MiB; writer rolls to new segment when active segment reaches this size
 
