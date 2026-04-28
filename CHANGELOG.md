@@ -1,3 +1,13 @@
+## [1.0.0](https://github.com/wu/keyop-messenger/compare/v0.14.1...v1.0.0) (2026-04-28)
+
+### ⚠ BREAKING CHANGES
+
+* removed SyncPolicy from config
+
+### Features
+
+* improve sync behavior ([ce59c02](https://github.com/wu/keyop-messenger/commit/ce59c0260c68d4dda5ac6bdb4ded542ef10b28da))
+
 ## [0.14.1](https://github.com/wu/keyop-messenger/compare/v0.14.0...v0.14.1) (2026-04-26)
 
 ### Refactoring
