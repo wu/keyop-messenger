@@ -96,10 +96,17 @@ By default, the system performs an fsync after every publish and subscriber offs
 
 To increase performance, you can set periodic sync intervals:
 
-  * SyncIntervalMS (Publishing): A non-zero value flushes channel log files periodically. Setting this to a non-zero value introduces a risk of message loss if the system crashes before the sync occurs.
-  * OffsetFlushIntervalMS (Subscribing): A non-zero value flushes client offset files periodically. If a crash occurs before the sync, some messages may be redelivered upon restart.
+  * sync_interval_ms (Publishing): A non-zero value flushes channel log files periodically. Setting this to a non-zero value introduces a risk of message loss if the system crashes before the sync occurs.
+  * offset_flush_interval_ms (Subscribing): A non-zero value flushes client offset files periodically. If a crash occurs before the sync, some messages may be redelivered upon restart.
 
-Changing these values from 0 to 200ms can result in a 50x to 100x increase in throughput.
+```go
+storage:
+  sync_interval_ms: 0
+  offset_flush_interval_ms: 200
+  ...
+```
+
+If configuring directly with code:
 
 ```go
 	cfg := &messenger.Config{
@@ -108,6 +115,9 @@ Changing these values from 0 to 200ms can result in a 50x to 100x increase in th
 			OffsetFlushIntervalMS: 200, 
 			...
 ```
+
+Changing these values from 0 to 200ms can result in a massive increase in throughput (100x), see Benchmarks below.
+
 
 ### Correlation IDs
 
@@ -277,13 +287,13 @@ Offset files for peers that disconnect and never reconnect are cleaned up by a T
 
 Every connection lifecycle event is written to the audit log (`{data_dir}/audit/audit.jsonl`):
 
-| Event | When | Key fields |
-|---|---|---|
-| `client_connected` | Peer connects to hub | `peer`, `peer_addr`, `detail` (remote addr + subscribed/publish channels) |
-| `peer_disconnected` | Peer disconnects from hub | `peer`, `peer_addr`, `detail` (connection duration + error if unexpected) |
-| `peer_connected` | Client connects to hub | `peer_addr` |
-| `peer_disconnected` | Client detects hub disconnect | `peer_addr`, `detail` (`unacked=N` — messages in-flight at disconnect time) |
-| `peer_connected` | Client reconnect attempt fails | `peer_addr`, `detail` (`attempt=N err=...`) |
+| Event               | When                           | Key fields                                                                  |
+|---------------------|--------------------------------|-----------------------------------------------------------------------------|
+| `client_connected`  | Peer connects to hub           | `peer`, `peer_addr`, `detail` (remote addr + subscribed/publish channels)   |
+| `peer_disconnected` | Peer disconnects from hub      | `peer`, `peer_addr`, `detail` (connection duration + error if unexpected)   |
+| `peer_connected`    | Client connects to hub         | `peer_addr`                                                                 |
+| `peer_disconnected` | Client detects hub disconnect  | `peer_addr`, `detail` (`unacked=N` — messages in-flight at disconnect time) |
+| `peer_connected`    | Client reconnect attempt fails | `peer_addr`, `detail` (`attempt=N err=...`)                                 |
 
 ### Oversized Message Handling
 
@@ -320,6 +330,50 @@ go test -race ./...
 go test -race -tags integration -timeout 60s ./...
 go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
 golangci-lint run ./...
+```
+### Benchmarks
+
+Benchmarks show times with immediate sync after every write compared to periodic (200ms) offset updates.  See the
+'Trading Durability for Speed' section above in this document for more details.
+
+
+```bash
+$ make bench
+go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
+goos: darwin
+goarch: arm64
+pkg: github.com/wu/keyop-messenger
+cpu: Apple M2 Max
+
+# publish
+BenchmarkPublishThroughput/SyncImmediate-12                 1160           2613115 ns/op                                    1489 B/op         16 allocs/op
+BenchmarkPublishThroughput/SyncBatched200ms-12            335782             10577 ns/op                                    1426 B/op         16 allocs/op
+# subscribe
+BenchmarkSubscribeLatency/SyncImmediate-12                   589           6001609 ns/op           5969415 ns/delivery      3755 B/op         45 allocs/op
+BenchmarkSubscribeLatency/SyncBatched200ms-12              44695             73579 ns/op             70863 ns/delivery     70733 B/op         54 allocs/op
+# federation
+BenchmarkFederationRoundTrip/SyncImmediate-12                369           9247903 ns/op           9214575 ns/roundtrip     8719 B/op         93 allocs/op
+BenchmarkFederationRoundTrip/SyncBatched200ms-12           27433            118462 ns/op            115336 ns/roundtrip    75696 B/op        103 allocs/op
+```
+
+Raspberry Pi 4 Model B Rev 1.5
+
+```bash
+$ make bench                                                                                                                                                                                                         -[main]-
+go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
+goos: linux
+goarch: arm64
+pkg: github.com/wu/keyop-messenger
+
+# publish
+BenchmarkPublishThroughput/SyncImmediate-4                   698           4986259 ns/op                                    1478 B/op         16 allocs/op
+BenchmarkPublishThroughput/SyncBatched200ms-4              64982             47702 ns/op                                    1488 B/op         16 allocs/op
+# subscribe
+BenchmarkSubscribeLatency/SyncImmediate-4                    364          22857763 ns/op          17147337 ns/delivery      3544 B/op         45 allocs/op
+BenchmarkSubscribeLatency/SyncBatched200ms-4               10000            302989 ns/op            282122 ns/delivery     69479 B/op         53 allocs/op
+# federation
+BenchmarkFederationRoundTrip/SyncImmediate-4                 234          14226959 ns/op          14126142 ns/roundtrip    22908 B/op         99 allocs/op
+BenchmarkFederationRoundTrip/SyncBatched200ms-4             3771           1025285 ns/op            998203 ns/roundtrip    74192 B/op        102 allocs/op
 ```
 
 ## License
