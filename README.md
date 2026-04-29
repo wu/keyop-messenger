@@ -2,34 +2,25 @@
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/wu/keyop-messenger.svg)](https://pkg.go.dev/github.com/wu/keyop-messenger)
 
-Keyop Messenger is a high-reliability, file-based pub-sub library for Go. It is designed for systems where durability and delivery guarantees are paramount, offering a simple yet robust architecture based on append-only `.jsonl` files, persistent offset tracking, and mTLS-secured federation.
+## What is Keyop Messenger?
 
-NOTE: This is still Beta, but the API should now be relatively stable.
+[keyop-messenger](https://github.com/wu/keyop-messenger) is a lightweight, federated pub-sub system with at-least-once delivery guarantees, offline resilience, and mTLS security.  It was designed to run efficiently on resource-constrained systems with minimal operational complexity.
 
-## See Also
+I created it to be the nervous system for 'keyop', the latest generation of an IoT project I've been working on since 1999.
 
-  * [DESIGN.md](./DESIGN.md) for detailed design rationale and architecture.
-  * [Quick Start](https://blog.geekfarm.org/introducing-keyop-messenger.html)
+For more details, see the [Getting Started](https://blog.geekfarm.org/introducing-keyop-messenger.html) document.
 
 ## Key Features
 
-- **At-Least-Once Delivery**: Messages are only committed (offset advanced) after successful handler execution.
-- **Durable Storage**: Every channel is a directory of fixed-size segment files. Atomic appends ensure no record interleaving. Old segments are deleted once all subscribers have consumed them.
-- **Persistent Offset Tracking**: Subscribers resume exactly where they left off, even after a crash or restart.
-- **Low-Latency Dispatch**: Uses a dual-layer notification system (in-process `LocalNotifier` + `fsnotify` for filesystem events).
-- **Type-Safe Payloads**: Built-in registry for decoding message bodies into structured Go types.
-- **Correlation IDs**: Stamp messages with application-level correlation IDs to trace multi-step processes across service boundaries.
-- **Reliable Retries & DLQ**: Configurable retry logic with automatic routing to `.dead-letter` channels.
-- **Secure Federation**: Star-topology federation over mTLS WebSockets. Clients subscribe to specific channels; hubs enforce per-client channel allowlists under explicit policy.
-- **Observability**: File-based offsets and JSONL records allow operators to use standard Unix tools (`cat`, `grep`, `tail`) for debugging.
-
-## Why Keyop Messenger?
-
-Unlike memory-based message brokers, Keyop Messenger treats the filesystem as the single source of truth. This makes it:
-1. **Resilient**: No complex cluster state to manage. If the file is there, the data is safe.
-2. **Transparent**: Debugging a stuck subscriber is as simple as `cat subscriber.offset`.
-3. **Low-Overhead**: No separate broker process is required for local-only messaging.
-
+- **Reliable at-least-once delivery** — Messages published locally are durably persisted and guaranteed for delivery.
+- **Federated** — Clients publish and subscribe to specific channels on hubs with configurable access control.
+- **Offline capable** — Local event processing continues during disconnections, with automatic reconnection and message delivery upon restoration.
+- **Secure** — mTLS authentication with per-instance certificates and automated certificate generation.
+- **Low-latency** — Sub-second end-to-end latency across multiple federation hops.
+- **Resource efficient** — Minimal memory and CPU footprint suitable for resource-constrained systems.
+- **Simple** — Designed for ease of operation and maintenance with minimal complexity.
+- **Observable** — Comprehensive audit trails and correlation IDs for troubleshooting multi-event processes.
+- **Pure Go** — No CGO dependencies for simple cross-platform deployment.
 
 ### Installation
 
@@ -89,36 +80,6 @@ func main() {
     m.Publish(pubCtx, "alerts", "com.example.Alert", Alert{Message: "system problem!"})
 }
 ```
-
-### Trading Durability for Speed
-
-By default, the system performs an fsync after every publish and subscriber offset update. This ensures maximum durability but limits throughput as volume grows.
-
-To increase performance, you can set periodic sync intervals:
-
-  * sync_interval_ms (Publishing): A non-zero value flushes channel log files periodically. Setting this to a non-zero value introduces a risk of message loss if the system crashes before the sync occurs.
-  * offset_flush_interval_ms (Subscribing): A non-zero value flushes client offset files periodically. If a crash occurs before the sync, some messages may be redelivered upon restart.
-
-```go
-storage:
-  sync_interval_ms: 0
-  offset_flush_interval_ms: 200
-  ...
-```
-
-If configuring directly with code:
-
-```go
-	cfg := &messenger.Config{
-		Storage: messenger.StorageConfig{
-			SyncIntervalMS: 200,
-			OffsetFlushIntervalMS: 200, 
-			...
-```
-
-Changing these values from 0 to 200ms can result in a massive increase in throughput (100x), see Benchmarks below.
-
-
 ### Correlation IDs
 
 Correlation IDs track related messages across multi-step processes. Set a correlation ID via context before publishing, and it will be stamped on the envelope and delivered to subscribers. Useful for tracing a request through multiple services.
@@ -171,23 +132,6 @@ ctx := messenger.WithServiceName(context.Background(), "orders")
 ctx = messenger.WithCorrelationID(ctx, "order-789")
 
 m.Publish(ctx, "orders", "com.example.OrderCreated", &order)
-```
-
-### Certificate Generation (for Federation)
-
-```bash
-# Install the CLI
-go install github.com/wu/keyop-messenger/cmd/keyop-messenger@latest
-
-# Generate a CA (once per cluster)
-keyop-messenger keygen ca --out-cert ca.crt --out-key ca.key
-
-# Generate a per-instance certificate
-keyop-messenger keygen instance \
-  --ca ca.crt --ca-key ca.key \
-  --name billing-host \
-  --out-cert billing-host.crt \
-  --out-key  billing-host.key
 ```
 
 ## Ephemeral Client
@@ -264,38 +208,7 @@ Set `AutoReconnect: true` to reconnect automatically with exponential backoff af
 
 ---
 
-## Architecture
-
-Keyop Messenger follows a **Hub-and-Spoke** model:
-- **Clients**: Connect to a Hub to publish or subscribe to channels.
-- **Hubs**: Manage local `.jsonl` files, coordinate with peer Hubs, and deliver messages to subscribers using a **file-reader pull model**.
-- **Channels**: Each channel is a directory of append-only `.jsonl` segment files. Once all subscribers (local and federation) have consumed a segment it is deleted — no copying, no writer pauses.
-- **Offsets**: Each subscriber has a unique `.offset` file tracking its last read byte position across all segments. Federation peer offsets are stored under `subscribers/{channel}/fed-{peerName}.offset` and are automatically included in compaction boundary calculations.
-
-### Federation Delivery Model
-
-The hub delivers messages to subscribed federation peers using the same mechanism as local subscribers:
-
-1. When a message is written to a channel, the hub calls `NotifyChannel(channel)`, waking a `channelReader` goroutine for each peer subscribed to that channel.
-2. The `channelReader` reads from segment files starting at the peer's last byte offset, batches envelopes (up to `max_batch_bytes`), and delivers them via WebSocket.
-3. After the peer acknowledges the batch, the byte offset is persisted atomically to `subscribers/{channel}/fed-{peerName}.offset`.
-4. On reconnect, delivery resumes from the stored offset — no `last_id` handshake field is needed.
-
-Offset files for peers that disconnect and never reconnect are cleaned up by a TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week).
-
-### Federation Observability
-
-Every connection lifecycle event is written to the audit log (`{data_dir}/audit/audit.jsonl`):
-
-| Event               | When                           | Key fields                                                                  |
-|---------------------|--------------------------------|-----------------------------------------------------------------------------|
-| `client_connected`  | Peer connects to hub           | `peer`, `peer_addr`, `detail` (remote addr + subscribed/publish channels)   |
-| `peer_disconnected` | Peer disconnects from hub      | `peer`, `peer_addr`, `detail` (connection duration + error if unexpected)   |
-| `peer_connected`    | Client connects to hub         | `peer_addr`                                                                 |
-| `peer_disconnected` | Client detects hub disconnect  | `peer_addr`, `detail` (`unacked=N` — messages in-flight at disconnect time) |
-| `peer_connected`    | Client reconnect attempt fails | `peer_addr`, `detail` (`attempt=N err=...`)                                 |
-
-### Oversized Message Handling
+## Oversized Message Handling
 
 If a single message exceeds `max_batch_bytes` on the receiving side, it is logged and silently skipped — the sender receives an ack so it advances past the message and the connection stays alive.
 
@@ -321,59 +234,6 @@ make test-integration   # integration tests (build tag: integration)
 make bench              # benchmarks
 make lint               # golangci-lint
 make build              # verify compilation
-```
-
-Or directly:
-
-```bash
-go test -race ./...
-go test -race -tags integration -timeout 60s ./...
-go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
-golangci-lint run ./...
-```
-### Benchmarks
-
-Benchmarks show times with immediate sync after every write compared to periodic (200ms) offset updates.  See the
-'Trading Durability for Speed' section above in this document for more details.
-
-
-```bash
-$ make bench
-go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
-goos: darwin
-goarch: arm64
-pkg: github.com/wu/keyop-messenger
-cpu: Apple M2 Max
-
-# publish
-BenchmarkPublishThroughput/SyncImmediate-12                 1160           2613115 ns/op                                    1489 B/op         16 allocs/op
-BenchmarkPublishThroughput/SyncBatched200ms-12            335782             10577 ns/op                                    1426 B/op         16 allocs/op
-# subscribe
-BenchmarkSubscribeLatency/SyncImmediate-12                   589           6001609 ns/op           5969415 ns/delivery      3755 B/op         45 allocs/op
-BenchmarkSubscribeLatency/SyncBatched200ms-12              44695             73579 ns/op             70863 ns/delivery     70733 B/op         54 allocs/op
-# federation
-BenchmarkFederationRoundTrip/SyncImmediate-12                369           9247903 ns/op           9214575 ns/roundtrip     8719 B/op         93 allocs/op
-BenchmarkFederationRoundTrip/SyncBatched200ms-12           27433            118462 ns/op            115336 ns/roundtrip    75696 B/op        103 allocs/op
-```
-
-Raspberry Pi 4 Model B Rev 1.5
-
-```bash
-$ make bench                                                                                                                                                                                                         -[main]-
-go test -run='^$' -bench=. -benchmem -benchtime=3s ./...
-goos: linux
-goarch: arm64
-pkg: github.com/wu/keyop-messenger
-
-# publish
-BenchmarkPublishThroughput/SyncImmediate-4                   698           4986259 ns/op                                    1478 B/op         16 allocs/op
-BenchmarkPublishThroughput/SyncBatched200ms-4              64982             47702 ns/op                                    1488 B/op         16 allocs/op
-# subscribe
-BenchmarkSubscribeLatency/SyncImmediate-4                    364          22857763 ns/op          17147337 ns/delivery      3544 B/op         45 allocs/op
-BenchmarkSubscribeLatency/SyncBatched200ms-4               10000            302989 ns/op            282122 ns/delivery     69479 B/op         53 allocs/op
-# federation
-BenchmarkFederationRoundTrip/SyncImmediate-4                 234          14226959 ns/op          14126142 ns/roundtrip    22908 B/op         99 allocs/op
-BenchmarkFederationRoundTrip/SyncBatched200ms-4             3771           1025285 ns/op            998203 ns/roundtrip    74192 B/op        102 allocs/op
 ```
 
 ## License
