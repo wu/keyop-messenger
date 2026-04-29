@@ -72,7 +72,7 @@ func host1(ctx context.Context, logger *slog.Logger, baseDir string) {
 
 			// Just log the event details
 			logger.Info("host1: received",
-				"message", a.Message,
+				"details", a.Details,
 				"origin", msg.Origin,
 				"service", msg.ServiceName,
 				"timestamp", msg.Timestamp.Format("2006-01-02 15:04:05"),

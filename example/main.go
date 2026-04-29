@@ -10,7 +10,7 @@ import (
 )
 
 type Alert struct {
-	Message string `json:"message"`
+	Details string `json:"message"`
 	Count   int
 }
 

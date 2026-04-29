@@ -74,7 +74,7 @@ func host2(ctx context.Context, logger *slog.Logger, baseDir string) {
 			logger.Info("host2: publishing message", "service", "monitor-service")
 
 			count++
-			alert := Alert{Message: "system problem!", Count: count}
+			alert := Alert{Details: "system problem!", Count: count}
 			// send the data using the registered payload type.   Blocks until write is confirmed to disk.
 			if err := m.Publish(pubCtx, "alerts", "com.example.alert.v1", alert); err != nil {
 				slog.Error("failed to publish message", "error", err)
