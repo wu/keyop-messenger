@@ -174,7 +174,7 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 				},
 				Client: ClientConfig{
 					Enabled: true,
-					Hubs:    []ClientHubRef{{Addr: net.JoinHostPort("localhost", port)}},
+					Hubs:    []ClientHubRef{{Addr: net.JoinHostPort("localhost", port), Publish: []string{"bench"}}},
 				},
 				TLS: TLSConfig{
 					Cert: writePEM("client.crt", clientCert),

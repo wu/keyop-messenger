@@ -212,7 +212,7 @@ func TestFederationEndToEnd(t *testing.T) {
 		},
 		Client: ClientConfig{
 			Enabled: true,
-			Hubs:    []ClientHubRef{{Addr: hubAddr}},
+			Hubs:    []ClientHubRef{{Addr: hubAddr, Publish: []string{"orders"}}},
 		},
 		TLS: TLSConfig{
 			Cert: writePEM("client.crt", clientCert),

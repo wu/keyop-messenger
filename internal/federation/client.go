@@ -238,10 +238,8 @@ func (c *Client) Sender() *PeerSender {
 }
 
 // AllowPublish reports whether the given channel is allowed to be published to the hub.
+// An empty publishChannels list means the client does not publish to the hub at all.
 func (c *Client) AllowPublish(channel string) bool {
-	if len(c.publishChannels) == 0 {
-		return true
-	}
 	for _, ch := range c.publishChannels {
 		if ch == channel {
 			return true

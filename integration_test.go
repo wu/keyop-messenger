@@ -125,8 +125,14 @@ func TestIntegrationHubTwoClients(t *testing.T) {
 	)
 	hubAddr := hubLocalAddr(t, hubM)
 
-	clientA := newClientMessenger(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr)
-	clientB := newClientMessenger(t, "client-b", dir, caFile, certFor("client-b"), keyFor("client-b"), hubAddr)
+	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile, certFor("client-a"), keyFor("client-a"), hubAddr,
+		[]string{},         // subscribe
+		[]string{"events"}, // publish
+	)
+	clientB := newClientMessengerWithPolicy(t, "client-b", dir, caFile, certFor("client-b"), keyFor("client-b"), hubAddr,
+		[]string{},         // subscribe
+		[]string{"events"}, // publish
+	)
 
 	received := make(chan Message, 10)
 	require.NoError(t, hubM.Subscribe(context.Background(), "events", "hub-sub",
@@ -197,8 +203,8 @@ func TestIntegrationRingDedup(t *testing.T) {
 		Client: ClientConfig{
 			Enabled: true,
 			Hubs: []ClientHubRef{
-				{Addr: hub2Addr},
-				{Addr: hub2Addr},
+				{Addr: hub2Addr, Publish: []string{"ring-events"}},
+				{Addr: hub2Addr, Publish: []string{"ring-events"}},
 			},
 		},
 		TLS: TLSConfig{
@@ -283,8 +289,11 @@ func TestIntegrationBackpressure(t *testing.T) {
 	hub2Addr := hubLocalAddr(t, hub2M)
 
 	// Publisher connects to Hub2 as client.
-	pubM := newClientMessenger(t, "publisher", dir, caFile,
-		certFor("publisher"), keyFor("publisher"), hub2Addr)
+	pubM := newClientMessengerWithPolicy(t, "publisher", dir, caFile,
+		certFor("publisher"), keyFor("publisher"), hub2Addr,
+		[]string{},               // subscribe
+		[]string{"backpressure"}, // publish
+	)
 
 	received := make(chan struct{}, numMessages)
 	require.NoError(t, hub2M.Subscribe(context.Background(), "backpressure", "sub",

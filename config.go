@@ -103,7 +103,8 @@ type ClientHubRef struct {
 	// The hub may deliver a subset based on its access control policy.
 	Subscribe []string `yaml:"subscribe"`
 	// Publish lists the channels this instance will send to the hub (outbound from this instance).
-	// The hub may reject a subset based on its receive policy.
+	// An empty list means this client will not publish any messages to the hub.
+	// The hub may further restrict a subset based on its own receive policy.
 	Publish []string `yaml:"publish"`
 }
 
