@@ -1,3 +1,14 @@
+## [1.1.0](https://github.com/wu/keyop-messenger/compare/v1.0.0...v1.1.0) (2026-04-29)
+
+### Features
+
+* add release target to Makefile for pre-release checks ([649e0a0](https://github.com/wu/keyop-messenger/commit/649e0a0011496609c9b1c499775a34c8d293ef64))
+* enhance example project for getting started guide ([349148b](https://github.com/wu/keyop-messenger/commit/349148b0edd62c06f561df9b4e2d5da73de20ae4))
+
+### Bug Fixes
+
+* ensure clients on publish to configured channels ([afff88f](https://github.com/wu/keyop-messenger/commit/afff88f36e535681086658dde071cad5629e74c8))
+
 ## [1.0.0](https://github.com/wu/keyop-messenger/compare/v0.14.1...v1.0.0) (2026-04-28)
 
 ### ⚠ BREAKING CHANGES
