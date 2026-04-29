@@ -57,16 +57,16 @@ func host1(ctx context.Context, logger *slog.Logger, baseDir string) {
 	}
 
 	// Subscribe to the local 'alerts' channel, and run the callback on each message that arrives there.
-	// The subscriber ID is used to record your local offset in the channel log.
+	// The subscriber ID is used when recording your local offset in the channel log.
 	logger.Info("host1: subscribing to alerts topic on worker-1")
 	err = m.Subscribe(ctx, "alerts", "worker-1", func(_ context.Context, msg messenger.Message) error {
 
 		// check the payload type/version and respond accordingly
 		if msg.PayloadType == "com.example.alert.v1" {
-			// decode the payload into the expected struct type
+			// safely verify the payload type before using it
 			a, ok := msg.Payload.(Alert)
 			if !ok {
-				logger.Error("failed to cast payload to Alert")
+				logger.Error("failed to verify Alert payload type")
 				return nil
 			}
 
