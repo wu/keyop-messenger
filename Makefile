@@ -1,4 +1,4 @@
-.PHONY: all build test test-integration test-fast test-coverage bench lint clean help
+.PHONY: all build test test-integration test-fast test-coverage bench lint clean release help
 
 # Default target
 all: test build
@@ -34,6 +34,10 @@ bench:
 lint:
 	golangci-lint run ./...
 
+# Run all checks required before a release
+release: test test-integration lint bench
+	@echo "All release checks passed!"
+
 # Clean build artifacts and test cache
 clean:
 	go clean
@@ -50,5 +54,6 @@ help:
 	@echo "  test-coverage    - Run all tests and show coverage"
 	@echo "  bench            - Run benchmarks"
 	@echo "  lint             - Run golangci-lint"
+	@echo "  release          - Run all pre-release checks (test, test-integration, lint, bench)"
 	@echo "  clean            - Clean build artifacts and coverage files"
 	@echo "  help             - Show this help message"
