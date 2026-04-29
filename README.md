@@ -208,24 +208,6 @@ Set `AutoReconnect: true` to reconnect automatically with exponential backoff af
 
 ---
 
-## Oversized Message Handling
-
-If a single message exceeds `max_batch_bytes` on the receiving side, it is logged and silently skipped — the sender receives an ack so it advances past the message and the connection stays alive.
-
-```
-ERROR federation: receiver record too large, skipping
-      peer=sender id=abc123 channel=attachments size=921600 max=4194304
-```
-
-The default `max_batch_bytes` is **4 MiB** (raised from 64 KiB in earlier versions). Adjust in config if your payloads are larger:
-
-```yaml
-federation:
-  max_batch_bytes: 16777216  # 16 MiB
-```
-
-Set to `0` to disable the limit entirely.
-
 ## Development Commands
 
 ```bash
