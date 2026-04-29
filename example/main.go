@@ -11,6 +11,7 @@ import (
 
 type Alert struct {
 	Message string `json:"message"`
+	Count   int
 }
 
 func main() {
