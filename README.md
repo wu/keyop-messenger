@@ -65,7 +65,7 @@ func main() {
     ctx := context.Background()
 
     // Subscribe before publishing so the handler sees the message.
-    m.Subscribe(ctx, "alerts", "worker-1", func(ctx context.Context, msg messenger.Message) error {
+    m.Subscribe(ctx, "alerts", "notifier", func(ctx context.Context, msg messenger.Message) error {
         a := msg.Payload.(Alert)
         slog.Info("received",
             "message", a.Message,
