@@ -82,25 +82,31 @@ func main() {
 ```
 ### Correlation IDs
 
-Correlation IDs track related messages across multi-step processes. Set a correlation ID via context before publishing, and it will be stamped on the envelope and delivered to subscribers. Useful for tracing a request through multiple services.
+Correlation IDs track related messages across multi-step processes, allowing you to trace a single event through multiple services. Extract a message's ID and use it as the correlation ID for all downstream actions.
 
 ```go
-// Start a correlated chain of messages
-ctx := messenger.WithCorrelationID(context.Background(), "order-123")
+// Temperature sensor publishes a reading
+m.Publish(context.Background(), "temp", "com.example.TempReading", &reading)
 
-// All messages published with this context carry the same correlation ID
-m.Publish(ctx, "orders", "com.example.OrderCreated", &order)
-m.Publish(ctx, "payments", "com.example.ChargeOrder", &charge)
-m.Publish(ctx, "shipping", "com.example.ShipOrder", &shipment)
+// Thermostat subscribes to temperature readings and reacts
+m.Subscribe(context.Background(), "temp", "thermostat", func(ctx context.Context, msg messenger.Message) error {
+    // Use the temp message's ID as the correlation ID for downstream actions
+    downstreamCtx := messenger.WithCorrelationID(context.Background(), msg.ID)
+    
+    // Publish alert and switch events with the correlation ID
+    m.Publish(downstreamCtx, "alerts", "com.example.Alert", &alert)
+    m.Publish(downstreamCtx, "heater", "com.example.SwitchEvent", &switchEvent)
+    
+    return nil
+})
 
-// Subscribers receive the correlation ID
-m.Subscribe(ctx, "orders", "processor", func(ctx context.Context, msg messenger.Message) error {
-    // msg.CorrelationID == "order-123"
-
-    // Propagate to downstream services
-    downstreamCtx := messenger.WithCorrelationID(ctx, msg.CorrelationID)
-    m.Publish(downstreamCtx, "next-channel", "com.example.NextEvent", &event)
-
+// Switch service receives events and can trace them back to the original sensor reading
+m.Subscribe(context.Background(), "heater", "switch", func(ctx context.Context, msg messenger.Message) error {
+    slog.Info("heater activated",
+        "correlationId", msg.CorrelationID,  // Traces back to the original temp reading
+        "origin", msg.Origin,
+        "id", msg.ID,
+    )
     return nil
 })
 ```
@@ -111,13 +117,13 @@ Service names identify which service published a message. Set a service name via
 
 ```go
 // Publish from a specific service
-ctx := messenger.WithServiceName(context.Background(), "payment-processor")
-m.Publish(ctx, "payments", "com.example.ChargeCompleted", &charge)
+ctx := messenger.WithServiceName(context.Background(), "temperature-sensor")
+m.Publish(ctx, "sensors", "com.example.TemperatureReading", &reading)
 
 // Subscribers can see which service published the message
-m.Subscribe(ctx, "payments", "auditor", func(ctx context.Context, msg messenger.Message) error {
-    slog.Info("payment processed",
-        "service", msg.ServiceName,  // "payment-processor"
+m.Subscribe(ctx, "sensors", "monitor", func(ctx context.Context, msg messenger.Message) error {
+    slog.Info("temperature recorded",
+        "service", msg.ServiceName,  // "temperature-sensor"
         "origin", msg.Origin,        // instance name
         "id", msg.ID,
     )
@@ -128,10 +134,10 @@ m.Subscribe(ctx, "payments", "auditor", func(ctx context.Context, msg messenger.
 Service names work well with correlation IDs — both can be set in the same context:
 
 ```go
-ctx := messenger.WithServiceName(context.Background(), "orders")
-ctx = messenger.WithCorrelationID(ctx, "order-789")
+ctx := messenger.WithServiceName(context.Background(), "thermostat")
+ctx = messenger.WithCorrelationID(ctx, sourceMsg.CorrelationID)
 
-m.Publish(ctx, "orders", "com.example.OrderCreated", &order)
+m.Publish(ctx, "heater", "com.example.SwitchEvent", &switchEvent)
 ```
 
 ## Ephemeral Client
