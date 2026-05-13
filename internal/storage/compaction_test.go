@@ -272,21 +272,41 @@ func TestCompactor_FedOffsetConstrainsCompaction(t *testing.T) {
 }
 
 // TestCompactor_FedOffsetWithNoLocalSubscribers verifies that a fed-*.offset
-// file alone does not trigger compaction (at least one local subscriber must
-// be registered for MaybeCompact to proceed).
+// file constrains compaction even when no local subscriber is registered.
+// The fed offset is the sole consumer, so sealed segments it has consumed
+// should be deleted.
 func TestCompactor_FedOffsetWithNoLocalSubscribers(t *testing.T) {
 	c, channelDir, offsetDir := newTestCompactor(t)
 
 	seg0Size := writeSegment(t, channelDir, 0, 5)
 	_ = writeSegment(t, channelDir, seg0Size, 5) // active
 
-	// Only a fed offset file — no registered subscribers.
+	// Only a fed offset file — no registered local subscribers.
+	// Fed offset is at the start of the active segment (fully consumed seg 0).
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), seg0Size))
 
-	// MaybeCompact should skip deletion because no local subscribers are registered.
 	require.NoError(t, c.MaybeCompact(channelDir))
 
 	segs, err := listSegments(channelDir)
 	require.NoError(t, err)
-	assert.Len(t, segs, 2, "no compaction should occur without registered local subscribers")
+	assert.Len(t, segs, 1, "sealed segment consumed by fed peer should be deleted even without local subscribers")
+}
+
+// TestCompactor_NoConsumersDeletesAllSealedSegments verifies that when there
+// are no local subscribers and no fed-*.offset files, all sealed segments are
+// deleted. This covers channels that receive federation data but have no local
+// consumers (e.g. a client subscribed to a hub channel that nobody reads locally).
+func TestCompactor_NoConsumersDeletesAllSealedSegments(t *testing.T) {
+	c, channelDir, _ := newTestCompactor(t)
+
+	seg0Size := writeSegment(t, channelDir, 0, 5)
+	seg1Size := writeSegment(t, channelDir, seg0Size, 5)
+	_ = writeSegment(t, channelDir, seg0Size+seg1Size, 5) // active
+
+	// No local subscribers, no fed-*.offset files.
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 1, "all sealed segments should be deleted when there are no consumers")
 }

@@ -140,10 +140,6 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 	}
 	c.mu.Unlock()
 
-	if len(ids) == 0 {
-		return nil
-	}
-
 	offsets := make(map[string]int64, len(ids))
 	var minOffset int64 = math.MaxInt64
 	for _, id := range ids {
@@ -183,7 +179,8 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 
 	// Delete any sealed segment (not the last) whose entire content lies
 	// before minOffset. A segment is fully consumed when the next segment's
-	// start offset is <= minOffset.
+	// start offset is <= minOffset. When there are no consumers at all,
+	// minOffset remains math.MaxInt64 and all sealed segments are eligible.
 	for i := 0; i < len(segs)-1; i++ {
 		nextStart := segs[i+1].startOffset
 		if nextStart <= minOffset {
