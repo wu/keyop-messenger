@@ -1,3 +1,9 @@
+## [1.2.0](https://github.com/wu/keyop-messenger/compare/v1.1.0...v1.2.0) (2026-05-13)
+
+### Features
+
+* enhance compaction logic to delete sealed segments when no local consumers are present ([a1d52a2](https://github.com/wu/keyop-messenger/commit/a1d52a272ba22e9cc85da94cccdad7235b5d0d70))
+
 ## [1.1.0](https://github.com/wu/keyop-messenger/compare/v1.0.0...v1.1.0) (2026-04-29)
 
 ### Features
