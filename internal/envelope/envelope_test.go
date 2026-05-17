@@ -92,10 +92,10 @@ func TestNewEnvelope(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, CurrentVersion, env.V)
 
-	// ID must be a valid UUID v4.
+	// ID must be a valid UUID v7.
 	id, parseErr := uuid.Parse(env.ID)
 	require.NoError(t, parseErr, "ID must be a parseable UUID")
-	assert.Equal(t, uuid.Version(4), id.Version(), "ID must be UUID version 4")
+	assert.Equal(t, uuid.Version(7), id.Version(), "ID must be UUID version 7")
 
 	// Timestamp must be within the test window and in UTC with no monotonic reading.
 	assert.False(t, env.Ts.Before(before), "Ts must not be before call")

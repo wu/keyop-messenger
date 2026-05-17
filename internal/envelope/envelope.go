@@ -130,7 +130,7 @@ func Unmarshal(data []byte) (Envelope, error) {
 // payloadType is the type discriminator string (e.g. "com.keyop.orders.OrderCreated").
 // payload is any JSON-serialisable value.
 func NewEnvelope(channel, origin, payloadType string, payload any) (Envelope, error) {
-	id, err := uuid.NewRandom()
+	id, err := uuid.NewV7()
 	if err != nil {
 		return Envelope{}, fmt.Errorf("generate message ID: %w", err)
 	}
