@@ -1,3 +1,9 @@
+## [1.3.0](https://github.com/wu/keyop-messenger/compare/v1.2.0...v1.3.0) (2026-05-17)
+
+### Features
+
+* update UUID generation to use version 7 in envelope ([9a080ee](https://github.com/wu/keyop-messenger/commit/9a080ee922e10ceb0d4981beceb589be422b7664))
+
 ## [1.2.0](https://github.com/wu/keyop-messenger/compare/v1.1.0...v1.2.0) (2026-05-13)
 
 ### Features
