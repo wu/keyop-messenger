@@ -111,6 +111,58 @@ func TestAckRoundTrip(t *testing.T) {
 	assert.Equal(t, sent.LastID, received.LastID)
 }
 
+// TestReceiveHandshakeReadError verifies that a network-level read failure
+// (peer closed the connection) is propagated with context.
+func TestReceiveHandshakeReadError(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	require.NoError(t, cli.Close())
+
+	_, err := federation.ReceiveHandshake(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "receive handshake")
+}
+
+// TestReceiveHandshakeWrongFrameType verifies that a binary WebSocket frame
+// is rejected with an "expected text frame" error.
+func TestReceiveHandshakeWrongFrameType(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	errc := make(chan error, 1)
+	go func() { errc <- cli.WriteMessage(websocket.BinaryMessage, []byte(`{"instance_name":"x"}`)) }()
+
+	_, err := federation.ReceiveHandshake(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected text frame")
+	require.NoError(t, <-errc)
+}
+
+// TestReceiveHandshakeBadJSON verifies that a text frame containing invalid
+// JSON returns an unmarshal error.
+func TestReceiveHandshakeBadJSON(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	errc := make(chan error, 1)
+	go func() { errc <- cli.WriteMessage(websocket.TextMessage, []byte("{not valid json")) }()
+
+	_, err := federation.ReceiveHandshake(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unmarshal handshake")
+	require.NoError(t, <-errc)
+}
+
+// TestSendHandshakeWriteError verifies that SendHandshake propagates a write
+// error when the underlying connection is already closed.
+func TestSendHandshakeWriteError(t *testing.T) {
+	_, cli := newWSPair(t)
+
+	require.NoError(t, cli.Close())
+
+	err := federation.SendHandshake(cli, federation.HandshakeMsg{InstanceName: "x", Role: "client", Version: "1"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "send handshake")
+}
+
 // TestAckEmptyLastID verifies zero-value AckMsg round-trips cleanly.
 func TestAckEmptyLastID(t *testing.T) {
 	srv, cli := newWSPair(t)
