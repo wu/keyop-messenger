@@ -163,6 +163,57 @@ func TestSendHandshakeWriteError(t *testing.T) {
 	assert.Contains(t, err.Error(), "send handshake")
 }
 
+// TestReceiveAckReadError verifies that a network-level read failure is
+// propagated with context.
+func TestReceiveAckReadError(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	require.NoError(t, cli.Close())
+
+	_, err := federation.ReceiveAck(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "receive ack")
+}
+
+// TestReceiveAckWrongFrameType verifies that a binary frame is rejected.
+func TestReceiveAckWrongFrameType(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	errc := make(chan error, 1)
+	go func() { errc <- cli.WriteMessage(websocket.BinaryMessage, []byte(`{"last_id":"x"}`)) }()
+
+	_, err := federation.ReceiveAck(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expected text frame")
+	require.NoError(t, <-errc)
+}
+
+// TestReceiveAckBadJSON verifies that a text frame with invalid JSON returns
+// an unmarshal error.
+func TestReceiveAckBadJSON(t *testing.T) {
+	srv, cli := newWSPair(t)
+
+	errc := make(chan error, 1)
+	go func() { errc <- cli.WriteMessage(websocket.TextMessage, []byte("{bad json")) }()
+
+	_, err := federation.ReceiveAck(srv)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unmarshal ack")
+	require.NoError(t, <-errc)
+}
+
+// TestSendAckWriteError verifies that SendAck propagates a write error when
+// the connection is already closed.
+func TestSendAckWriteError(t *testing.T) {
+	_, cli := newWSPair(t)
+
+	require.NoError(t, cli.Close())
+
+	err := federation.SendAck(cli, federation.AckMsg{LastID: "x"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "send ack")
+}
+
 // TestAckEmptyLastID verifies zero-value AckMsg round-trips cleanly.
 func TestAckEmptyLastID(t *testing.T) {
 	srv, cli := newWSPair(t)

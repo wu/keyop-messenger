@@ -523,3 +523,18 @@ func TestChannelSubscribersStressConnectDisconnect(t *testing.T) {
 	// Test completed without panic; notify registry survived the stress.
 	assert.True(t, true, "stress test completed without panic or memory issues")
 }
+
+// TestHubListenError verifies that Listen returns an error when the underlying
+// tls.Listen call fails (nil TLS config has no certificates).
+func TestHubListenError(t *testing.T) {
+	dd, err := dedup.NewLRUDedup(10000)
+	require.NoError(t, err)
+	log := &testutil.FakeLogger{}
+	auditL := &fakeAuditLog{}
+	hub := federation.NewHub("hub", federation.HubConfig{}, nil, func(*envelope.Envelope) error { return nil },
+		dd, auditL, log, 16, 65536, "")
+
+	err = hub.Listen("127.0.0.1:0")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hub listen")
+}
