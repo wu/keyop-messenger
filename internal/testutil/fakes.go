@@ -38,6 +38,18 @@ func (f *FakeLogger) record(level, msg string, args []any) {
 	f.logs = append(f.logs, entry)
 }
 
+// HasInfo reports whether any INFO-level log entry contains substr.
+func (f *FakeLogger) HasInfo(substr string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, e := range f.logs {
+		if strings.HasPrefix(e, "INFO") && strings.Contains(e, substr) {
+			return true
+		}
+	}
+	return false
+}
+
 // HasWarn reports whether any WARN-level log entry contains substr.
 func (f *FakeLogger) HasWarn(substr string) bool {
 	f.mu.Lock()
