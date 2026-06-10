@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -291,4 +292,183 @@ func TestWriter_SegmentRolling(t *testing.T) {
 		assert.Equal(t, expected, segs[i].startOffset,
 			"segment %d startOffset must equal previous segment end", i)
 	}
+}
+
+// ---- additional fake types for doWrite / openActive error-path tests --------
+
+// alwaysFailWriteFile is a fileWriter whose Write always returns ENOSPC.
+// The write count is tracked atomically for test synchronisation.
+type alwaysFailWriteFile struct{ writes atomic.Int64 }
+
+func (f *alwaysFailWriteFile) Write(_ []byte) (int, error) { f.writes.Add(1); return 0, syscall.ENOSPC }
+func (f *alwaysFailWriteFile) Sync() error                 { return nil }
+func (f *alwaysFailWriteFile) Close() error                { return nil }
+func (f *alwaysFailWriteFile) Fd() uintptr                 { return 0 }
+
+// syncFailFile is a fileWriter whose Write succeeds but Sync always fails.
+type syncFailFile struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (f *syncFailFile) Write(b []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.buf.Write(b)
+}
+func (f *syncFailFile) Sync() error  { return errors.New("fsync error") }
+func (f *syncFailFile) Close() error { return nil }
+func (f *syncFailFile) Fd() uintptr  { return 0 }
+
+// fixedFileFactory is a segmentFactory that returns the same fileWriter for
+// every openSegment and createSegment call.
+type fixedFileFactory struct{ f fileWriter }
+
+func (ff *fixedFileFactory) openSegment(_ string) (fileWriter, error)   { return ff.f, nil }
+func (ff *fixedFileFactory) createSegment(_ string) (fileWriter, error) { return ff.f, nil }
+
+// firstSuccessFactory lets only the first createSegment call succeed; all
+// subsequent calls return an error. openSegment always returns the base file.
+type firstSuccessFactory struct {
+	base    fileWriter
+	mu      sync.Mutex
+	creates int
+}
+
+func (sf *firstSuccessFactory) openSegment(_ string) (fileWriter, error) { return sf.base, nil }
+func (sf *firstSuccessFactory) createSegment(_ string) (fileWriter, error) {
+	sf.mu.Lock()
+	defer sf.mu.Unlock()
+	sf.creates++
+	if sf.creates == 1 {
+		return sf.base, nil
+	}
+	return nil, errors.New("no space left on device")
+}
+
+// failCreateFactory is a segmentFactory whose createSegment always returns an error.
+type failCreateFactory struct{}
+
+func (failCreateFactory) openSegment(_ string) (fileWriter, error) { return &fakeFile{}, nil }
+func (failCreateFactory) createSegment(_ string) (fileWriter, error) {
+	return nil, errors.New("permission denied")
+}
+
+// failOpenFactory is a segmentFactory whose openSegment always returns an error.
+type failOpenFactory struct{}
+
+func (failOpenFactory) openSegment(_ string) (fileWriter, error) {
+	return nil, errors.New("permission denied")
+}
+func (failOpenFactory) createSegment(_ string) (fileWriter, error) { return &fakeFile{}, nil }
+
+// ---- tests for doWrite error paths ------------------------------------------
+
+// TestWriter_AbortOnCloseWhileRetrying verifies that Write returns a descriptive
+// error when Close is called while doWrite is spinning in the retry loop.
+func TestWriter_AbortOnCloseWhileRetrying(t *testing.T) {
+	nf := &alwaysFailWriteFile{}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: nf}, 1000000, nil, nil)
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Write(makeTestEnvelope(t, "ord")) }()
+
+	// Wait until the retry loop has made at least one attempt.
+	require.Eventually(t, func() bool { return nf.writes.Load() > 0 }, time.Second, time.Millisecond)
+
+	require.NoError(t, w.Close())
+
+	err := <-errCh
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "write aborted")
+}
+
+// TestWriter_SyncError verifies that a Sync() failure propagates to the caller.
+func TestWriter_SyncError(t *testing.T) {
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: &syncFailFile{}}, 0 /* sync every write */, nil, nil)
+
+	err := w.Write(makeTestEnvelope(t, "ord"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "fsync channel file")
+
+	require.NoError(t, w.Close())
+}
+
+// ---- tests for segment rolling error path -----------------------------------
+
+// TestWriter_SegmentRollCreateError verifies that a createSegment failure during
+// rolling propagates to the caller and the writer goroutine exits cleanly.
+func TestWriter_SegmentRollCreateError(t *testing.T) {
+	base := &fakeFile{}
+	sf := &firstSuccessFactory{base: base}
+	// maxSegmentBytes=1 guarantees the second write always triggers rolling.
+	w := newChannelWriterWithFactory("", 1, sf, 1000000, nil, nil)
+
+	// First write succeeds: segSize starts at 0, so the rolling condition
+	// (segSize > 0) is false and rolling is skipped.
+	require.NoError(t, w.Write(makeTestEnvelope(t, "ord-1")))
+
+	// Second write triggers rolling; the second createSegment call fails.
+	err := w.Write(makeTestEnvelope(t, "ord-2"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create new segment")
+
+	// Writer goroutine has exited; Close must not deadlock.
+	require.NoError(t, w.Close())
+}
+
+// ---- tests for openActive error and re-open paths ---------------------------
+
+// TestWriter_OpenActive_ExistingSegments verifies that a new writer reopens and
+// appends to the most-recent segment when one already exists on disk.
+func TestWriter_OpenActive_ExistingSegments(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "orders")
+
+	w1, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, w1.Write(makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w1.Close())
+
+	w2, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, w2.Write(makeTestEnvelope(t, "ord-2")))
+	require.NoError(t, w2.Close())
+
+	lines := readAllSegments(t, channelDir)
+	assert.Len(t, lines, 2)
+	for i, line := range lines {
+		var v map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &v), "line %d invalid JSON", i)
+	}
+}
+
+// TestWriter_OpenActive_CreateError verifies that a createSegment failure during
+// startup (no existing segments) is logged and Close does not deadlock.
+func TestWriter_OpenActive_CreateError(t *testing.T) {
+	log := &testutil.FakeLogger{}
+	w := newChannelWriterWithFactory("", 0, failCreateFactory{}, 0, nil, log)
+
+	// run() exits immediately after logging the error.
+	require.NoError(t, w.Close())
+	assert.True(t, log.HasError("open active segment on startup"))
+
+	// stopCh is closed; subsequent writes must return ErrWriterClosed.
+	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
+}
+
+// TestWriter_OpenActive_OpenError verifies that an openSegment failure on an
+// existing segment is logged and Close does not deadlock.
+func TestWriter_OpenActive_OpenError(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "ch")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	// Create a segment file so listSegments returns it and openSegment is called.
+	require.NoError(t, os.WriteFile(filepath.Join(channelDir, segmentName(0)), nil, 0o600))
+
+	log := &testutil.FakeLogger{}
+	w := newChannelWriterWithFactory(channelDir, 0, failOpenFactory{}, 0, nil, log)
+
+	require.NoError(t, w.Close())
+	assert.True(t, log.HasError("open active segment on startup"))
+
+	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
 }
