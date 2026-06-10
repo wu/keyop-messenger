@@ -2,6 +2,7 @@ package messenger
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -333,6 +334,41 @@ func TestEphemeralMessenger_RegisterPayloadType_Multiple(t *testing.T) {
 	assert.NoError(t, em.RegisterPayloadType("test.EventA", EventA{}))
 	assert.NoError(t, em.RegisterPayloadType("test.EventB", EventB{}))
 	assert.NoError(t, em.RegisterPayloadType("test.EventC", EventC{}))
+}
+
+// TestEphemeralMessenger_Connect_AutoReconnect exercises the AutoReconnect=true
+// branch of Connect (calls ConnectWithReconnect instead of Connect).
+func TestEphemeralMessenger_Connect_AutoReconnect(t *testing.T) {
+	t.Parallel()
+	em, err := NewEphemeralMessenger(EphemeralConfig{
+		HubAddr:       "invalid..addr:999999",
+		InstanceName:  "test-client",
+		AutoReconnect: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = em.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	err = em.Connect(ctx)
+	assert.Error(t, err, "Connect with invalid address must fail")
+}
+
+// TestEphemeralMessenger_RegisterPayloadType_NilPrototype exercises the
+// non-duplicate error path in RegisterPayloadType (prototype == nil).
+func TestEphemeralMessenger_RegisterPayloadType_NilPrototype(t *testing.T) {
+	t.Parallel()
+	em, err := NewEphemeralMessenger(EphemeralConfig{
+		HubAddr:      "hub.example.com:7740",
+		InstanceName: "test-client",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = em.Close() })
+
+	err = em.RegisterPayloadType("test.Event", nil)
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrPayloadTypeAlreadyRegistered),
+		"nil-prototype error must not be wrapped as ErrPayloadTypeAlreadyRegistered")
 }
 
 // testLogger is a simple logger for testing that tracks call counts.
