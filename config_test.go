@@ -5,9 +5,11 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 // intPtr returns a pointer to n. Used to set *int config fields in tests.
@@ -376,4 +378,126 @@ storage: {}
 	_, err := LoadConfig(path)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "storage.data_dir is required")
+}
+
+// ---- Duration.UnmarshalYAML -------------------------------------------------
+
+// TestDuration_UnmarshalYAML verifies that Duration correctly parses Go duration
+// strings when decoded from YAML.
+func TestDuration_UnmarshalYAML(t *testing.T) {
+	cases := []struct {
+		input string
+		want  time.Duration
+	}{
+		{"1h", time.Hour},
+		{"30m", 30 * time.Minute},
+		{"168h", 168 * time.Hour},
+		{"500ms", 500 * time.Millisecond},
+		{"0s", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			var d Duration
+			require.NoError(t, yaml.Unmarshal([]byte(`"`+tc.input+`"`), &d))
+			assert.Equal(t, tc.want, d.Duration)
+		})
+	}
+}
+
+// TestDuration_UnmarshalYAML_Invalid verifies that an unparseable duration
+// string returns a wrapped error that includes "invalid duration".
+func TestDuration_UnmarshalYAML_Invalid(t *testing.T) {
+	var d Duration
+	err := yaml.Unmarshal([]byte(`"not-a-duration"`), &d)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid duration")
+}
+
+// TestLoadConfig_WithFedClientOffsetTTL verifies that hub.fed_client_offset_ttl
+// is parsed via Duration.UnmarshalYAML and reflects the correct value.
+func TestLoadConfig_WithFedClientOffsetTTL(t *testing.T) {
+	const input = `
+name: test-host
+storage:
+  data_dir: /var/keyop
+hub:
+  fed_client_offset_ttl: "336h"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 336*time.Hour, cfg.Hub.FedClientOffsetTTL.Duration)
+}
+
+// TestLoadConfig_InvalidFedClientOffsetTTL verifies that an unparseable
+// fed_client_offset_ttl causes LoadConfig to return a decode error.
+func TestLoadConfig_InvalidFedClientOffsetTTL(t *testing.T) {
+	const input = `
+name: test-host
+storage:
+  data_dir: /var/keyop
+hub:
+  fed_client_offset_ttl: "not-a-duration"
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+
+	_, err := LoadConfig(path)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decode config")
+}
+
+// TestLoadConfig_AllowedPeers_SubscribePublish verifies that per-peer subscribe
+// and publish channel lists round-trip correctly through YAML.
+func TestLoadConfig_AllowedPeers_SubscribePublish(t *testing.T) {
+	const input = `
+name: test-host
+storage:
+  data_dir: /var/keyop
+hub:
+  enabled: true
+  listen_addr: "0.0.0.0:7740"
+  allowed_peers:
+    - name: client-a
+      subscribe: [orders, events]
+      publish:   [commands]
+    - name: client-b
+      subscribe: [alerts]
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Hub.AllowedPeers, 2)
+
+	peerA := cfg.Hub.AllowedPeers[0]
+	assert.Equal(t, "client-a", peerA.Name)
+	assert.Equal(t, []string{"orders", "events"}, peerA.Subscribe)
+	assert.Equal(t, []string{"commands"}, peerA.Publish)
+
+	peerB := cfg.Hub.AllowedPeers[1]
+	assert.Equal(t, "client-b", peerB.Name)
+	assert.Equal(t, []string{"alerts"}, peerB.Subscribe)
+	assert.Empty(t, peerB.Publish)
+}
+
+// TestLoadConfig_StorageOffsetFlushIntervalMS verifies that
+// storage.offset_flush_interval_ms round-trips through YAML.
+func TestLoadConfig_StorageOffsetFlushIntervalMS(t *testing.T) {
+	const input = `
+name: test-host
+storage:
+  data_dir: /var/keyop
+  offset_flush_interval_ms: 250
+`
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(input), 0600))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 250, cfg.Storage.OffsetFlushIntervalMS)
 }
