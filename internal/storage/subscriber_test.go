@@ -398,6 +398,115 @@ func TestSubscriber_RetryBackoff(t *testing.T) {
 	}
 }
 
+// TestSubscriber_DeadLetter_WriterError verifies that a dlWriter.Write failure
+// is logged and does not prevent the subscriber from advancing its offset (so
+// the message is not re-delivered on restart).
+func TestSubscriber_DeadLetter_WriterError(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "orders")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	watcher := &testutil.FakeChannelWatcher{}
+	notifyC, err := watcher.Watch(channelDir)
+	require.NoError(t, err)
+
+	dlWriter := &testutil.FakeChannelWriter{}
+	dlWriter.SetError(fmt.Errorf("dead-letter storage unavailable"))
+
+	log := &testutil.FakeLogger{}
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, log, 0)
+	require.NoError(t, err)
+	sub.retryDelay = func(int) time.Duration { return 0 }
+
+	// Two messages: both fail handler and attempt (and fail) the DL write.
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "a"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]string{"k": "b"}))
+
+	var deliveries atomic.Int64
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		deliveries.Add(1)
+		return fmt.Errorf("always fails")
+	})
+	t.Cleanup(sub.Stop)
+
+	require.Eventually(t, func() bool { return deliveries.Load() >= 2 },
+		testTimeout, time.Millisecond, "both messages must be dispatched")
+	sub.Stop()
+
+	// DL write failures must be logged.
+	assert.True(t, log.HasError("write dead-letter"),
+		"dead-letter write failure must be logged at Error level")
+	// The error path must not corrupt the DL writer's state.
+	assert.Empty(t, dlWriter.Written(),
+		"failed DL write must not persist the envelope")
+	// Offset must be advanced so the messages are not re-delivered on restart.
+	off, readErr := ReadOffset(filepath.Join(offsetDir, "s.offset"))
+	require.NoError(t, readErr)
+	assert.Greater(t, off, int64(0),
+		"offset must advance past messages whose DL write failed")
+}
+
+// TestSubscriber_OffsetWriteFailure_ProbeSucceeds verifies the recovery path:
+// when the probe write in processAvailable succeeds after accumulated failures,
+// consecutiveOffsetErrs is reset to 0 and delivery continues normally.
+func TestSubscriber_OffsetWriteFailure_ProbeSucceeds(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "orders")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	notifier := NewLocalNotifier()
+	dlWriter := &testutil.FakeChannelWriter{}
+	log := &testutil.FakeLogger{}
+
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
+	require.NoError(t, err)
+	sub.retryDelay = func(int) time.Duration { return 0 }
+
+	// Fail the first maxConsecutiveOffsetErrs flushes; succeed on everything after.
+	var writeCount atomic.Int64
+	sub.writeOffsetFn = func(path string, offset int64) error {
+		if writeCount.Add(1) <= int64(maxConsecutiveOffsetErrs) {
+			return fmt.Errorf("disk full")
+		}
+		return WriteOffset(path, offset)
+	}
+
+	// Write exactly maxConsecutiveOffsetErrs messages so that every offset flush
+	// in the initial processAvailable fails, driving consecutiveOffsetErrs to the
+	// threshold that arms the probe.
+	for i := 0; i < maxConsecutiveOffsetErrs; i++ {
+		writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]int{"n": i}))
+	}
+
+	received := make(chan *envelope.Envelope, 20)
+	sub.Start(notifier.C(), func(env *envelope.Envelope, _ any) error {
+		received <- env
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// Drain initial messages and confirm all offset write attempts are done.
+	collectN(t, received, maxConsecutiveOffsetErrs, testTimeout)
+	require.Eventually(t, func() bool {
+		return writeCount.Load() >= int64(maxConsecutiveOffsetErrs)
+	}, testTimeout, time.Millisecond, "all initial offset writes must have been attempted")
+
+	// Write one more message to be delivered after the probe write resets the counter.
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]int{"n": maxConsecutiveOffsetErrs}))
+
+	// Notify: the next processAvailable attempts the probe write (call N+1, which
+	// succeeds), resets consecutiveOffsetErrs to 0, and then delivers the new message.
+	notifier.Notify()
+	collectN(t, received, 1, testTimeout)
+
+	// The probe succeeded immediately: the "pausing delivery" error must not appear.
+	assert.False(t, log.HasError("offset writes still failing"),
+		"successful probe write must not log the pausing-delivery error")
+	// The initial flush failures must still have been logged.
+	assert.True(t, log.HasError("persist offset"),
+		"initial offset write failures must be logged")
+}
+
 func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "orders")
