@@ -72,3 +72,31 @@ func TestOffsetFileExists(t *testing.T) {
 	require.NoError(t, WriteOffset(path, 0))
 	assert.True(t, OffsetFileExists(path), "should exist after write")
 }
+
+// TestWriteOffset_CreateFailure verifies the error path when the temporary file
+// cannot be created (e.g. the parent directory does not exist).
+func TestWriteOffset_CreateFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nonexistent", "sub.offset")
+
+	err := WriteOffset(path, 42)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "create tmp offset file")
+}
+
+// TestWriteOffset_RenameFailure verifies the error path when the atomic rename
+// fails (target path is a directory) and that the .tmp file is cleaned up.
+func TestWriteOffset_RenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub.offset")
+	// Create a directory at the target path so os.Rename(tmp, path) fails with EISDIR.
+	require.NoError(t, os.MkdirAll(path, 0o750))
+
+	err := WriteOffset(path, 42)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rename offset file")
+
+	// The .tmp file must be cleaned up after the failed rename.
+	_, statErr := os.Stat(path + ".tmp")
+	assert.True(t, os.IsNotExist(statErr), ".tmp file must not remain after rename failure")
+}

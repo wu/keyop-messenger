@@ -310,3 +310,131 @@ func TestCompactor_NoConsumersDeletesAllSealedSegments(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, segs, 1, "all sealed segments should be deleted when there are no consumers")
 }
+
+// ---- MinOffset tests --------------------------------------------------------
+
+// TestMinOffset_SingleSubscriber verifies that MinOffset returns the sole
+// subscriber's persisted offset.
+func TestMinOffset_SingleSubscriber(t *testing.T) {
+	c, _, offsetDir := newTestCompactor(t)
+
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 42))
+	c.RegisterSubscriber("sub1")
+
+	off, err := c.MinOffset()
+	require.NoError(t, err)
+	assert.Equal(t, int64(42), off)
+}
+
+// TestMinOffset_ReturnsMinAcrossSubscribers verifies that MinOffset returns the
+// smallest offset when multiple subscribers are registered.
+func TestMinOffset_ReturnsMinAcrossSubscribers(t *testing.T) {
+	c, _, offsetDir := newTestCompactor(t)
+
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 100))
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub2.offset"), 50))
+	c.RegisterSubscriber("sub1")
+	c.RegisterSubscriber("sub2")
+
+	off, err := c.MinOffset()
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), off)
+}
+
+// TestMinOffset_MissingOffsetFile verifies that MinOffset returns an error when
+// a registered subscriber's offset file does not exist.
+func TestMinOffset_MissingOffsetFile(t *testing.T) {
+	c, _, _ := newTestCompactor(t)
+
+	// Subscriber registered but no offset file written.
+	c.RegisterSubscriber("ghost")
+
+	_, err := c.MinOffset()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read offset for subscriber")
+}
+
+// TestMinOffset_CorruptOffsetFile verifies that MinOffset returns an error when
+// a registered subscriber's offset file contains unparseable content.
+func TestMinOffset_CorruptOffsetFile(t *testing.T) {
+	c, _, offsetDir := newTestCompactor(t)
+
+	require.NoError(t, os.WriteFile(filepath.Join(offsetDir, "sub1.offset"), []byte("not-a-number\n"), 0o600))
+	c.RegisterSubscriber("sub1")
+
+	_, err := c.MinOffset()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "read offset for subscriber")
+}
+
+// TestMinOffset_FedOffsetBelowLocal verifies that a fed-*.offset below the
+// local subscriber's position is used as the minimum.
+func TestMinOffset_FedOffsetBelowLocal(t *testing.T) {
+	c, _, offsetDir := newTestCompactor(t)
+
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 100))
+	c.RegisterSubscriber("sub1")
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), 50))
+
+	off, err := c.MinOffset()
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), off, "fed offset below local must lower the minimum")
+}
+
+// TestMinOffset_FedOffsetAboveLocal verifies that a fed-*.offset above the
+// local subscriber's position does not change the minimum.
+func TestMinOffset_FedOffsetAboveLocal(t *testing.T) {
+	c, _, offsetDir := newTestCompactor(t)
+
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 50))
+	c.RegisterSubscriber("sub1")
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "fed-peer1.offset"), 100))
+
+	off, err := c.MinOffset()
+	require.NoError(t, err)
+	assert.Equal(t, int64(50), off, "fed offset above local must not raise the minimum")
+}
+
+// ---- fedMinOffset branch tests (exercised via MaybeCompact) -----------------
+
+// TestMaybeCompact_OffsetDirNotExist verifies that MaybeCompact succeeds when
+// the offset directory does not exist; fedMinOffset must treat a non-existent
+// directory as having no peer offsets and return MaxInt64 without error.
+func TestMaybeCompact_OffsetDirNotExist(t *testing.T) {
+	base := t.TempDir()
+	channelDir := filepath.Join(base, "orders")
+	// offsetDir intentionally absent — covers the os.IsNotExist branch in fedMinOffset.
+	offsetDir := filepath.Join(base, "nonexistent-offsets")
+	c := NewCompactor(offsetDir, 0, nil)
+
+	seg0Size := writeSegment(t, channelDir, 0, 5)
+	seg1Size := writeSegment(t, channelDir, seg0Size, 5)
+	_ = writeSegment(t, channelDir, seg0Size+seg1Size, 5) // active
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 1, "all sealed segments must be deleted when offset dir is absent")
+}
+
+// TestMaybeCompact_CorruptFedOffset verifies that a corrupt fed-*.offset file
+// does not cause MaybeCompact to return an error; the corrupt peer offset is
+// silently skipped and compaction proceeds based on the local subscriber offset.
+func TestMaybeCompact_CorruptFedOffset(t *testing.T) {
+	c, channelDir, offsetDir := newTestCompactor(t)
+
+	seg0Size := writeSegment(t, channelDir, 0, 5)
+	_ = writeSegment(t, channelDir, seg0Size, 5) // active
+
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), seg0Size))
+	c.RegisterSubscriber("sub1")
+	// Corrupt fed-*.offset must be silently ignored, not block compaction.
+	require.NoError(t, os.WriteFile(filepath.Join(offsetDir, "fed-peer1.offset"), []byte("garbage\n"), 0o600))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 1, "sealed segment must be deleted based on subscriber offset despite corrupt fed file")
+}
