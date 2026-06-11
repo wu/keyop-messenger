@@ -1,49 +1,32 @@
 package federation_test
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"net"
 	"testing"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/federation"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(*http.Request) bool { return true },
-}
-
-// newWSPair creates a pair of WebSocket connections (server, client) backed by
-// an in-process httptest server. Both connections are closed via t.Cleanup.
-func newWSPair(t *testing.T) (server, client *websocket.Conn) {
+// newConnPair creates a pair of Conn connections backed by an in-process
+// net.Pipe. Both connections are closed via t.Cleanup.
+func newConnPair(t *testing.T) (server, client *federation.Conn) {
 	t.Helper()
-
-	ready := make(chan *websocket.Conn, 1)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
-		ready <- conn
-	}))
-	t.Cleanup(srv.Close)
-
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	clientConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = clientConn.Close() })
-
-	serverConn := <-ready
-	t.Cleanup(func() { _ = serverConn.Close() })
-
-	return serverConn, clientConn
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	})
+	server = federation.NewConn(c1, c1, c1.RemoteAddr(), func() error { return c1.Close() })
+	client = federation.NewConn(c2, c2, c2.RemoteAddr(), func() error { return c2.Close() })
+	return
 }
 
 // TestHandshakeRoundTrip verifies that a HandshakeMsg survives a send/receive
-// cycle over a live WebSocket connection.
+// cycle over a live connection.
 func TestHandshakeRoundTrip(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	sent := federation.HandshakeMsg{
 		InstanceName: "hub-east",
@@ -68,32 +51,45 @@ func TestHandshakeRoundTrip(t *testing.T) {
 }
 
 // TestHandshakeBidirectional verifies the exchange works in both directions.
+// net.Pipe is unbuffered, so each side must send and receive concurrently.
 func TestHandshakeBidirectional(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	srvMsg := federation.HandshakeMsg{InstanceName: "hub-server", Role: "hub", Version: "1"}
 	cliMsg := federation.HandshakeMsg{InstanceName: "hub-client", Role: "hub", Version: "1"}
 
-	// Both sides send concurrently, then receive.
-	errSrv := make(chan error, 1)
-	errCli := make(chan error, 1)
-	go func() { errSrv <- federation.SendHandshake(srv, srvMsg) }()
-	go func() { errCli <- federation.SendHandshake(cli, cliMsg) }()
-	require.NoError(t, <-errSrv)
-	require.NoError(t, <-errCli)
+	type result struct {
+		msg federation.HandshakeMsg
+		err error
+	}
+	srvCh := make(chan result, 1)
+	cliCh := make(chan result, 1)
 
-	gotBySrv, err := federation.ReceiveHandshake(srv)
-	require.NoError(t, err)
-	gotByCli, err := federation.ReceiveHandshake(cli)
-	require.NoError(t, err)
+	// Each side sends asynchronously and receives synchronously so the pipe
+	// drains: srv's send unblocks when cli's receive reads from it, and vice versa.
+	go func() {
+		go func() { _ = federation.SendHandshake(srv, srvMsg) }()
+		msg, err := federation.ReceiveHandshake(srv)
+		srvCh <- result{msg, err}
+	}()
+	go func() {
+		go func() { _ = federation.SendHandshake(cli, cliMsg) }()
+		msg, err := federation.ReceiveHandshake(cli)
+		cliCh <- result{msg, err}
+	}()
 
-	assert.Equal(t, cliMsg.InstanceName, gotBySrv.InstanceName)
-	assert.Equal(t, srvMsg.InstanceName, gotByCli.InstanceName)
+	srvResult := <-srvCh
+	cliResult := <-cliCh
+
+	require.NoError(t, srvResult.err)
+	require.NoError(t, cliResult.err)
+	assert.Equal(t, cliMsg.InstanceName, srvResult.msg.InstanceName)
+	assert.Equal(t, srvMsg.InstanceName, cliResult.msg.InstanceName)
 }
 
 // TestAckRoundTrip verifies that an AckMsg survives a send/receive cycle.
 func TestAckRoundTrip(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	sent := federation.AckMsg{LastID: "01J0000000000000000000000A"}
 
@@ -114,7 +110,7 @@ func TestAckRoundTrip(t *testing.T) {
 // TestReceiveHandshakeReadError verifies that a network-level read failure
 // (peer closed the connection) is propagated with context.
 func TestReceiveHandshakeReadError(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	require.NoError(t, cli.Close())
 
@@ -123,27 +119,27 @@ func TestReceiveHandshakeReadError(t *testing.T) {
 	assert.Contains(t, err.Error(), "receive handshake")
 }
 
-// TestReceiveHandshakeWrongFrameType verifies that a binary WebSocket frame
-// is rejected with an "expected text frame" error.
+// TestReceiveHandshakeWrongFrameType verifies that a binary frame
+// is rejected with an "expected JSON frame" error.
 func TestReceiveHandshakeWrongFrameType(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	errc := make(chan error, 1)
-	go func() { errc <- cli.WriteMessage(websocket.BinaryMessage, []byte(`{"instance_name":"x"}`)) }()
+	go func() { errc <- cli.WriteMessage(federation.MsgTypeBinary, []byte(`{"instance_name":"x"}`)) }()
 
 	_, err := federation.ReceiveHandshake(srv)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "expected text frame")
+	assert.Contains(t, err.Error(), "expected JSON frame")
 	require.NoError(t, <-errc)
 }
 
-// TestReceiveHandshakeBadJSON verifies that a text frame containing invalid
+// TestReceiveHandshakeBadJSON verifies that a JSON frame containing invalid
 // JSON returns an unmarshal error.
 func TestReceiveHandshakeBadJSON(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	errc := make(chan error, 1)
-	go func() { errc <- cli.WriteMessage(websocket.TextMessage, []byte("{not valid json")) }()
+	go func() { errc <- cli.WriteMessage(federation.MsgTypeJSON, []byte("{not valid json")) }()
 
 	_, err := federation.ReceiveHandshake(srv)
 	require.Error(t, err)
@@ -154,7 +150,7 @@ func TestReceiveHandshakeBadJSON(t *testing.T) {
 // TestSendHandshakeWriteError verifies that SendHandshake propagates a write
 // error when the underlying connection is already closed.
 func TestSendHandshakeWriteError(t *testing.T) {
-	_, cli := newWSPair(t)
+	_, cli := newConnPair(t)
 
 	require.NoError(t, cli.Close())
 
@@ -166,7 +162,7 @@ func TestSendHandshakeWriteError(t *testing.T) {
 // TestReceiveAckReadError verifies that a network-level read failure is
 // propagated with context.
 func TestReceiveAckReadError(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	require.NoError(t, cli.Close())
 
@@ -177,24 +173,24 @@ func TestReceiveAckReadError(t *testing.T) {
 
 // TestReceiveAckWrongFrameType verifies that a binary frame is rejected.
 func TestReceiveAckWrongFrameType(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	errc := make(chan error, 1)
-	go func() { errc <- cli.WriteMessage(websocket.BinaryMessage, []byte(`{"last_id":"x"}`)) }()
+	go func() { errc <- cli.WriteMessage(federation.MsgTypeBinary, []byte(`{"last_id":"x"}`)) }()
 
 	_, err := federation.ReceiveAck(srv)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "expected text frame")
+	assert.Contains(t, err.Error(), "expected JSON frame")
 	require.NoError(t, <-errc)
 }
 
-// TestReceiveAckBadJSON verifies that a text frame with invalid JSON returns
+// TestReceiveAckBadJSON verifies that a JSON frame with invalid JSON returns
 // an unmarshal error.
 func TestReceiveAckBadJSON(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	errc := make(chan error, 1)
-	go func() { errc <- cli.WriteMessage(websocket.TextMessage, []byte("{bad json")) }()
+	go func() { errc <- cli.WriteMessage(federation.MsgTypeJSON, []byte("{bad json")) }()
 
 	_, err := federation.ReceiveAck(srv)
 	require.Error(t, err)
@@ -205,7 +201,7 @@ func TestReceiveAckBadJSON(t *testing.T) {
 // TestSendAckWriteError verifies that SendAck propagates a write error when
 // the connection is already closed.
 func TestSendAckWriteError(t *testing.T) {
-	_, cli := newWSPair(t)
+	_, cli := newConnPair(t)
 
 	require.NoError(t, cli.Close())
 
@@ -216,7 +212,7 @@ func TestSendAckWriteError(t *testing.T) {
 
 // TestAckEmptyLastID verifies zero-value AckMsg round-trips cleanly.
 func TestAckEmptyLastID(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	errc := make(chan error, 1)
 	var received federation.AckMsg

@@ -5,9 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -20,22 +18,20 @@ import (
 // ---- helpers ----------------------------------------------------------------
 
 // sendBinaryFrame encodes records with WriteFrame and sends them as a single
-// WebSocket binary message on conn.
-func sendBinaryFrame(t *testing.T, conn *websocket.Conn, records [][]byte) {
+// binary message on conn.
+func sendBinaryFrame(t *testing.T, conn *federation.Conn, records [][]byte) {
 	t.Helper()
-	w, err := conn.NextWriter(websocket.BinaryMessage)
+	w, err := conn.NextWriter(federation.MsgTypeBinary)
 	require.NoError(t, err)
 	require.NoError(t, federation.WriteFrame(w, records))
 	require.NoError(t, w.Close())
 }
 
-// readAck reads the next ack text-frame from conn with a 2-second deadline.
-func readAck(t *testing.T, conn *websocket.Conn) federation.AckMsg {
+// readAck reads the next ack frame from conn.
+func readAck(t *testing.T, conn *federation.Conn) federation.AckMsg {
 	t.Helper()
-	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
 	ack, err := federation.ReceiveAck(conn)
 	require.NoError(t, err)
-	_ = conn.SetReadDeadline(time.Time{})
 	return ack
 }
 
@@ -43,7 +39,7 @@ func readAck(t *testing.T, conn *websocket.Conn) federation.AckMsg {
 // t.Cleanup. fakeAuditLog and FakeLogger are defined in sibling test files.
 func startReceiver(
 	t *testing.T,
-	conn *websocket.Conn,
+	conn *federation.Conn,
 	policy *federation.AtomicPolicy,
 	writer func(*envelope.Envelope) error,
 	log *testutil.FakeLogger,
@@ -75,7 +71,7 @@ func marshalEnv(t *testing.T, env envelope.Envelope) []byte {
 // size exceeds maxBatchBytes is NOT delivered to localWriter but an ack is still
 // sent so the sender can advance its window past the undeliverable message.
 func TestPeerReceiver_OversizedRecordSkipped(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	log := &testutil.FakeLogger{}
 
 	var writeCount atomic.Int64
@@ -105,7 +101,7 @@ func TestPeerReceiver_OversizedRecordSkipped(t *testing.T) {
 // not permitted by the receive policy is discarded without calling localWriter,
 // is logged and audited, but an ack is still sent to advance the sender's window.
 func TestPeerReceiver_InboundPolicyViolation(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
 
@@ -137,7 +133,7 @@ func TestPeerReceiver_InboundPolicyViolation(t *testing.T) {
 // storage but an ack is still sent to advance the sender's window, preventing
 // the sender from replaying the same message indefinitely.
 func TestPeerReceiver_LocalWriteFailure(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	log := &testutil.FakeLogger{}
 
 	startReceiver(t, cli, nil,

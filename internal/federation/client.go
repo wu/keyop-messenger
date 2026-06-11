@@ -1,20 +1,26 @@
 package federation
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
+
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
-// Client dials a hub, runs a PeerSender for outbound messages, and reconnects
-// with exponential backoff on disconnect. A PeerReceiver can be optionally
-// started for hubs that also push messages back to the client.
+// Client dials a hub over HTTP/2, runs a PeerSender for outbound messages, and
+// reconnects with exponential backoff on disconnect. A PeerReceiver can be
+// optionally started for hubs that also push messages back to the client.
 type Client struct {
 	instanceName      string
 	tlsCfg            *tls.Config
@@ -85,29 +91,103 @@ func (c *Client) Dial(hubAddr string) (*PeerSender, error) {
 	return c.dial(hubAddr)
 }
 
-func (c *Client) dial(hubAddr string) (*PeerSender, error) {
-	dialer := websocket.Dialer{TLSClientConfig: c.tlsCfg}
-	url := "wss://" + hubAddr
-	if c.tlsCfg == nil {
-		url = "ws://" + hubAddr
+// buildHTTPClient returns an http.Client configured for HTTP/2 over TLS (when
+// tlsCfg is non-nil) or h2c cleartext HTTP/2 (when tlsCfg is nil).
+func (c *Client) buildHTTPClient() *http.Client {
+	if c.tlsCfg != nil {
+		return &http.Client{
+			Transport: &http2.Transport{
+				TLSClientConfig: c.tlsCfg,
+			},
+		}
 	}
-	conn, _, err := dialer.Dial(url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("federation: client dial %s: %w", hubAddr, err)
+	// Cleartext HTTP/2 (h2c) — used in tests and plain-TCP deployments.
+	return &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		},
 	}
+}
 
-	// Send handshake. LastID is omitted — the hub tracks delivery progress
-	// server-side via per-channel offset files and no longer relies on the
-	// client to report its position.
-	if err := SendHandshake(conn, HandshakeMsg{
+func (c *Client) dial(hubAddr string) (*PeerSender, error) {
+	scheme := "https"
+	if c.tlsCfg == nil {
+		scheme = "http"
+	}
+	url := scheme + "://" + hubAddr
+
+	// Create a pipe for the HTTP/2 request body (client→hub direction).
+	pr, pw := io.Pipe()
+
+	req, err := http.NewRequest(http.MethodPost, url, pr)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("federation: client build request %s: %w", hubAddr, err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = -1 // streaming body of unknown length
+
+	// Marshal the client handshake before dialing so it can be written
+	// concurrently with the HTTP/2 HEADERS exchange.
+	hsData, err := json.Marshal(HandshakeMsg{
 		InstanceName: c.instanceName,
 		Role:         "client",
 		Version:      wireVersion,
 		Subscribe:    c.subscribeChannels,
-	}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("federation: client send handshake: %w", err)
+	})
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("federation: client marshal handshake: %w", err)
 	}
+
+	httpClient := c.buildHTTPClient()
+
+	// Write the handshake to the request body pipe concurrently with Do().
+	// Do() reads from pr (via HTTP/2 DATA frames) once the server starts reading
+	// the request body. The goroutine blocks on pw.Write until pr is drained.
+	writeErrCh := make(chan error, 1)
+	go func() {
+		// Use a temporary write-only conn to frame the handshake correctly.
+		tmpConn := NewConn(nil, pw, nil, nil)
+		writeErrCh <- tmpConn.WriteMessage(MsgTypeJSON, hsData)
+	}()
+
+	// Do() blocks until the server sends HTTP response headers (200 OK).
+	// This happens after the server reads and processes the client handshake.
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		<-writeErrCh
+		return nil, fmt.Errorf("federation: client connect %s: %w", hubAddr, err)
+	}
+
+	if writeErr := <-writeErrCh; writeErr != nil {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("federation: client send handshake: %w", writeErr)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("federation: client connect %s: unexpected status %d", hubAddr, resp.StatusCode)
+	}
+
+	// Build the full-duplex Conn: read from response body (hub→client),
+	// write to request body pipe (client→hub).
+	closeFn := func() error {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil
+	}
+	conn := NewConn(resp.Body, pw, &stringAddr{"tcp", hubAddr}, closeFn)
+
 	// Receive hub's handshake.
 	if _, err := ReceiveHandshake(conn); err != nil {
 		_ = conn.Close()

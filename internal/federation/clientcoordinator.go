@@ -3,20 +3,18 @@ package federation
 import (
 	"errors"
 	"sync"
-
-	"github.com/gorilla/websocket"
 )
 
-// clientCoordinator serialises hub→peer WebSocket sends across all channel
-// readers attached to one peer connection. One instance is created per
-// connected peer that has subscriptions.
+// clientCoordinator serialises hub→peer sends across all channel readers
+// attached to one peer connection. One instance is created per connected peer
+// that has subscriptions.
 //
-// A single goroutine dequeues sendReqs from requestCh, writes the binary
-// WebSocket frame, waits for the text-frame ack routed from the PeerReceiver
-// via ackCh, then closes req.doneCh to unblock the originating channelReader.
+// A single goroutine dequeues sendReqs from requestCh, writes the binary frame,
+// waits for the JSON ack routed from the PeerReceiver via ackCh, then closes
+// req.doneCh to unblock the originating channelReader.
 // Sequential delivery is guaranteed by the single goroutine model.
 type clientCoordinator struct {
-	conn          *websocket.Conn
+	conn          *Conn
 	connWriteMu   *sync.Mutex   // shared with PeerReceiver to serialise all writes
 	ackCh         <-chan AckMsg // acks routed from PeerReceiver (owned by hub side)
 	maxBatchBytes int
@@ -34,7 +32,7 @@ type clientCoordinator struct {
 // requestCh is created here and assigned to each channelReader so they all
 // write to the same queue.
 func newClientCoordinator(
-	conn *websocket.Conn,
+	conn *Conn,
 	connWriteMu *sync.Mutex,
 	ackCh <-chan AckMsg,
 	maxBatchBytes int,
@@ -107,13 +105,13 @@ func (cc *clientCoordinator) run() {
 	}
 }
 
-// sendBatch writes one batch to the WebSocket connection and waits for the ack.
+// sendBatch writes one batch to the connection and waits for the ack.
 // Returns a non-nil error on connection or ack failure; the caller (run) will
 // exit on error, triggering the hub cleanup path.
 func (cc *clientCoordinator) sendBatch(req sendReq) error {
 	// Write the binary frame holding all raw JSONL lines.
 	cc.connWriteMu.Lock()
-	w, err := cc.conn.NextWriter(websocket.BinaryMessage)
+	w, err := cc.conn.NextWriter(MsgTypeBinary)
 	if err != nil {
 		cc.connWriteMu.Unlock()
 		return err
@@ -129,7 +127,7 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 	}
 	cc.connWriteMu.Unlock()
 
-	// Wait for the text-frame ack routed from the PeerReceiver.
+	// Wait for the JSON ack routed from the PeerReceiver.
 	select {
 	case _, ok := <-cc.ackCh:
 		if !ok {

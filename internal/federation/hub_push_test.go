@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -66,7 +65,7 @@ func writeSegment(t *testing.T, channelDir string, startOffset int64, envs []env
 }
 
 // hubPushHandshake connects cli as a subscribing peer.
-func hubPushHandshake(t *testing.T, conn *websocket.Conn, peerName string, subscribe []string) {
+func hubPushHandshake(t *testing.T, conn *federation.Conn, peerName string, subscribe []string) {
 	t.Helper()
 	require.NoError(t, federation.SendHandshake(conn, federation.HandshakeMsg{
 		InstanceName: peerName, Role: "client", Version: "1",
@@ -78,7 +77,7 @@ func hubPushHandshake(t *testing.T, conn *websocket.Conn, peerName string, subsc
 
 // subscribingReceiver attaches a PeerReceiver on conn that captures delivered
 // envelopes. It is cleaned up via t.Cleanup.
-func subscribingReceiver(t *testing.T, conn *websocket.Conn) *captureWriter {
+func subscribingReceiver(t *testing.T, conn *federation.Conn) *captureWriter {
 	t.Helper()
 	cw := &captureWriter{}
 	dd, err := dedup.NewLRUDedup(1000)
@@ -141,7 +140,7 @@ func TestHubPushBasicDelivery(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "sub1", []string{"events"})
 	waitForConnected(t, auditL) // hub must register channelReaders before we notify
@@ -171,7 +170,7 @@ func TestHubPushMultipleChannels(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "sub", []string{"alpha", "beta"})
 	waitForConnected(t, auditL)
@@ -213,7 +212,7 @@ func TestHubPushResumeFromOffset(t *testing.T) {
 	require.NoError(t, os.MkdirAll(offsetDir, 0o750))
 	require.NoError(t, storage.WriteOffset(filepath.Join(offsetDir, "fed-resume-peer.offset"), n))
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "resume-peer", []string{"orders"})
 	waitForConnected(t, auditL)
@@ -241,7 +240,7 @@ func TestHubPushOffsetPersisted(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "offset-peer", []string{"metrics"})
 	waitForConnected(t, auditL)
@@ -281,7 +280,7 @@ func TestHubPushBatchSizeLimit(t *testing.T) {
 		func(*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 512, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "batch-peer", []string{"stream"})
 	waitForConnected(t, auditL)
@@ -321,7 +320,7 @@ func TestHubPushCorruptRecordSkipped(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "corrupt-peer", []string{"logs"})
 	waitForConnected(t, auditL)
@@ -372,7 +371,7 @@ func TestHubPushMultipleSegments(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "seg-peer", []string{"items"})
 	waitForConnected(t, auditL)
@@ -406,7 +405,7 @@ func TestHubPushNotDeliveredWithoutSubscription(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "selective", []string{"wanted"}) // not "unwanted"
 	waitForConnected(t, auditL)
@@ -444,7 +443,7 @@ func TestHubPushChannelAllowlistEnforced(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	// Client requests both channels; hub must restrict to allowed-ch.
 	hubPushHandshake(t, cli, "limited", []string{"allowed-ch", "blocked-ch"})
@@ -482,7 +481,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 		func(*envelope.Envelope) error { return nil },
 		dd, auditL, &testutil.FakeLogger{}, 1000, 65536, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "audit-peer", []string{"ch"})
 
@@ -519,7 +518,7 @@ func TestHubPushWrongVersionRecordSkipped(t *testing.T) {
 	}
 	hub, auditL := newHubWithData(t, cfg, dataDir)
 
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	hub.ServeTestConn(srv, nil)
 	hubPushHandshake(t, cli, "ver-peer", []string{"feed"})
 	waitForConnected(t, auditL)

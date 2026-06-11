@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -57,12 +56,6 @@ func (r *recordingAudit) findEventWithDetail(name, substr string) (audit.Event, 
 	return audit.Event{}, false
 }
 
-// mockHubHandshakeInternal performs the server side of the application handshake.
-func mockHubHandshakeInternal(conn *websocket.Conn) {
-	_ = conn.ReadJSON(&HandshakeMsg{})
-	_ = conn.WriteJSON(HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
-}
-
 // newSenderOnlyClient builds a sender-only Client (no localWriter) with short
 // reconnect timings suitable for these tests.
 func newSenderOnlyClient(auditL audit.AuditLogger, log *testutil.FakeLogger) *Client {
@@ -88,19 +81,14 @@ func newSenderOnlyClient(auditL audit.AuditLogger, log *testutil.FakeLogger) *Cl
 // TestClientDisconnect_AuditsPeerDisconnected verifies that ConnectWithReconnect
 // emits a peer_disconnected audit event (with "unacked=" in Detail) when the hub
 // closes without acking an in-flight message.
-//
-// The sender's Done() channel only fires when it is actively sending and
-// encounters an error (write failure or ack channel closed). We trigger this
-// by enqueueing a message so the sender blocks waiting for an ack, then the
-// server closes the connection without sending one.
 func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 	auditL := &recordingAudit{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		mockHubHandshakeInternal(conn)
+		_ = mockHubHandshake(conn)
 		// Read the binary message frame but close without sending an ack.
 		// This causes the client sender to detect the disconnect.
 		_, _, _ = conn.ReadMessage()
@@ -110,8 +98,7 @@ func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 	client := newSenderOnlyClient(auditL, log)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	err := client.ConnectWithReconnect(strings.TrimPrefix(wsURL, "ws://"))
+	err := client.ConnectWithReconnect(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	// Enqueue a message so the sender sends it and then blocks waiting for an ack.
@@ -142,17 +129,16 @@ func TestClientReconnect_AuditsFailedAttempts(t *testing.T) {
 	auditL := &recordingAudit{}
 
 	// Server accepts the initial connection, reads a message, then closes.
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		mockHubHandshakeInternal(conn)
+		_ = mockHubHandshake(conn)
 		_, _, _ = conn.ReadMessage() // read the message but close without acking
 	})
 
 	client := newSenderOnlyClient(auditL, log)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	addr := strings.TrimPrefix(wsURL, "ws://")
+	addr := fedServerAddr(srv)
 
 	err := client.ConnectWithReconnect(addr)
 	require.NoError(t, err)

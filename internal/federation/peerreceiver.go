@@ -5,7 +5,6 @@ import (
 	"io"
 	"sync"
 
-	"github.com/gorilla/websocket"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
@@ -18,14 +17,14 @@ type Deduplicator interface {
 
 // PeerReceiver reads binary data frames from conn, deduplicates, enforces the
 // receive policy, and hands each accepted envelope to localWriter. After each
-// batch it sends a text-frame ack. Blocking in localWriter propagates TCP
+// batch it sends a JSON ack. Blocking in localWriter propagates TCP
 // backpressure to the sender — this is intentional.
 //
 // When ackRouteCh is non-nil this receiver owns ALL reads on the connection;
-// text-frame acks destined for a co-located PeerSender are forwarded to
+// JSON acks destined for a co-located PeerSender are forwarded to
 // ackRouteCh. ackRouteCh is closed when the receiver exits.
 type PeerReceiver struct {
-	conn          *websocket.Conn
+	conn          *Conn
 	connWriteMu   *sync.Mutex   // protects concurrent writes to conn (shared with PeerSender if present)
 	policy        *AtomicPolicy // may be nil (accept everything)
 	dedup         Deduplicator
@@ -56,7 +55,7 @@ func (pr *PeerReceiver) LastReceivedID() string {
 
 // NewPeerReceiver creates a PeerReceiver and starts its goroutine.
 func NewPeerReceiver(
-	conn *websocket.Conn,
+	conn *Conn,
 	connWriteMu *sync.Mutex,
 	policy *AtomicPolicy,
 	dedup Deduplicator,
@@ -84,11 +83,11 @@ func NewPeerReceiver(
 }
 
 // newPeerReceiverWithAck creates a PeerReceiver that owns all reads on conn and
-// routes text-frame acks to ackRouteCh. Use this when a PeerSender also uses
+// routes JSON acks to ackRouteCh. Use this when a PeerSender also uses
 // the same conn to avoid concurrent reads. ackRouteCh is closed when the
 // receiver goroutine exits, which will unblock the paired PeerSender.
 func newPeerReceiverWithAck(
-	conn *websocket.Conn,
+	conn *Conn,
 	connWriteMu *sync.Mutex,
 	policy *AtomicPolicy,
 	dedup Deduplicator,
@@ -158,10 +157,10 @@ func (pr *PeerReceiver) run() {
 			}
 			return
 		}
-		if msgType != websocket.BinaryMessage {
-			// When sharing a conn with a PeerSender, text frames are acks
+		if msgType != MsgTypeBinary {
+			// When sharing a conn with a PeerSender, JSON frames are acks
 			// destined for that sender — route them via ackRouteCh.
-			if pr.ackRouteCh != nil && msgType == websocket.TextMessage {
+			if pr.ackRouteCh != nil && msgType == MsgTypeJSON {
 				data, readErr := io.ReadAll(r)
 				if readErr == nil {
 					var ack AckMsg

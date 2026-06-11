@@ -1,12 +1,10 @@
 package federation
 
 import (
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -21,23 +19,34 @@ type fakeAuditLogger2 struct{}
 func (f *fakeAuditLogger2) Log(_ audit.Event) error { return nil }
 func (f *fakeAuditLogger2) Close() error            { return nil }
 
+// mockHubHandshake performs the server-side application handshake on a *Conn.
+func mockHubHandshake(conn *Conn) error {
+	if _, err := ReceiveHandshake(conn); err != nil {
+		return err
+	}
+	return SendHandshake(conn, HandshakeMsg{
+		InstanceName: "hub",
+		Role:         "hub",
+		Version:      "1",
+	})
+}
+
 // TestClient_Dial_Success connects to a mock hub server.
 func TestClient_Dial_Success(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 
 		// Receive client handshake
-		var hs HandshakeMsg
-		err := conn.ReadJSON(&hs)
+		hs, err := ReceiveHandshake(conn)
 		require.NoError(t, err)
 		assert.Equal(t, "test-client", hs.InstanceName)
 		assert.Equal(t, "client", hs.Role)
 
 		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
@@ -46,7 +55,6 @@ func TestClient_Dial_Success(t *testing.T) {
 		// Keep connection open
 		time.Sleep(100 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -67,8 +75,7 @@ func TestClient_Dial_Success(t *testing.T) {
 	)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
+	sender, err := client.Dial(fedServerAddr(srv))
 
 	assert.NoError(t, err)
 	assert.NotNil(t, sender)
@@ -81,17 +88,11 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		_ = conn.ReadJSON(&HandshakeMsg{})
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
+		_ = mockHubHandshake(conn)
 		time.Sleep(100 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -115,8 +116,7 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 	// Before dial, Sender should be nil
 	assert.Nil(t, client.Sender())
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
+	sender, err := client.Dial(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	// After dial, Sender should return the same sender
@@ -131,18 +131,12 @@ func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	connectionCount := atomic.Int32{}
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		connectionCount.Add(1)
 		defer func() { _ = conn.Close() }()
-		_ = conn.ReadJSON(&HandshakeMsg{})
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
+		_ = mockHubHandshake(conn)
 		time.Sleep(50 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -163,8 +157,7 @@ func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
 	)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	err := client.ConnectWithReconnect(strings.TrimPrefix(wsURL, "ws://"))
+	err := client.ConnectWithReconnect(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	// Give reconnect loop time to attempt a reconnection after the first disconnects
@@ -179,17 +172,11 @@ func TestClient_Close_StopsReconnectLoop(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		_ = conn.ReadJSON(&HandshakeMsg{})
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
+		_ = mockHubHandshake(conn)
 		time.Sleep(50 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -209,8 +196,7 @@ func TestClient_Close_StopsReconnectLoop(t *testing.T) {
 		[]string{}, nil,
 	)
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	err := client.ConnectWithReconnect(strings.TrimPrefix(wsURL, "ws://"))
+	err := client.ConnectWithReconnect(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	time.Sleep(50 * time.Millisecond)
@@ -228,17 +214,11 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		_ = conn.ReadJSON(&HandshakeMsg{})
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
+		_ = mockHubHandshake(conn)
 		time.Sleep(100 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -260,8 +240,7 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 	)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
+	sender, err := client.Dial(fedServerAddr(srv))
 
 	assert.NoError(t, err)
 	assert.NotNil(t, sender)
@@ -275,19 +254,20 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	var receivedSubscribe []string
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		var hs HandshakeMsg
-		_ = conn.ReadJSON(&hs)
+		hs, err := ReceiveHandshake(conn)
+		if err != nil {
+			return
+		}
 		receivedSubscribe = hs.Subscribe
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
 		})
 		time.Sleep(100 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -308,8 +288,7 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
+	sender, err := client.Dial(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	// Verify subscribe channels were sent
@@ -325,19 +304,20 @@ func TestClient_Dial_NoLastID(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	var receivedLastID string
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
-		var hs HandshakeMsg
-		_ = conn.ReadJSON(&hs)
+		hs, err := ReceiveHandshake(conn)
+		if err != nil {
+			return
+		}
 		receivedLastID = hs.LastID
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
 		})
 		time.Sleep(100 * time.Millisecond)
 	})
-	defer srv.Close()
 
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
@@ -358,8 +338,7 @@ func TestClient_Dial_NoLastID(t *testing.T) {
 	)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	sender, err := client.Dial(strings.TrimPrefix(wsURL, "ws://"))
+	sender, err := client.Dial(fedServerAddr(srv))
 	require.NoError(t, err)
 
 	assert.Empty(t, receivedLastID, "client must not send LastID; hub tracks progress server-side")

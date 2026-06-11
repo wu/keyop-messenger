@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -19,17 +18,17 @@ import (
 // ---- shared helpers ---------------------------------------------------------
 
 // doEphemeralHandshake completes the ephemeral client/hub handshake on conn.
-func doEphemeralHandshake(t *testing.T, conn *websocket.Conn) {
+func doEphemeralHandshake(t *testing.T, conn *Conn) {
 	t.Helper()
-	var hs HandshakeMsg
-	require.NoError(t, conn.ReadJSON(&hs))
-	require.NoError(t, conn.WriteJSON(HandshakeMsg{
+	_, err := ReceiveHandshake(conn)
+	require.NoError(t, err)
+	require.NoError(t, SendHandshake(conn, HandshakeMsg{
 		InstanceName: "hub", Role: "hub", Version: "1",
 	}))
 }
 
 // keepAlive drains messages from conn until it closes.
-func keepAlive(conn *websocket.Conn) {
+func keepAlive(conn *Conn) {
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			return
@@ -38,7 +37,7 @@ func keepAlive(conn *websocket.Conn) {
 }
 
 // pushFrame sends envs to the client as a single length-prefixed binary frame.
-func pushFrame(t *testing.T, conn *websocket.Conn, envs ...*envelope.Envelope) {
+func pushFrame(t *testing.T, conn *Conn, envs ...*envelope.Envelope) {
 	t.Helper()
 	records := make([][]byte, 0, len(envs))
 	for _, env := range envs {
@@ -46,7 +45,7 @@ func pushFrame(t *testing.T, conn *websocket.Conn, envs ...*envelope.Envelope) {
 		require.NoError(t, err)
 		records = append(records, data)
 	}
-	w, err := conn.NextWriter(websocket.BinaryMessage)
+	w, err := conn.NextWriter(MsgTypeBinary)
 	require.NoError(t, err)
 	require.NoError(t, WriteFrame(w, records))
 	require.NoError(t, w.Close())
@@ -92,7 +91,7 @@ func TestNoopAuditLogger(t *testing.T) {
 func TestEphemeralClient_DispatchEnvelope_HandlerCalled(t *testing.T) {
 	received := make(chan string, 4)
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 
@@ -130,7 +129,7 @@ func TestEphemeralClient_DispatchEnvelope_HandlerCalled(t *testing.T) {
 func TestEphemeralClient_DispatchEnvelope_HandlerError(t *testing.T) {
 	var callCount atomic.Int32
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 
@@ -168,7 +167,7 @@ func TestEphemeralClient_DispatchEnvelope_HandlerError(t *testing.T) {
 func TestEphemeralClient_Publish_CloseWhileWaitingForAck(t *testing.T) {
 	frameReceived := make(chan struct{}, 1)
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 
@@ -178,7 +177,7 @@ func TestEphemeralClient_Publish_CloseWhileWaitingForAck(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if mt == websocket.BinaryMessage {
+			if mt == MsgTypeBinary {
 				select {
 				case frameReceived <- struct{}{}:
 				default:
@@ -222,7 +221,7 @@ func TestEphemeralClient_Publish_CloseWhileWaitingForAck(t *testing.T) {
 // the connection closes before the hub acks, Publish returns ErrEphemeralConnLost
 // (writeLoop path: select case <-connDead after write, and ackCh !ok).
 func TestEphemeralClient_Publish_ConnLostWhileWaitingForAck(t *testing.T) {
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 
@@ -232,7 +231,7 @@ func TestEphemeralClient_Publish_ConnLostWhileWaitingForAck(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if mt == websocket.BinaryMessage {
+			if mt == MsgTypeBinary {
 				return // close → PeerReceiver exits → connDead fires
 			}
 		}
@@ -253,7 +252,7 @@ func TestEphemeralClient_Publish_ConnLostWhileWaitingForAck(t *testing.T) {
 // cancelling the context while Publish waits for an ack returns a wrapped
 // context.Canceled error (Publish second-select ctx.Done() path).
 func TestEphemeralClient_Publish_ContextCancelledWhileWaiting(t *testing.T) {
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 		// Read the frame but never ack; keep connection alive.
@@ -262,7 +261,7 @@ func TestEphemeralClient_Publish_ContextCancelledWhileWaiting(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if mt == websocket.BinaryMessage {
+			if mt == MsgTypeBinary {
 				keepAlive(conn)
 				return
 			}
@@ -300,7 +299,7 @@ func TestEphemeralClient_ConnectWithReconnect_Reconnects(t *testing.T) {
 	var connIdx atomic.Int32
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		idx := int(connIdx.Add(1))
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
@@ -335,7 +334,7 @@ func TestEphemeralClient_ConnectWithReconnect_FailedAttemptThenSuccess(t *testin
 	var connIdx atomic.Int32
 	log := &testutil.FakeLogger{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		idx := int(connIdx.Add(1))
 		defer func() { _ = conn.Close() }()
 
@@ -348,8 +347,7 @@ func TestEphemeralClient_ConnectWithReconnect_FailedAttemptThenSuccess(t *testin
 		if idx == 2 {
 			// Rejection: consume the client handshake but close without responding,
 			// so ReceiveHandshake inside startConn returns an error.
-			var hs HandshakeMsg
-			_ = conn.ReadJSON(&hs)
+			_, _ = ReceiveHandshake(conn)
 			return
 		}
 		// Third connection: successful reconnect.
@@ -376,7 +374,7 @@ func TestEphemeralClient_ConnectWithReconnect_FailedAttemptThenSuccess(t *testin
 // Close() while connected terminates the reconnect loop immediately via the
 // outer select case <-c.stop path.
 func TestEphemeralClient_ConnectWithReconnect_CloseStopsLoop(t *testing.T) {
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 		doEphemeralHandshake(t, conn)
 		keepAlive(conn)
@@ -400,7 +398,7 @@ func TestEphemeralClient_ConnectWithReconnect_CloseStopsLoop(t *testing.T) {
 func TestEphemeralClient_ConnectWithReconnect_CloseInterruptsBackoff(t *testing.T) {
 	var connIdx atomic.Int32
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		idx := int(connIdx.Add(1))
 		defer func() { _ = conn.Close() }()
 
@@ -410,8 +408,7 @@ func TestEphemeralClient_ConnectWithReconnect_CloseInterruptsBackoff(t *testing.
 			return // trigger reconnect
 		}
 		// Subsequent connections: reject to force a long backoff sleep.
-		var hs HandshakeMsg
-		_ = conn.ReadJSON(&hs)
+		_, _ = ReceiveHandshake(conn)
 	})
 	defer srv.Close()
 

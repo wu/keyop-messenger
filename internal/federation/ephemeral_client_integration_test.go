@@ -11,22 +11,32 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-// mockWsServer creates a simple WebSocket server for testing.
-func mockWsServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
+// mockFedServer creates a simple HTTP/2 (h2c) server for testing federation
+// clients. The handler receives a *Conn wrapping the bidirectional HTTP/2 stream.
+func mockFedServer(t *testing.T, handler func(*Conn)) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		conn := NewConn(r.Body, w, &stringAddr{"tcp", r.RemoteAddr}, func() error { return nil })
 		handler(conn)
-	}))
+	})
+	srv := httptest.NewUnstartedServer(h2c.NewHandler(mux, &http2.Server{}))
+	srv.Start()
+	t.Cleanup(srv.Close)
 	return srv
+}
+
+// fedServerAddr extracts the host:port from an httptest.Server URL.
+func fedServerAddr(srv *httptest.Server) string {
+	return strings.TrimPrefix(srv.URL, "http://")
 }
 
 // TestEphemeralClient_Dispatch_MessageHandlers verifies multiple handlers are registered.
@@ -68,34 +78,37 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	receivedFrames := atomic.Int32{}
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 
-		// Receive handshake
-		hs := HandshakeMsg{}
-		_ = conn.ReadJSON(&hs)
+		// Receive client handshake
+		if _, err := ReceiveHandshake(conn); err != nil {
+			return
+		}
 
 		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
 		})
 
 		// Read binary frames from client (published messages)
+		connWriteMu := &sync.Mutex{}
 		for {
-			mt, _, err := conn.ReadMessage()
+			msgType, _, err := conn.NextReader()
 			if err != nil {
 				break
 			}
-			if mt == websocket.BinaryMessage {
+			if msgType == MsgTypeBinary {
 				receivedFrames.Add(1)
 			}
 			// Send ack for each frame
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"ack"}`))
+			connWriteMu.Lock()
+			_ = SendAck(conn, AckMsg{LastID: "ack"})
+			connWriteMu.Unlock()
 		}
 	})
-	defer srv.Close()
 
 	ec := NewEphemeralClient(EphemeralClientConfig{
 		InstanceName:   "em-client",
@@ -104,11 +117,10 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 	}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, fedServerAddr(srv))
 	require.NoError(t, err)
 
 	// Publish multiple small messages
@@ -160,14 +172,16 @@ func TestEphemeralClient_Publish_BlocksUntilAck(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	ackDelay := 100 * time.Millisecond
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 
 		// Receive handshake
-		_ = conn.ReadJSON(&HandshakeMsg{})
+		if _, err := ReceiveHandshake(conn); err != nil {
+			return
+		}
 
 		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
@@ -181,20 +195,18 @@ func TestEphemeralClient_Publish_BlocksUntilAck(t *testing.T) {
 
 		// Delay before sending ack
 		time.Sleep(ackDelay)
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"msg1"}`))
+		_ = SendAck(conn, AckMsg{LastID: "msg1"})
 	})
-	defer srv.Close()
 
 	ec := NewEphemeralClient(EphemeralClientConfig{
 		InstanceName: "em-client",
 	}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, fedServerAddr(srv))
 	require.NoError(t, err)
 
 	time.Sleep(50 * time.Millisecond)
@@ -222,43 +234,46 @@ func TestEphemeralClient_PublishConcurrent(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	messageCount := atomic.Int32{}
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		defer func() { _ = conn.Close() }()
 
 		// Receive handshake
-		_ = conn.ReadJSON(&HandshakeMsg{})
+		if _, err := ReceiveHandshake(conn); err != nil {
+			return
+		}
 
 		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
+		_ = SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub",
 			Role:         "hub",
 			Version:      "1",
 		})
 
 		// Read messages and send acks
+		connWriteMu := &sync.Mutex{}
 		for {
-			_, data, err := conn.ReadMessage()
+			msgType, _, err := conn.ReadMessage()
 			if err != nil {
 				break
 			}
-			if len(data) > 0 {
+			if msgType == MsgTypeBinary {
 				messageCount.Add(1)
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"ack"}`))
+				connWriteMu.Lock()
+				_ = SendAck(conn, AckMsg{LastID: "ack"})
+				connWriteMu.Unlock()
 			}
 		}
 	})
-	defer srv.Close()
 
 	ec := NewEphemeralClient(EphemeralClientConfig{
 		InstanceName: "em-client",
 	}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, fedServerAddr(srv))
 	require.NoError(t, err)
 
 	time.Sleep(50 * time.Millisecond)

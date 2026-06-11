@@ -3,13 +3,18 @@ package federation
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
+
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/dedup"
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -29,12 +34,12 @@ var (
 type EphemeralClientConfig struct {
 	// InstanceName identifies this client to the hub (must match TLS CN).
 	InstanceName string
-	// TLSConfig is the mTLS configuration. nil means plain-text ws://.
+	// TLSConfig is the mTLS configuration. nil means plain-text h2c.
 	TLSConfig *tls.Config
 	// Subscribe is the list of channels to receive from the hub.
 	// Sent in the handshake; the hub may deliver a subset per its policy.
 	Subscribe []string
-	// MaxBatchBytes is the max WebSocket frame payload size. Default: 4194304 (4 MiB). Set to 0 to disable.
+	// MaxBatchBytes is the max frame payload size. Default: 4194304 (4 MiB). Set to 0 to disable.
 	MaxBatchBytes int
 	// WriteQueueSize is the outbound buffer depth. Default: 256.
 	WriteQueueSize int
@@ -178,45 +183,108 @@ func (c *EphemeralClient) Close() {
 	c.wg.Wait()
 }
 
+// buildHTTPClient returns an http.Client for HTTP/2 (TLS or h2c).
+func (c *EphemeralClient) buildHTTPClient() *http.Client {
+	if c.tlsCfg != nil {
+		return &http.Client{
+			Transport: &http2.Transport{
+				TLSClientConfig: c.tlsCfg,
+			},
+		}
+	}
+	return &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		},
+	}
+}
+
 // startConn dials hubAddr, completes the ephemeral handshake, and starts the
 // per-connection goroutines. Returns a channel closed when the connection is lost.
 func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, error) {
-	dialer := websocket.Dialer{TLSClientConfig: c.tlsCfg}
-	wsURL := "wss://" + hubAddr
+	scheme := "https"
 	if c.tlsCfg == nil {
-		wsURL = "ws://" + hubAddr
+		scheme = "http"
 	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
-	if err != nil {
-		// If context was cancelled, return context.Canceled to maintain error chain semantics
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, fmt.Errorf("ephemeral: dial %s: %w", hubAddr, err)
-	}
+	url := scheme + "://" + hubAddr
 
-	if err := SendHandshake(conn, HandshakeMsg{
+	pr, pw := io.Pipe()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, pr)
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("ephemeral: build request %s: %w", hubAddr, err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.ContentLength = -1
+
+	hsData, err := json.Marshal(HandshakeMsg{
 		InstanceName: c.instanceName,
 		Role:         "client",
 		Version:      wireVersion,
 		Subscribe:    c.subscribe,
 		Ephemeral:    true,
-	}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("ephemeral: send handshake: %w", err)
+	})
+	if err != nil {
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, fmt.Errorf("ephemeral: marshal handshake: %w", err)
 	}
+
+	httpClient := c.buildHTTPClient()
+
+	writeErrCh := make(chan error, 1)
+	go func() {
+		tmpConn := NewConn(nil, pw, nil, nil)
+		writeErrCh <- tmpConn.WriteMessage(MsgTypeJSON, hsData)
+	}()
+
+	resp, doErr := httpClient.Do(req)
+	if doErr != nil {
+		_ = pw.Close()
+		_ = pr.Close()
+		<-writeErrCh
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("ephemeral: dial %s: %w", hubAddr, doErr)
+	}
+
+	if writeErr := <-writeErrCh; writeErr != nil {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("ephemeral: send handshake: %w", writeErr)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("ephemeral: connect %s: unexpected status %d", hubAddr, resp.StatusCode)
+	}
+
+	closeFn := func() error {
+		_ = pw.Close()
+		_ = resp.Body.Close()
+		return nil
+	}
+	conn := NewConn(resp.Body, pw, &stringAddr{"tcp", hubAddr}, closeFn)
+
 	if _, err := ReceiveHandshake(conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ephemeral: receive handshake: %w", err)
 	}
 
-	// ackCh: PeerReceiver routes text-frame acks (from the hub's PeerReceiver
+	// ackCh: PeerReceiver routes JSON acks (from the hub's PeerReceiver
 	// acknowledging our published messages) here so the write goroutine can
 	// unblock waiting Publish callers.
 	ackCh := make(chan AckMsg, 4)
 
-	connWriteMu := &sync.Mutex{}     // shared mutex for protecting concurrent writes to conn
-	dd, _ := dedup.NewLRUDedup(1024) // small dedup for defense-in-depth
+	connWriteMu := &sync.Mutex{}
+	dd, _ := dedup.NewLRUDedup(1024)
 	receiver := newPeerReceiverWithAck(
 		conn,
 		connWriteMu,
@@ -231,8 +299,6 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	)
 
 	// connDead is closed when the PeerReceiver exits (read error or stop).
-	// The write goroutine selects on it so it exits promptly even when blocked
-	// waiting for new Publish calls rather than waiting for an ack.
 	connDead := make(chan struct{})
 	c.wg.Add(1)
 	go func() {
@@ -253,7 +319,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	go func() {
 		defer c.wg.Done()
 		defer close(connLost)
-		c.writeLoop(conn, ackCh, connDead)
+		c.writeLoop(conn, connWriteMu, ackCh, connDead)
 	}()
 
 	return connLost, nil
@@ -278,7 +344,7 @@ func (c *EphemeralClient) dispatchEnvelope(env *envelope.Envelope) error {
 // writeQ, writes batched binary frames, and blocks waiting for each hub ack.
 // All items in a batch are signalled together: nil on ack, ErrEphemeralConnLost
 // on connection loss, or ErrEphemeralClosed on Close.
-func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, connDead <-chan struct{}) {
+func (c *EphemeralClient) writeLoop(conn *Conn, connWriteMu *sync.Mutex, ackCh <-chan AckMsg, connDead <-chan struct{}) {
 	signalAll := func(items []ephemeralWriteItem, err error) {
 		for _, item := range items {
 			select {
@@ -334,24 +400,28 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 			continue
 		}
 
-		// Write one binary WebSocket frame containing all records in the batch.
-		w, err := conn.NextWriter(websocket.BinaryMessage)
+		// Write one binary frame containing all records in the batch.
+		connWriteMu.Lock()
+		w, err := conn.NextWriter(MsgTypeBinary)
 		if err != nil {
+			connWriteMu.Unlock()
 			signalAll(batch, ErrEphemeralConnLost)
 			return
 		}
 		if err := WriteFrame(w, records); err != nil {
 			_ = w.Close()
+			connWriteMu.Unlock()
 			signalAll(batch, ErrEphemeralConnLost)
 			return
 		}
 		if err := w.Close(); err != nil {
+			connWriteMu.Unlock()
 			signalAll(batch, ErrEphemeralConnLost)
 			return
 		}
+		connWriteMu.Unlock()
 
-		// Wait for the hub's text-frame ack, routed here via ackCh by PeerReceiver.
-		// The hub acks the entire batch; all waiting callers in the batch are unblocked.
+		// Wait for the hub's JSON ack, routed here via ackCh by PeerReceiver.
 		select {
 		case <-c.stop:
 			signalAll(batch, ErrEphemeralClosed)

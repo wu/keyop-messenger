@@ -16,7 +16,7 @@ import (
 // TestPeerReceiverErr_NilAfterCleanClose verifies that Err() returns nil when the
 // receiver exits because Close() was called (not due to a connection error).
 func TestPeerReceiverErr_NilAfterCleanClose(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	_ = srv // keep server alive until test cleanup
 
 	dd, err := dedup.NewLRUDedup(100)
@@ -42,7 +42,7 @@ func TestPeerReceiverErr_NilAfterCleanClose(t *testing.T) {
 // TestPeerReceiverErr_NonNilAfterUnexpectedDisconnect verifies that Err() returns a
 // non-nil error when the underlying connection is closed without calling Close() first.
 func TestPeerReceiverErr_NonNilAfterUnexpectedDisconnect(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 
 	dd, err := dedup.NewLRUDedup(100)
 	require.NoError(t, err)
@@ -68,7 +68,7 @@ func TestPeerReceiverErr_NonNilAfterUnexpectedDisconnect(t *testing.T) {
 // TestPeerReceiverErr_SafeBeforeDone verifies that Err() can be called before Done()
 // closes without data races (though the value may be nil or stale).
 func TestPeerReceiverErr_SafeBeforeDone(t *testing.T) {
-	srv, cli := newWSPair(t)
+	srv, cli := newConnPair(t)
 	_ = srv
 
 	dd, err := dedup.NewLRUDedup(100)

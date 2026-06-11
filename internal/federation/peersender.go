@@ -4,16 +4,15 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/gorilla/websocket"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
-// PeerSender manages outbound delivery to one peer over a WebSocket connection.
+// PeerSender manages outbound delivery to one peer over a Conn.
 // One goroutine owns all writes; it batches, sends a binary frame, then blocks
-// waiting for a text-frame ack before sending the next batch. Unacked messages
+// waiting for a JSON ack before sending the next batch. Unacked messages
 // are retained for replay on reconnect.
 type PeerSender struct {
-	conn          *websocket.Conn
+	conn          *Conn
 	connWriteMu   *sync.Mutex // protects concurrent writes to conn (shared with PeerReceiver if present)
 	maxBatchBytes int
 	log           logger
@@ -34,7 +33,7 @@ type PeerSender struct {
 
 // NewPeerSender starts a PeerSender goroutine on conn.
 // bufSize is the capacity of the outbound buffer (send_buffer_messages).
-func NewPeerSender(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger) *PeerSender {
+func NewPeerSender(conn *Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger) *PeerSender {
 	ps := &PeerSender{
 		conn:          conn,
 		connWriteMu:   connWriteMu,
@@ -50,8 +49,8 @@ func NewPeerSender(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBa
 
 // newPeerSenderWithAck creates a PeerSender that reads acks from ackCh instead
 // of the connection directly. Use this when a PeerReceiver also reads from conn
-// to avoid concurrent reads violating gorilla/websocket's single-reader rule.
-func newPeerSenderWithAck(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
+// to avoid concurrent reads.
+func newPeerSenderWithAck(conn *Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
 	ps := &PeerSender{
 		conn:          conn,
 		connWriteMu:   connWriteMu,
@@ -167,7 +166,7 @@ func (ps *PeerSender) run() {
 
 		// Write one binary frame containing all records.
 		ps.connWriteMu.Lock()
-		w, err := ps.conn.NextWriter(websocket.BinaryMessage)
+		w, err := ps.conn.NextWriter(MsgTypeBinary)
 		if err != nil {
 			ps.connWriteMu.Unlock()
 			ps.log.Error("federation: sender next writer", "err", err)

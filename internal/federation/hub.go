@@ -11,7 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
@@ -45,11 +47,11 @@ type peerEntry struct {
 	receiver    *PeerReceiver
 	coordinator *clientCoordinator // non-nil when peer has subscriptions
 	policy      *AtomicPolicy
-	conn        *websocket.Conn
+	conn        *Conn
 	connWriteMu *sync.Mutex
 }
 
-// Hub accepts incoming WebSocket connections and enforces the allowlist and
+// Hub accepts incoming HTTP/2 connections and enforces the allowlist and
 // receive policy. Hub-to-peer delivery uses a file-reader pull model: one
 // channelReader goroutine per (peer, channel) reads segment files and delivers
 // batches via a clientCoordinator, writing per-peer byte offsets to
@@ -81,8 +83,9 @@ type Hub struct {
 	notifyMu       sync.RWMutex
 	notifyRegistry map[string][]*channelReader // channel → readers for that channel
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop      chan struct{}
+	wg        sync.WaitGroup // srv.Serve goroutine + TTL sweep
+	handlerWg sync.WaitGroup // active serveConn invocations (HTTP handlers + ServeTestConn)
 }
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
@@ -114,29 +117,60 @@ func NewHub(
 	}
 }
 
-var hubUpgrader = websocket.Upgrader{
-	CheckOrigin: func(*http.Request) bool { return true },
+// ServeHTTP implements http.Handler for incoming federation connections.
+// The response status is sent implicitly (200 OK) when the first message is
+// written to w — either the hub handshake (accepted) or a close frame (rejected).
+func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.ProtoMajor < 2 {
+		http.Error(w, "HTTP/2 required", http.StatusHTTPVersionNotSupported)
+		return
+	}
+	h.handlerWg.Add(1)
+	defer h.handlerWg.Done()
+	addr := &stringAddr{"tcp", r.RemoteAddr}
+	conn := NewConn(r.Body, w, addr, func() error { return nil })
+	h.serveConn(conn, r.TLS)
 }
 
-// Listen starts a TLS-wrapped HTTP/WebSocket listener on addr and returns
-// immediately; connections are served in background goroutines.
+// ServeTestConn is exported for tests: injects a pre-built Conn without a
+// real HTTP/2 listener. The tlsState is passed through to serveConn.
+func (h *Hub) ServeTestConn(conn *Conn, tlsState *tls.ConnectionState) {
+	h.handlerWg.Add(1)
+	go func() {
+		defer h.handlerWg.Done()
+		h.serveConn(conn, tlsState)
+	}()
+}
+
+// Listen starts an HTTP/2 listener on addr and returns immediately.
+// With TLS, HTTP/2 is negotiated via ALPN. Without TLS, h2c (HTTP/2 cleartext)
+// is used so that clients can use the http2.Transport.
 func (h *Hub) Listen(addr string) error {
-	ln, err := tls.Listen("tcp", addr, h.tlsCfg)
+	mux := http.NewServeMux()
+	mux.Handle("/", h)
+
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	var ln net.Listener
+	var err error
+	if h.tlsCfg != nil {
+		// TLS: let ConfigureServer add "h2" to the TLS NextProtos list, then use
+		// that config for the listener so ALPN negotiation works correctly.
+		srv.TLSConfig = h.tlsCfg.Clone()
+		http2.ConfigureServer(srv, nil) //nolint:errcheck
+		srv.Handler = mux
+		ln, err = tls.Listen("tcp", addr, srv.TLSConfig)
+	} else {
+		// Cleartext: use h2c so clients can use http2.Transport{AllowHTTP:true}.
+		srv.Handler = h2c.NewHandler(mux, &http2.Server{})
+		ln, err = net.Listen("tcp", addr)
+	}
 	if err != nil {
 		return fmt.Errorf("federation: hub listen %s: %w", addr, err)
 	}
-	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			conn, err := hubUpgrader.Upgrade(w, r, nil)
-			if err != nil {
-				h.log.Error("federation: hub ws upgrade", "err", err)
-				return
-			}
-			tlsState := r.TLS
-			h.serveConn(conn, tlsState)
-		}),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+
 	h.mu.Lock()
 	h.listener = ln
 	h.httpSrv = srv
@@ -165,12 +199,6 @@ func (h *Hub) SetFedClientOffsetTTL(ttl time.Duration) {
 	h.fedClientOffsetTTL = ttl
 }
 
-// ServeTestConn is the same as the internal serveConn; exported so tests can
-// inject pre-dialed websocket connections without a real TLS listener.
-func (h *Hub) ServeTestConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
-	go h.serveConn(conn, tlsState)
-}
-
 // Addr returns the listener address, or empty string if not listening.
 func (h *Hub) Addr() string {
 	h.mu.RLock()
@@ -191,7 +219,9 @@ func (h *Hub) NotifyChannel(channel string) {
 	}
 }
 
-// Close stops the listener and all active peer connections.
+// Close stops the listener and all active peer connections, then waits for
+// all in-flight handler goroutines to finish before returning so that callers
+// can safely close shared resources (e.g. the audit logger) afterwards.
 func (h *Hub) Close() error {
 	close(h.stop)
 	h.mu.Lock()
@@ -202,14 +232,15 @@ func (h *Hub) Close() error {
 		_ = entry.conn.Close()
 	}
 	h.mu.Unlock()
-	h.wg.Wait()
+	h.wg.Wait()        // server goroutine + TTL sweep
+	h.handlerWg.Wait() // all serveConn invocations (audit log writes happen here)
 	return nil
 }
 
-// serveConn handles one incoming WebSocket connection: receives the peer
-// handshake, checks the allowlist, sends the hub handshake if allowed, then
-// starts the receiver and (if the peer has subscriptions) a clientCoordinator.
-func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
+// serveConn handles one incoming connection: receives the peer handshake,
+// checks the allowlist, sends the hub handshake if allowed, then starts the
+// receiver and (if the peer has subscriptions) a clientCoordinator.
+func (h *Hub) serveConn(conn *Conn, tlsState *tls.ConnectionState) {
 	// Receive peer handshake first so we know its identity.
 	hs, err := ReceiveHandshake(conn)
 	if err != nil {
@@ -230,9 +261,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	h.mu.RUnlock()
 
 	if !cfg.IsPeerAllowed(peerName) {
-		_ = conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(4403, "not in allowlist"))
-		_ = conn.Close()
+		_ = conn.WriteClose(4403, "not in allowlist")
 		_ = h.auditL.Log(audit.Event{Event: audit.EventClientRejected, Peer: peerName})
 		h.log.Warn("federation: hub rejected connection", "peer", peerName)
 		return
@@ -261,7 +290,7 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 	connWriteMu := &sync.Mutex{}
 
 	// Set up inbound receiver. When the peer also subscribes, the receiver owns
-	// all reads and routes text-frame acks to the coordinator via ackCh.
+	// all reads and routes JSON acks to the coordinator via ackCh.
 	var receiver *PeerReceiver
 	var coordinator *clientCoordinator
 
@@ -319,47 +348,45 @@ func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
 		h.log.Info("federation: hub accepted connection", "peer", peerName, "addr", peerAddr)
 	}
 
-	// Wait for receiver to finish, then clean up.
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		<-receiver.Done()
+	// Block until the receiver exits. For HTTP/2 connections this keeps the
+	// ServeHTTP handler goroutine alive, which in turn keeps r.Body open so the
+	// PeerReceiver can continue reading DATA frames from the client.
+	<-receiver.Done()
 
-		// Deregister channel readers from the notify registry.
-		if coordinator != nil {
-			h.notifyMu.Lock()
-			for _, r := range coordinator.readers {
-				readers := h.notifyRegistry[r.channel]
-				for i, rr := range readers {
-					if rr == r {
-						h.notifyRegistry[r.channel] = append(readers[:i], readers[i+1:]...)
-						break
-					}
-				}
-				if len(h.notifyRegistry[r.channel]) == 0 {
-					delete(h.notifyRegistry, r.channel)
+	// Deregister channel readers from the notify registry.
+	if coordinator != nil {
+		h.notifyMu.Lock()
+		for _, r := range coordinator.readers {
+			readers := h.notifyRegistry[r.channel]
+			for i, rr := range readers {
+				if rr == r {
+					h.notifyRegistry[r.channel] = append(readers[:i], readers[i+1:]...)
+					break
 				}
 			}
-			h.notifyMu.Unlock()
-			coordinator.close()
+			if len(h.notifyRegistry[r.channel]) == 0 {
+				delete(h.notifyRegistry, r.channel)
+			}
 		}
+		h.notifyMu.Unlock()
+		coordinator.close()
+	}
 
-		h.mu.Lock()
-		delete(h.peers, peerName)
-		h.mu.Unlock()
+	h.mu.Lock()
+	delete(h.peers, peerName)
+	h.mu.Unlock()
 
-		duration := time.Since(connectedAt).Round(time.Millisecond)
-		detail := "duration=" + duration.String()
-		if err := receiver.Err(); err != nil {
-			detail += " err=" + err.Error()
-		}
-		_ = h.auditL.Log(audit.Event{
-			Event:    audit.EventPeerDisconnected,
-			Peer:     peerName,
-			PeerAddr: peerAddr,
-			Detail:   detail,
-		})
-	}()
+	duration := time.Since(connectedAt).Round(time.Millisecond)
+	detail := "duration=" + duration.String()
+	if err := receiver.Err(); err != nil {
+		detail += " err=" + err.Error()
+	}
+	_ = h.auditL.Log(audit.Event{
+		Event:    audit.EventPeerDisconnected,
+		Peer:     peerName,
+		PeerAddr: peerAddr,
+		Detail:   detail,
+	})
 }
 
 // buildChannelReaders creates a clientCoordinator with one channelReader per
@@ -369,7 +396,7 @@ func (h *Hub) buildChannelReaders(
 	subChannels []string,
 	ackCh <-chan AckMsg,
 	connWriteMu *sync.Mutex,
-	conn *websocket.Conn,
+	conn *Conn,
 ) (*clientCoordinator, error) {
 	var readers []*channelReader
 	for _, ch := range subChannels {

@@ -1,14 +1,11 @@
 package federation
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
+	"net"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -16,31 +13,23 @@ import (
 	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
-// wsUpgrader is a permissive upgrader for coordinator tests.
-var wsUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-
-// newCoordTestPair creates a connected WebSocket pair for coordinator tests.
+// newCoordTestPair creates a connected Conn pair for coordinator tests.
 // serverFn runs in a goroutine on the server side.
-func newCoordTestPair(t *testing.T, serverFn func(*websocket.Conn)) *websocket.Conn {
+func newCoordTestPair(t *testing.T, serverFn func(*Conn)) *Conn {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := wsUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		serverFn(conn)
-	}))
-	t.Cleanup(srv.Close)
-
-	u := "ws" + strings.TrimPrefix(srv.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	return conn
+	c1, c2 := net.Pipe()
+	t.Cleanup(func() {
+		_ = c1.Close()
+		_ = c2.Close()
+	})
+	serverConn := NewConn(c1, c1, c1.RemoteAddr(), func() error { return c1.Close() })
+	clientConn := NewConn(c2, c2, c2.RemoteAddr(), func() error { return c2.Close() })
+	go serverFn(serverConn)
+	return clientConn
 }
 
 // TestClientCoordinator_SendBatch_AckFlow verifies that a batch is sent over
-// the WebSocket and doneCh is closed once the ack arrives.
+// the connection and doneCh is closed once the ack arrives.
 func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
@@ -49,23 +38,20 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	var serverReceivedFrames int
 	var serverMu sync.Mutex
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
+	clientConn := newCoordTestPair(t, func(conn *Conn) {
+		defer func() { _ = conn.Close() }()
 		for {
 			msgType, _, err := conn.NextReader()
 			if err != nil {
 				return
 			}
-			if msgType == websocket.BinaryMessage {
+			if msgType == MsgTypeBinary {
 				serverMu.Lock()
 				serverReceivedFrames++
 				serverMu.Unlock()
-				// Send an ack back (simulates PeerReceiver on client side).
-				_ = conn.WriteJSON(AckMsg{LastID: "x"})
+				// Acks are delivered via ackCh directly by the test goroutine;
+				// writing to the connection here would block (nobody reads the
+				// client side of the pipe in this test setup).
 			}
 		}
 	})
@@ -117,20 +103,16 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	ackCh := make(chan AckMsg, 8)
 	received := make(chan []byte, 16)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
+	clientConn := newCoordTestPair(t, func(conn *Conn) {
+		defer func() { _ = conn.Close() }()
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-			if msgType == websocket.BinaryMessage {
+			if msgType == MsgTypeBinary {
 				received <- data
-				_ = conn.WriteJSON(AckMsg{LastID: "ok"})
+				// Acks delivered via ackCh by test goroutines; no conn write.
 			}
 		}
 	})
@@ -195,12 +177,8 @@ func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	log := &testutil.FakeLogger{}
 	ackCh := make(chan AckMsg, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
+	clientConn := newCoordTestPair(t, func(conn *Conn) {
+		defer func() { _ = conn.Close() }()
 		time.Sleep(200 * time.Millisecond)
 	})
 
@@ -220,12 +198,8 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	log := &testutil.FakeLogger{}
 	ackCh := make(chan AckMsg, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
+	clientConn := newCoordTestPair(t, func(conn *Conn) {
+		defer func() { _ = conn.Close() }()
 		time.Sleep(500 * time.Millisecond)
 	})
 
@@ -270,28 +244,16 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	channelDir := dir + "/channels/feed"
 	offsetDir := dir + "/subscribers/feed"
 
-	// Write one message to the channel directory before creating the reader.
-	// The reader will be created with no existing offset → starts at 0.
-	// (We create the reader before writing data so it starts at offset 0.)
-
 	ackCh := make(chan AckMsg, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
+	clientConn := newCoordTestPair(t, func(conn *Conn) {
+		defer func() { _ = conn.Close() }()
 		for {
 			msgType, _, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-			if msgType == websocket.BinaryMessage {
-				if err := conn.WriteJSON(AckMsg{LastID: "ok"}); err != nil {
-					t.Logf("failed to write ack: %v", err)
-				}
-			}
+			_ = msgType // Acks are delivered via ackCh; no conn write needed here.
 		}
 	})
 

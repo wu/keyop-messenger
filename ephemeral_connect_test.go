@@ -1,5 +1,5 @@
 // Package-level tests for EphemeralMessenger that require a live (in-process)
-// WebSocket hub to exercise code paths that unit tests cannot reach.
+// HTTP/2 hub to exercise code paths that unit tests cannot reach.
 package messenger
 
 import (
@@ -12,33 +12,29 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/federation"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
-// mockEphemeralHub returns a plain-text (ws://) WebSocket test server that
+// mockEphemeralHub returns a plain-text (h2c) HTTP/2 test server that
 // completes the ephemeral handshake with every connecting client. The caller
 // supplies afterHandshake, which is invoked on the server-side conn immediately
 // after the handshake completes. Pass nil to just keep the connection alive.
-func mockEphemeralHub(t *testing.T, afterHandshake func(*websocket.Conn)) *httptest.Server {
+func mockEphemeralHub(t *testing.T, afterHandshake func(*federation.Conn)) *httptest.Server {
 	t.Helper()
-	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := up.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		conn := federation.NewConn(r.Body, w, nil, func() error { return nil })
 
 		// Read and respond to the client handshake.
-		var hs federation.HandshakeMsg
-		if err := conn.ReadJSON(&hs); err != nil {
+		if _, err := federation.ReceiveHandshake(conn); err != nil {
 			return
 		}
-		if err := conn.WriteJSON(federation.HandshakeMsg{
+		if err := federation.SendHandshake(conn, federation.HandshakeMsg{
 			InstanceName: "hub", Role: "hub", Version: "1",
 		}); err != nil {
 			return
@@ -54,21 +50,23 @@ func mockEphemeralHub(t *testing.T, afterHandshake func(*websocket.Conn)) *httpt
 				}
 			}
 		}
-	}))
+	})
+	srv := httptest.NewUnstartedServer(h2c.NewHandler(mux, &http2.Server{}))
+	srv.Start()
 	t.Cleanup(srv.Close)
 	return srv
 }
 
 // sendEnvelopeFromHub writes a length-prefixed binary frame containing one
 // envelope to conn (the server side).
-func sendEnvelopeFromHub(t *testing.T, conn *websocket.Conn, channel, payloadType string, payload any) {
+func sendEnvelopeFromHub(t *testing.T, conn *federation.Conn, channel, payloadType string, payload any) {
 	t.Helper()
 	env, err := envelope.NewEnvelope(channel, "hub", payloadType, payload)
 	require.NoError(t, err)
 	data, err := envelope.Marshal(env)
 	require.NoError(t, err)
 
-	w, err := conn.NextWriter(websocket.BinaryMessage)
+	w, err := conn.NextWriter(federation.MsgTypeBinary)
 	require.NoError(t, err)
 	require.NoError(t, federation.WriteFrame(w, [][]byte{data}))
 	require.NoError(t, w.Close())
@@ -84,7 +82,7 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	var mu sync.Mutex
 	var lastMsg Message
 
-	srv := mockEphemeralHub(t, func(conn *websocket.Conn) {
+	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
 		// Push one envelope to the client, then keep the connection alive so
 		// the PeerReceiver can ack it and the client doesn't disconnect.
 		sendEnvelopeFromHub(t, conn, "events", "test.Msg", map[string]string{"x": "1"})
@@ -133,7 +131,7 @@ func TestEphemeralMessenger_Subscribe_PayloadDecoded(t *testing.T) {
 	var gotPayload any
 	var received atomic.Bool
 
-	srv := mockEphemeralHub(t, func(conn *websocket.Conn) {
+	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
 		sendEnvelopeFromHub(t, conn, "typed", "test.MyEvent", MyEvent{Name: "hello"})
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
@@ -191,15 +189,15 @@ func TestEphemeralMessenger_Publish_EnvelopeCreateError(t *testing.T) {
 func TestEphemeralMessenger_Publish_WithCorrelationAndService(t *testing.T) {
 	acked := make(chan struct{}, 1)
 
-	srv := mockEphemeralHub(t, func(conn *websocket.Conn) {
-		// Read the binary frame from the client and send a text-frame ack.
+	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
+		// Read the binary frame from the client and send a JSON ack.
 		for {
 			mt, _, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-			if mt == websocket.BinaryMessage {
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"x"}`))
+			if mt == federation.MsgTypeBinary {
+				_ = federation.SendAck(conn, federation.AckMsg{LastID: "x"})
 				select {
 				case acked <- struct{}{}:
 				default:

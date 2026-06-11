@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/dedup"
@@ -57,16 +56,19 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 	var connIdx atomic.Int32
 	replayed := make(chan string, 20)
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		idx := int(connIdx.Add(1))
 		defer func() { _ = conn.Close() }()
 
 		// All connections begin with the standard hub handshake.
-		var hs HandshakeMsg
-		require.NoError(t, conn.ReadJSON(&hs))
-		require.NoError(t, conn.WriteJSON(HandshakeMsg{
+		if _, err := ReceiveHandshake(conn); err != nil {
+			return
+		}
+		if err := SendHandshake(conn, HandshakeMsg{
 			InstanceName: "hub", Role: "hub", Version: "1",
-		}))
+		}); err != nil {
+			return
+		}
 
 		if idx == 1 {
 			// First connection: consume the first binary frame the sender delivers
@@ -75,7 +77,7 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 			// returns an error there and fires sender.Done().
 			for {
 				msgType, _, err := conn.ReadMessage()
-				if err != nil || msgType == websocket.BinaryMessage {
+				if err != nil || msgType == MsgTypeBinary {
 					return // close without sending any ack
 				}
 			}
@@ -88,7 +90,7 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if msgType != websocket.BinaryMessage {
+			if msgType != MsgTypeBinary {
 				continue
 			}
 			records, _, _ := ReadFrame(bytes.NewReader(data), 65536)
@@ -155,7 +157,7 @@ func TestClient_ConnectWithReconnect_BackoffOnFailedAttempts(t *testing.T) {
 	log := &testutil.FakeLogger{}
 	replayed := make(chan string, 10)
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
+	srv := mockFedServer(t, func(conn *Conn) {
 		idx := int(connIdx.Add(1))
 		defer func() { _ = conn.Close() }()
 
@@ -163,36 +165,37 @@ func TestClient_ConnectWithReconnect_BackoffOnFailedAttempts(t *testing.T) {
 			// First connection: full handshake, consume the binary frame without
 			// acking, then close. This puts the message into sender.Unacked() and
 			// fires sender.Done() (receiveAck returns an error on connection close).
-			var hs HandshakeMsg
-			_ = conn.ReadJSON(&hs)
-			_ = conn.WriteJSON(HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
+			if _, err := ReceiveHandshake(conn); err != nil {
+				return
+			}
+			_ = SendHandshake(conn, HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
 			for {
 				msgType, _, err := conn.ReadMessage()
-				if err != nil || msgType == websocket.BinaryMessage {
+				if err != nil || msgType == MsgTypeBinary {
 					return
 				}
 			}
 		}
 
 		if idx <= rejectCount+1 {
-			// Rejection: accept the WebSocket upgrade, consume the client
-			// handshake, then close without sending a hub handshake response so
-			// that ReceiveHandshake inside Client.dial returns an error.
-			var hs HandshakeMsg
-			_ = conn.ReadJSON(&hs)
+			// Rejection: receive the client handshake, then close without sending a
+			// hub handshake response so that ReceiveHandshake inside Client.dial
+			// returns an error.
+			_, _ = ReceiveHandshake(conn)
 			return
 		}
 
 		// Successful reconnect: full handshake, receive the replayed message, ack.
-		var hs HandshakeMsg
-		_ = conn.ReadJSON(&hs)
-		_ = conn.WriteJSON(HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
+		if _, err := ReceiveHandshake(conn); err != nil {
+			return
+		}
+		_ = SendHandshake(conn, HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
 		for {
 			msgType, data, err := conn.ReadMessage()
 			if err != nil {
 				return
 			}
-			if msgType != websocket.BinaryMessage {
+			if msgType != MsgTypeBinary {
 				continue
 			}
 			records, _, _ := ReadFrame(bytes.NewReader(data), 65536)
