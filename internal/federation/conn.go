@@ -184,7 +184,8 @@ type msgWriter struct {
 	conn    *Conn
 	msgType int
 	buf     []byte
-	closed  bool
+	once    sync.Once
+	err     error
 }
 
 func (w *msgWriter) Write(p []byte) (int, error) {
@@ -193,9 +194,8 @@ func (w *msgWriter) Write(p []byte) (int, error) {
 }
 
 func (w *msgWriter) Close() error {
-	if w.closed {
-		return nil
-	}
-	w.closed = true
-	return w.conn.WriteMessage(w.msgType, w.buf)
+	w.once.Do(func() {
+		w.err = w.conn.WriteMessage(w.msgType, w.buf)
+	})
+	return w.err
 }
