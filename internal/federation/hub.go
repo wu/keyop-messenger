@@ -159,7 +159,7 @@ func (h *Hub) Listen(addr string) error {
 		// TLS: let ConfigureServer add "h2" to the TLS NextProtos list, then use
 		// that config for the listener so ALPN negotiation works correctly.
 		srv.TLSConfig = h.tlsCfg.Clone()
-		http2.ConfigureServer(srv, nil) //nolint:errcheck
+		http2.ConfigureServer(srv, nil) //nolint:errcheck,gosec
 		srv.Handler = mux
 		ln, err = tls.Listen("tcp", addr, srv.TLSConfig)
 	} else {

@@ -42,8 +42,10 @@ type Client struct {
 	mu     sync.Mutex
 	sender *PeerSender
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop       chan struct{}
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // NewClient constructs a Client that is ready to dial. Call Dial or
@@ -65,6 +67,7 @@ func NewClient(
 	subscribeChannels []string,
 	publishChannels []string,
 ) *Client {
+	stopCtx, stopCancel := context.WithCancel(context.Background())
 	return &Client{
 		instanceName:      instanceName,
 		tlsCfg:            tlsCfg,
@@ -81,6 +84,8 @@ func NewClient(
 		subscribeChannels: subscribeChannels,
 		publishChannels:   publishChannels,
 		stop:              make(chan struct{}),
+		stopCtx:           stopCtx,
+		stopCancel:        stopCancel,
 	}
 }
 
@@ -122,7 +127,7 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	// Create a pipe for the HTTP/2 request body (client→hub direction).
 	pr, pw := io.Pipe()
 
-	req, err := http.NewRequest(http.MethodPost, url, pr)
+	req, err := http.NewRequestWithContext(c.stopCtx, http.MethodPost, url, pr)
 	if err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
@@ -277,6 +282,9 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				if dialErr == nil {
 					break
 				}
+				if c.stopCtx.Err() != nil {
+					return // shutdown cancelled the dial; exit without logging
+				}
 				c.log.Error("federation: client reconnect failed", "err", dialErr, "attempt", attempt)
 				_ = c.auditL.Log(audit.Event{
 					Event:    audit.EventPeerConnected,
@@ -335,6 +343,7 @@ func (c *Client) Close() {
 	default:
 		close(c.stop)
 	}
+	c.stopCancel() // cancels any in-flight httpClient.Do in dial()
 	c.mu.Lock()
 	if c.sender != nil {
 		c.sender.Close()

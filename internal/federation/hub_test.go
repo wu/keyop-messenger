@@ -321,11 +321,9 @@ func TestReconnectReplay(t *testing.T) {
 	}()
 
 	sender1 := federation.NewPeerSender(cli1, &sync.Mutex{}, 100, 65536, log)
-	var sent []*envelope.Envelope
 	for i := 0; i < 5; i++ {
 		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
 		sender1.Enqueue(&env)
-		sent = append(sent, &env)
 	}
 
 	<-disconnected

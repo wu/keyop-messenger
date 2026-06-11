@@ -81,8 +81,8 @@ func (c *Conn) RemoteAddr() net.Addr { return c.addr }
 // combined into one Write call so pipe-backed connections deliver them atomically.
 func (c *Conn) WriteMessage(msgType int, data []byte) error {
 	buf := make([]byte, 5+len(data))
-	buf[0] = byte(msgType)
-	binary.BigEndian.PutUint32(buf[1:5], uint32(len(data)))
+	buf[0] = byte(msgType)                                  //nolint:gosec // G115: msgType is always 1, 2, or 3
+	binary.BigEndian.PutUint32(buf[1:5], uint32(len(data))) //nolint:gosec // G115: payload fits in uint32 by construction
 	copy(buf[5:], data)
 	if _, err := c.w.Write(buf); err != nil {
 		return fmt.Errorf("federation: conn write: %w", err)
@@ -96,7 +96,7 @@ func (c *Conn) WriteMessage(msgType int, data []byte) error {
 // WriteClose sends a close frame with code and text, then calls Close.
 func (c *Conn) WriteClose(code int, text string) error {
 	payload := make([]byte, 2+len(text))
-	binary.BigEndian.PutUint16(payload[:2], uint16(code))
+	binary.BigEndian.PutUint16(payload[:2], uint16(code)) //nolint:gosec // G115: close codes are small positive integers
 	copy(payload[2:], text)
 	err := c.WriteMessage(msgTypeClose, payload)
 	_ = c.Close()
