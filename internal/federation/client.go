@@ -42,6 +42,8 @@ type Client struct {
 	mu     sync.Mutex
 	sender *PeerSender
 
+	httpClient *http.Client
+
 	stop       chan struct{}
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -83,6 +85,7 @@ func NewClient(
 		reconnectJitter:   reconnectJitter,
 		subscribeChannels: subscribeChannels,
 		publishChannels:   publishChannels,
+		httpClient:        newHTTPClient(tlsCfg),
 		stop:              make(chan struct{}),
 		stopCtx:           stopCtx,
 		stopCancel:        stopCancel,
@@ -94,27 +97,6 @@ func NewClient(
 // On disconnect, Done() fires; call Dial again or use ConnectWithReconnect.
 func (c *Client) Dial(hubAddr string) (*PeerSender, error) {
 	return c.dial(hubAddr)
-}
-
-// buildHTTPClient returns an http.Client configured for HTTP/2 over TLS (when
-// tlsCfg is non-nil) or h2c cleartext HTTP/2 (when tlsCfg is nil).
-func (c *Client) buildHTTPClient() *http.Client {
-	if c.tlsCfg != nil {
-		return &http.Client{
-			Transport: &http2.Transport{
-				TLSClientConfig: c.tlsCfg,
-			},
-		}
-	}
-	// Cleartext HTTP/2 (h2c) — used in tests and plain-TCP deployments.
-	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		},
-	}
 }
 
 func (c *Client) dial(hubAddr string) (*PeerSender, error) {
@@ -150,7 +132,7 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 		return nil, fmt.Errorf("federation: client marshal handshake: %w", err)
 	}
 
-	httpClient := c.buildHTTPClient()
+	httpClient := c.httpClient
 
 	// Write the handshake to the request body pipe concurrently with Do().
 	// Do() reads from pr (via HTTP/2 DATA frames) once the server starts reading
@@ -350,6 +332,7 @@ func (c *Client) Close() {
 	}
 	c.mu.Unlock()
 	c.wg.Wait()
+	c.httpClient.CloseIdleConnections()
 }
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -357,4 +340,25 @@ func minDuration(a, b time.Duration) time.Duration {
 		return a
 	}
 	return b
+}
+
+// newHTTPClient constructs an http.Client for HTTP/2 over TLS (tlsCfg non-nil)
+// or h2c cleartext HTTP/2 (tlsCfg nil). Callers should create one instance per
+// logical endpoint and reuse it across dials so the transport can pool connections.
+func newHTTPClient(tlsCfg *tls.Config) *http.Client {
+	if tlsCfg != nil {
+		return &http.Client{
+			Transport: &http2.Transport{
+				TLSClientConfig: tlsCfg,
+			},
+		}
+	}
+	return &http.Client{
+		Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		},
+	}
 }

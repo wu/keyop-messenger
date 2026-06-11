@@ -8,12 +8,9 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
-	"net"
 	"net/http"
 	"sync"
 	"time"
-
-	"golang.org/x/net/http2"
 
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/dedup"
@@ -78,6 +75,8 @@ type EphemeralClient struct {
 	// across reconnects so that ConnectWithReconnect can resume delivery.
 	writeQ chan ephemeralWriteItem
 
+	httpClient *http.Client
+
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
@@ -119,6 +118,7 @@ func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient 
 		reconnectJitter: cfg.ReconnectJitter,
 		handlers:        make(map[string][]func(*envelope.Envelope) error),
 		writeQ:          make(chan ephemeralWriteItem, cfg.WriteQueueSize),
+		httpClient:      newHTTPClient(cfg.TLSConfig),
 		stop:            make(chan struct{}),
 	}
 }
@@ -181,25 +181,7 @@ func (c *EphemeralClient) Publish(ctx context.Context, env *envelope.Envelope) e
 func (c *EphemeralClient) Close() {
 	c.stopOnce.Do(func() { close(c.stop) })
 	c.wg.Wait()
-}
-
-// buildHTTPClient returns an http.Client for HTTP/2 (TLS or h2c).
-func (c *EphemeralClient) buildHTTPClient() *http.Client {
-	if c.tlsCfg != nil {
-		return &http.Client{
-			Transport: &http2.Transport{
-				TLSClientConfig: c.tlsCfg,
-			},
-		}
-	}
-	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		},
-	}
+	c.httpClient.CloseIdleConnections()
 }
 
 // startConn dials hubAddr, completes the ephemeral handshake, and starts the
@@ -235,7 +217,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 		return nil, fmt.Errorf("ephemeral: marshal handshake: %w", err)
 	}
 
-	httpClient := c.buildHTTPClient()
+	httpClient := c.httpClient
 
 	writeErrCh := make(chan error, 1)
 	go func() {
