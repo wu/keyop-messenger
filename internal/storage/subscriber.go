@@ -139,6 +139,15 @@ func (s *Subscriber) Start(notifyC <-chan struct{}, handler HandlerFunc) {
 	go s.run(notifyC, handler)
 }
 
+// Offset returns the subscriber's current in-memory read position in the
+// channel stream. May be slightly ahead of the persisted offset when a
+// flush interval is configured.
+func (s *Subscriber) Offset() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.offset
+}
+
 // Stop signals the goroutine to exit and blocks until it does.
 // Safe to call more than once.
 func (s *Subscriber) Stop() {
