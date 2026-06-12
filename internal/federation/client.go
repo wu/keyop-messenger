@@ -40,8 +40,9 @@ type Client struct {
 	reconnectMax    time.Duration
 	reconnectJitter float64
 
-	mu     sync.Mutex
-	sender *PeerSender
+	mu       sync.Mutex
+	sender   *PeerSender
+	receiver *PeerReceiver // nil when no subscribe channels are configured
 
 	// grpcConn is created lazily on the first dial and reused across reconnects.
 	grpcConnMu sync.Mutex
@@ -117,6 +118,7 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	sender := NewPeerSender(pubStream, pubCancel, c.sendBufSize, c.maxBatchBytes, c.log)
 
 	// Open the Subscribe stream if this client subscribes to channels.
+	var receiver *PeerReceiver
 	if c.localWriter != nil && len(c.subscribeChannels) > 0 {
 		subCtx, subCancel := context.WithCancel(c.stopCtx)
 		subStream, err := stub.Subscribe(metadata.NewOutgoingContext(subCtx, outMD))
@@ -141,13 +143,21 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 			return nil, fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, err)
 		}
 
-		NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
+		receiver = NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
 			c.auditL, c.log, hubAddr, c.maxBatchBytes)
 	}
 
 	c.mu.Lock()
+	oldReceiver := c.receiver
 	c.sender = sender
+	c.receiver = receiver
 	c.mu.Unlock()
+
+	// Close the old receiver outside the lock; on reconnect the underlying stream
+	// is already dead so this returns promptly.
+	if oldReceiver != nil {
+		oldReceiver.Close()
+	}
 
 	_ = c.auditL.Log(audit.Event{Event: audit.EventPeerConnected, PeerAddr: hubAddr})
 	return sender, nil
@@ -289,6 +299,9 @@ func (c *Client) Close() {
 	c.mu.Lock()
 	if c.sender != nil {
 		c.sender.Close()
+	}
+	if c.receiver != nil {
+		c.receiver.Close()
 	}
 	c.mu.Unlock()
 	c.wg.Wait()
