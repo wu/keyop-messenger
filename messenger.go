@@ -529,6 +529,61 @@ func (m *Messenger) Close() error {
 	return firstErr
 }
 
+// Stats returns a point-in-time snapshot of runtime metrics for this Messenger.
+// Channel stream sizes are read from disk; subscriber positions are read from
+// memory. The snapshot is not atomic across channels.
+func (m *Messenger) Stats() Stats {
+	var s Stats
+
+	// Snapshot the channel map under read lock to avoid holding it during I/O.
+	m.mu.RLock()
+	channels := make(map[string]*channelState, len(m.channels))
+	for k, v := range m.channels {
+		channels[k] = v
+	}
+	m.mu.RUnlock()
+
+	s.Channels = make([]ChannelStats, 0, len(channels))
+	for name, cs := range channels {
+		streamEnd, err := storage.ChannelStreamEnd(m.channelDir(name))
+		if err != nil {
+			m.log.Warn("stats: read channel stream end", "channel", name, "err", err)
+		}
+
+		cs.mu.RLock()
+		subs := make([]SubscriberStats, 0, len(cs.subs))
+		for id, entry := range cs.subs {
+			off := entry.sub.Offset()
+			lag := streamEnd - off
+			if lag < 0 {
+				lag = 0
+			}
+			subs = append(subs, SubscriberStats{ID: id, LagBytes: lag})
+		}
+		cs.mu.RUnlock()
+
+		s.Channels = append(s.Channels, ChannelStats{
+			Channel:     name,
+			StreamBytes: streamEnd,
+			Subscribers: subs,
+		})
+	}
+
+	if len(m.clients) > 0 {
+		s.Federation.Clients = make([]ClientStats, 0, len(m.clients))
+		for _, c := range m.clients {
+			s.Federation.Clients = append(s.Federation.Clients, ClientStats{
+				HubAddr:         c.HubAddr(),
+				Connected:       c.Connected(),
+				ReconnectCount:  c.ReconnectCount(),
+				UnackedMessages: c.UnackedCount(),
+			})
+		}
+	}
+
+	return s
+}
+
 // ----- Internal helpers ------------------------------------------------------
 
 func (m *Messenger) isClosed() bool {

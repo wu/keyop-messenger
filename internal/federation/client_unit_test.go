@@ -363,6 +363,30 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 	// Audit logger is stored and used internally (tested in integration tests).
 }
 
+// TestClient_StatsAccessors_BeforeConnect verifies HubAddr, Connected,
+// ReconnectCount, and UnackedCount return their zero values before a connection
+// is established.
+func TestClient_StatsAccessors_BeforeConnect(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+	dd, _ := dedup.NewLRUDedup(100)
+
+	client := NewClient(
+		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
+		func(_ *envelope.Envelope) error { return nil },
+		dd, &fakeAuditLogger{}, log,
+		100, 65536,
+		500*time.Millisecond, 60*time.Second, 0.2,
+		[]string{"events"}, nil,
+	)
+	defer client.Close()
+
+	assert.Empty(t, client.HubAddr(), "HubAddr should be empty before ConnectWithReconnect")
+	assert.False(t, client.Connected(), "Connected should be false before dialing")
+	assert.Zero(t, client.ReconnectCount(), "ReconnectCount should be zero initially")
+	assert.Zero(t, client.UnackedCount(), "UnackedCount should be zero before dialing")
+}
+
 // TestClient_MinDuration_Helper tests the minDuration helper function.
 func TestClient_MinDuration_Helper(t *testing.T) {
 	t.Parallel()

@@ -106,6 +106,38 @@ const testTimeout = 2 * time.Second
 
 // ---- tests ------------------------------------------------------------------
 
+func TestSubscriber_Offset(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "ch")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 0)
+
+	assert.Zero(t, sub.Offset(), "offset should be zero before any messages")
+
+	writeTestEnvelope(t, channelDir, makeEnv(t, "ch", map[string]any{"n": 1}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "ch", map[string]any{"n": 2}))
+
+	received := make(chan struct{}, 10)
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		received <- struct{}{}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-received:
+		case <-time.After(testTimeout):
+			t.Fatalf("message %d not delivered", i+1)
+		}
+	}
+
+	streamEnd, err := ChannelStreamEnd(channelDir)
+	require.NoError(t, err)
+	assert.Equal(t, streamEnd, sub.Offset(), "offset should match stream end after full delivery")
+}
+
 func TestSubscriber_HappyPath(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "orders")

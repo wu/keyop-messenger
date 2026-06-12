@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -39,6 +40,9 @@ type Client struct {
 	reconnectBase   time.Duration
 	reconnectMax    time.Duration
 	reconnectJitter float64
+
+	hubAddr        string       // set once in ConnectWithReconnect before the reconnect goroutine starts
+	reconnectCount atomic.Int64 // incremented on each successful reconnect (not the initial dial)
 
 	mu       sync.Mutex
 	sender   *PeerSender
@@ -182,6 +186,7 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 // ConnectWithReconnect dials hubAddr and reconnects automatically on disconnect.
 // It returns after the first successful connection.
 func (c *Client) ConnectWithReconnect(hubAddr string) error {
+	c.hubAddr = hubAddr
 	sender, err := c.dial(hubAddr)
 	if err != nil {
 		return err
@@ -263,6 +268,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				newSender.Enqueue(env)
 			}
 
+			c.reconnectCount.Add(1)
 			backoff = c.reconnectBase
 			attempt = 0
 			sender = newSender
@@ -286,6 +292,41 @@ func (c *Client) AllowPublish(channel string) bool {
 		}
 	}
 	return false
+}
+
+// HubAddr returns the address this client was configured to dial.
+func (c *Client) HubAddr() string { return c.hubAddr }
+
+// Connected reports whether the Publish stream is currently active.
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	s := c.sender
+	c.mu.Unlock()
+	if s == nil {
+		return false
+	}
+	select {
+	case <-s.Done():
+		return false
+	default:
+		return true
+	}
+}
+
+// ReconnectCount returns the number of successful reconnections after the
+// initial dial. The first connection is not counted.
+func (c *Client) ReconnectCount() int64 { return c.reconnectCount.Load() }
+
+// UnackedCount returns the number of messages sent to the hub that have not
+// yet been acknowledged by the remote. Returns 0 when disconnected.
+func (c *Client) UnackedCount() int {
+	c.mu.Lock()
+	s := c.sender
+	c.mu.Unlock()
+	if s == nil {
+		return 0
+	}
+	return len(s.Unacked())
 }
 
 // Close stops the reconnect loop and the current connection.

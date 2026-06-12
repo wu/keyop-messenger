@@ -55,6 +55,22 @@ type segmentInfo struct {
 	size        int64
 }
 
+// ChannelStreamEnd returns the byte position at the end of the channel's write
+// stream: the start offset of the last segment plus its current byte size.
+// This value is monotonically increasing and does not shrink when compaction
+// removes consumed segments. Returns 0 if no segments exist yet.
+func ChannelStreamEnd(channelDir string) (int64, error) {
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return 0, err
+	}
+	if len(segs) == 0 {
+		return 0, nil
+	}
+	last := segs[len(segs)-1]
+	return last.startOffset + last.size, nil
+}
+
 // listSegments returns all segment files in channelDir sorted by start offset.
 // os.ReadDir returns entries in name order, and since names are zero-padded
 // decimal offsets lexicographic == numeric order.

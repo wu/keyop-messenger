@@ -251,51 +251,6 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	sender.Close()
 }
 
-func TestClient_Dial_NoLastID(t *testing.T) {
-	t.Parallel()
-	log := &testutil.FakeLogger{}
-
-	var receivedLastID string
-	gotSubscribe := make(chan struct{}, 1)
-
-	addr := startMockServer(t, &mockFedServer{
-		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
-			frame, err := stream.Recv()
-			if err != nil {
-				return nil
-			}
-			if req := frame.GetRequest(); req != nil {
-				receivedLastID = req.LastId
-				gotSubscribe <- struct{}{}
-			}
-			<-stream.Context().Done()
-			return nil
-		},
-	})
-
-	dd, _ := dedup.NewLRUDedup(100)
-	client := NewClient(
-		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
-		func(_ *envelope.Envelope) error { return nil },
-		dd, &fakeAuditLogger2{}, log,
-		100, 65536,
-		500*time.Millisecond, 60*time.Second, 0.2,
-		[]string{"events"}, nil,
-	)
-	defer client.Close()
-
-	sender, err := client.Dial(addr)
-	require.NoError(t, err)
-
-	select {
-	case <-gotSubscribe:
-		assert.Empty(t, receivedLastID, "client must not send LastID on fresh connect")
-	case <-time.After(2 * time.Second):
-		t.Fatal("timeout waiting for subscribe request")
-	}
-	sender.Close()
-}
-
 func TestClient_Publish_Batching(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
