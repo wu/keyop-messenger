@@ -1,3 +1,9 @@
+## [1.4.0](https://github.com/wu/keyop-messenger/compare/v1.3.0...v1.4.0) (2026-06-12)
+
+### Features
+
+* add Stats() observability to Messenger ([6d26721](https://github.com/wu/keyop-messenger/commit/6d2672125d44ba88981840cc5a13c345d716194f))
+
 ## [1.3.0](https://github.com/wu/keyop-messenger/compare/v1.2.0...v1.3.0) (2026-05-17)
 
 ### Features
