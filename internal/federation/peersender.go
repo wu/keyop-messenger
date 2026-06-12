@@ -5,6 +5,9 @@ import (
 	"io"
 	"sync"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
@@ -152,7 +155,7 @@ func (ps *PeerSender) run() {
 		// Block until ack arrives from the remote receiver.
 		ack, err := ps.stream.Recv()
 		if err != nil {
-			if err != io.EOF {
+			if err != io.EOF && status.Code(err) != codes.Canceled {
 				ps.log.Error("federation: sender receive ack", "err", err)
 			}
 			return

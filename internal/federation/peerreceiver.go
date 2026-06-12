@@ -4,6 +4,9 @@ import (
 	"io"
 	"sync"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -108,7 +111,7 @@ func (pr *PeerReceiver) run() {
 			select {
 			case <-pr.stop:
 			default:
-				if err != io.EOF {
+				if err != io.EOF && status.Code(err) != codes.Canceled {
 					pr.log.Error("federation: receiver read error", "peer", pr.peerName, "err", err)
 					pr.mu.Lock()
 					pr.stopErr = err
