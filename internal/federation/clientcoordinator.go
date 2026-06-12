@@ -2,21 +2,28 @@ package federation
 
 import (
 	"errors"
-	"sync"
+
+	"google.golang.org/grpc"
+
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 )
 
 // clientCoordinator serialises hub→peer sends across all channel readers
 // attached to one peer connection. One instance is created per connected peer
 // that has subscriptions.
 //
-// A single goroutine dequeues sendReqs from requestCh, writes the binary frame,
-// waits for the JSON ack routed from the PeerReceiver via ackCh, then closes
-// req.doneCh to unblock the originating channelReader.
-// Sequential delivery is guaranteed by the single goroutine model.
+// A single goroutine dequeues sendReqs from requestCh, sends the EnvelopeBatch
+// via the gRPC Subscribe server stream, waits for a signal on ackCh (written by
+// the ack-reader goroutine in the Subscribe handler), then closes req.doneCh to
+// unblock the originating channelReader. Sequential delivery is guaranteed by
+// the single-goroutine model.
+//
+// The coordinator is the sole writer on the Subscribe server stream; the ack-reader
+// goroutine in the Subscribe handler is the sole reader. Concurrent Send/Recv on a
+// gRPC server stream is safe per the gRPC-Go guarantees.
 type clientCoordinator struct {
-	conn          *Conn
-	connWriteMu   *sync.Mutex   // shared with PeerReceiver to serialise all writes
-	ackCh         <-chan AckMsg // acks routed from PeerReceiver (owned by hub side)
+	stream        grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]
+	ackCh         <-chan struct{} // closed or signalled by the Subscribe handler's ack-reader goroutine
 	maxBatchBytes int
 	log           logger
 	readers       []*channelReader
@@ -30,19 +37,18 @@ type clientCoordinator struct {
 // start any goroutines until start() is called.
 //
 // requestCh is created here and assigned to each channelReader so they all
-// write to the same queue.
+// write to the same queue. ackCh is closed by the caller's ack-reader goroutine
+// when the Subscribe stream ends.
 func newClientCoordinator(
-	conn *Conn,
-	connWriteMu *sync.Mutex,
-	ackCh <-chan AckMsg,
+	stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch],
+	ackCh <-chan struct{},
 	maxBatchBytes int,
 	log logger,
 	readers []*channelReader,
 ) *clientCoordinator {
 	requestCh := make(chan sendReq, 1)
 	cc := &clientCoordinator{
-		conn:          conn,
-		connWriteMu:   connWriteMu,
+		stream:        stream,
 		ackCh:         ackCh,
 		maxBatchBytes: maxBatchBytes,
 		log:           log,
@@ -51,7 +57,6 @@ func newClientCoordinator(
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
-	// Wire the shared requestCh into every reader.
 	for _, r := range readers {
 		r.requestCh = requestCh
 	}
@@ -67,20 +72,14 @@ func (cc *clientCoordinator) start() {
 }
 
 // close stops the coordinator send goroutine and all channel readers, then
-// waits for everything to exit. The offset files on disk are intentionally left
-// in place — they are needed by the compactor and the TTL sweep.
-//
-// Safe to call once. Callers must ensure close() is not invoked concurrently.
+// waits for everything to exit.
 func (cc *clientCoordinator) close() {
 	select {
 	case <-cc.stop:
 	default:
 		close(cc.stop)
 	}
-	// Wait for the coordinator goroutine first: it may be mid-send or waiting for
-	// an ack. Once it exits, no new doneCh closures will race with reader shutdown.
 	<-cc.done
-	// Stop all readers. Any reader blocked on <-doneCh will unblock via <-cr.stop.
 	for _, r := range cc.readers {
 		r.close()
 	}
@@ -88,9 +87,12 @@ func (cc *clientCoordinator) close() {
 
 func (cc *clientCoordinator) run() {
 	defer close(cc.done)
+	streamDone := cc.stream.Context().Done()
 	for {
 		select {
 		case <-cc.stop:
+			return
+		case <-streamDone:
 			return
 		case req, ok := <-cc.requestCh:
 			if !ok {
@@ -105,38 +107,27 @@ func (cc *clientCoordinator) run() {
 	}
 }
 
-// sendBatch writes one batch to the connection and waits for the ack.
-// Returns a non-nil error on connection or ack failure; the caller (run) will
-// exit on error, triggering the hub cleanup path.
+// sendBatch sends one EnvelopeBatch to the peer and waits for the ack.
+// Returns a non-nil error on stream or ack failure; run() exits on error.
 func (cc *clientCoordinator) sendBatch(req sendReq) error {
-	// Write the binary frame holding all raw JSONL lines.
-	cc.connWriteMu.Lock()
-	w, err := cc.conn.NextWriter(MsgTypeBinary)
-	if err != nil {
-		cc.connWriteMu.Unlock()
+	if err := cc.stream.Send(&federationv1.HubBatch{
+		Payload: &federationv1.HubBatch_Batch{
+			Batch: &federationv1.EnvelopeBatch{Records: req.rawLines},
+		},
+	}); err != nil {
 		return err
 	}
-	if err := WriteFrame(w, req.rawLines); err != nil {
-		_ = w.Close()
-		cc.connWriteMu.Unlock()
-		return err
-	}
-	if err := w.Close(); err != nil {
-		cc.connWriteMu.Unlock()
-		return err
-	}
-	cc.connWriteMu.Unlock()
 
-	// Wait for the JSON ack routed from the PeerReceiver.
 	select {
 	case _, ok := <-cc.ackCh:
 		if !ok {
-			return errors.New("clientCoordinator: ack channel closed (connection lost)")
+			return errors.New("clientCoordinator: ack channel closed (stream ended)")
 		}
-		// Ack received; signal the channelReader to persist its offset.
 		close(req.doneCh)
 		return nil
 	case <-cc.stop:
 		return errors.New("clientCoordinator: stopped while waiting for ack")
+	case <-cc.stream.Context().Done():
+		return cc.stream.Context().Err()
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"net"
 	"time"
 )
 
@@ -77,6 +78,11 @@ func GenerateInstance(caCertPEM, caKeyPEM []byte, name string, validityDays int)
 		NotAfter:     now.Add(time.Duration(validityDays) * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	// localhost certs also need IP SANs so callers can dial 127.0.0.1 directly
+	// without triggering a DNS lookup.
+	if name == "localhost" {
+		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)

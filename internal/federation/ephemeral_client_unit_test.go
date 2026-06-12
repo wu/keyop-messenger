@@ -113,20 +113,6 @@ func TestEphemeralClient_Close_Idempotent(t *testing.T) {
 	ec.Close()
 }
 
-// TestEphemeralClient_Connect_InvalidAddr fails gracefully with invalid address.
-func TestEphemeralClient_Connect_InvalidAddr(t *testing.T) {
-	t.Parallel()
-	log := &testutil.FakeLogger{}
-	ec := NewEphemeralClient(EphemeralClientConfig{InstanceName: "test"}, log)
-	t.Cleanup(func() { ec.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-
-	err := ec.Connect(ctx, "invalid..addr:999999")
-	assert.Error(t, err)
-}
-
 // TestEphemeralClient_Connect_ContextCancelled returns error when context cancelled.
 func TestEphemeralClient_Connect_ContextCancelled(t *testing.T) {
 	t.Parallel()

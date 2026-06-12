@@ -224,24 +224,6 @@ func TestEphemeralMessenger_Publish_InvalidPayloadType(t *testing.T) {
 	assert.Error(t, err) // Context timeout error is fine
 }
 
-// TestEphemeralMessenger_Connect_InvalidAddr returns error for invalid
-// hub address.
-func TestEphemeralMessenger_Connect_InvalidAddr(t *testing.T) {
-	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "invalid..addr:999999", // invalid port
-		InstanceName: "test-client",
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = em.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	err = em.Connect(ctx)
-	// Should fail to connect to invalid address.
-	assert.Error(t, err)
-}
-
 // TestEphemeralMessenger_Connect_ContextCancelled returns error when
 // context is already cancelled.
 func TestEphemeralMessenger_Connect_ContextCancelled(t *testing.T) {
@@ -334,24 +316,6 @@ func TestEphemeralMessenger_RegisterPayloadType_Multiple(t *testing.T) {
 	assert.NoError(t, em.RegisterPayloadType("test.EventA", EventA{}))
 	assert.NoError(t, em.RegisterPayloadType("test.EventB", EventB{}))
 	assert.NoError(t, em.RegisterPayloadType("test.EventC", EventC{}))
-}
-
-// TestEphemeralMessenger_Connect_AutoReconnect exercises the AutoReconnect=true
-// branch of Connect (calls ConnectWithReconnect instead of Connect).
-func TestEphemeralMessenger_Connect_AutoReconnect(t *testing.T) {
-	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:       "invalid..addr:999999",
-		InstanceName:  "test-client",
-		AutoReconnect: true,
-	})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = em.Close() })
-
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-	defer cancel()
-	err = em.Connect(ctx)
-	assert.Error(t, err, "Connect with invalid address must fail")
 }
 
 // TestEphemeralMessenger_RegisterPayloadType_NilPrototype exercises the

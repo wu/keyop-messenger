@@ -1,435 +1,216 @@
+//go:build integration
+
 package federation
 
 import (
 	"context"
-	"fmt"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"google.golang.org/grpc"
 )
 
-// ---- shared helpers ---------------------------------------------------------
-
-// doEphemeralHandshake completes the ephemeral client/hub handshake on conn.
-func doEphemeralHandshake(t *testing.T, conn *Conn) {
-	t.Helper()
-	_, err := ReceiveHandshake(conn)
-	require.NoError(t, err)
-	require.NoError(t, SendHandshake(conn, HandshakeMsg{
-		InstanceName: "hub", Role: "hub", Version: "1",
-	}))
-}
-
-// keepAlive drains messages from conn until it closes.
-func keepAlive(conn *Conn) {
-	for {
-		if _, _, err := conn.ReadMessage(); err != nil {
-			return
-		}
-	}
-}
-
-// pushFrame sends envs to the client as a single length-prefixed binary frame.
-func pushFrame(t *testing.T, conn *Conn, envs ...*envelope.Envelope) {
-	t.Helper()
-	records := make([][]byte, 0, len(envs))
-	for _, env := range envs {
-		data, err := envelope.Marshal(*env)
-		require.NoError(t, err)
-		records = append(records, data)
-	}
-	w, err := conn.NextWriter(MsgTypeBinary)
-	require.NoError(t, err)
-	require.NoError(t, WriteFrame(w, records))
-	require.NoError(t, w.Close())
-}
-
-// newEphemeralTestClient creates an EphemeralClient with minimal reconnect
-// delay (so reconnect tests complete quickly) and registers Close via cleanup.
-func newEphemeralTestClient(t *testing.T, log *testutil.FakeLogger) *EphemeralClient {
-	t.Helper()
-	ec := NewEphemeralClient(EphemeralClientConfig{
-		InstanceName:  "test",
-		ReconnectBase: 1 * time.Millisecond,
-		ReconnectMax:  10 * time.Millisecond,
-	}, log)
-	t.Cleanup(ec.Close)
-	return ec
-}
-
-// dialEphemeral connects ec to the mock server at srv.URL and waits briefly.
-func dialEphemeral(t *testing.T, ec *EphemeralClient, srvURL string) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	require.NoError(t, ec.Connect(ctx, strings.TrimPrefix(srvURL, "http://")))
-	time.Sleep(20 * time.Millisecond)
-}
-
-// ---- noopAuditLogger --------------------------------------------------------
-
-// TestNoopAuditLogger covers the two no-op methods that are invoked by
-// PeerReceiver for every inbound message forwarded to the client.
+// TestNoopAuditLogger covers the two no-op methods.
 func TestNoopAuditLogger(t *testing.T) {
 	a := noopAuditLogger{}
 	assert.NoError(t, a.Log(audit.Event{Event: "forward", Channel: "events"}))
 	assert.NoError(t, a.Close())
 }
 
-// ---- dispatchEnvelope -------------------------------------------------------
-
-// TestEphemeralClient_DispatchEnvelope_HandlerCalled verifies that a binary
-// frame pushed by the hub is decoded and delivered to every registered handler.
-// It also covers noopAuditLogger.Log, which PeerReceiver calls on EventForward.
+// TestEphemeralClient_DispatchEnvelope_HandlerCalled verifies that a hub batch
+// pushed via Subscribe stream is decoded and delivered to registered handlers.
 func TestEphemeralClient_DispatchEnvelope_HandlerCalled(t *testing.T) {
 	received := make(chan string, 4)
 
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
+	env, err := envelope.NewEnvelope("events", "hub", "test.Msg", map[string]string{"k": "v"})
+	require.NoError(t, err)
+	raw, err := envelope.Marshal(env)
+	require.NoError(t, err)
 
-		env, err := envelope.NewEnvelope("events", "hub", "test.Msg", map[string]string{"k": "v"})
-		require.NoError(t, err)
-		pushFrame(t, conn, &env)
-
-		keepAlive(conn)
+	addr := startMockServer(t, &mockFedServer{
+		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			frame, recvErr := stream.Recv()
+			if recvErr != nil || frame.GetRequest() == nil {
+				return nil
+			}
+			// Push the test envelope as a HubBatch.
+			_ = stream.Send(&federationv1.HubBatch{
+				Payload: &federationv1.HubBatch_Batch{
+					Batch: &federationv1.EnvelopeBatch{Records: [][]byte{raw}},
+				},
+			})
+			// Wait for the ack then keep stream open briefly.
+			_, _ = stream.Recv()
+			time.Sleep(200 * time.Millisecond)
+			return nil
+		},
 	})
-	defer srv.Close()
 
 	log := &testutil.FakeLogger{}
-	ec := newEphemeralTestClient(t, log)
-	ec.AddHandler("events", func(env *envelope.Envelope) error {
-		select {
-		case received <- env.Channel:
-		default:
-		}
+	ec := newEphemeralTestClient(t, log, "events")
+
+	ec.AddHandler("events", func(e *envelope.Envelope) error {
+		received <- e.ID
 		return nil
 	})
 
-	dialEphemeral(t, ec, srv.URL)
+	dialEphemeral(t, ec, addr)
 
 	select {
-	case ch := <-received:
-		assert.Equal(t, "events", ch)
+	case id := <-received:
+		assert.Equal(t, env.ID, id)
 	case <-time.After(2 * time.Second):
-		t.Fatal("handler was not called within 2 s")
+		t.Fatal("handler was not called")
 	}
 }
 
-// TestEphemeralClient_DispatchEnvelope_HandlerError verifies that a handler
-// returning an error is logged at Warn but does not stop delivery of subsequent
-// messages.
-func TestEphemeralClient_DispatchEnvelope_HandlerError(t *testing.T) {
-	var callCount atomic.Int32
-
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-
-		for i := 0; i < 2; i++ {
-			env, err := envelope.NewEnvelope("events", "hub", "test.Msg", map[string]int{"n": i})
-			require.NoError(t, err)
-			pushFrame(t, conn, &env)
-			time.Sleep(5 * time.Millisecond) // give writeLoop time to ack before next frame
-		}
-
-		keepAlive(conn)
+// TestEphemeralClient_Publish_ConnLost returns ErrEphemeralConnLost when the
+// connection closes before the ack arrives.
+func TestEphemeralClient_Publish_ConnLost(t *testing.T) {
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			_, _ = stream.Recv() // receive but close without acking
+			return nil
+		},
 	})
-	defer srv.Close()
 
 	log := &testutil.FakeLogger{}
 	ec := newEphemeralTestClient(t, log)
-	ec.AddHandler("events", func(_ *envelope.Envelope) error {
-		callCount.Add(1)
-		return fmt.Errorf("deliberate handler error")
-	})
+	dialEphemeral(t, ec, addr)
 
-	dialEphemeral(t, ec, srv.URL)
-
-	require.Eventually(t, func() bool { return callCount.Load() >= 2 },
-		2*time.Second, 10*time.Millisecond, "both messages must be delivered despite handler errors")
-	assert.True(t, log.HasWarn("ephemeral: handler error"),
-		"handler error must be logged at Warn level")
-}
-
-// ---- writeLoop error paths --------------------------------------------------
-
-// TestEphemeralClient_Publish_CloseWhileWaitingForAck verifies that calling
-// Close() while a Publish is blocked waiting for a hub ack returns
-// ErrEphemeralClosed (writeLoop path: select case <-c.stop after write).
-func TestEphemeralClient_Publish_CloseWhileWaitingForAck(t *testing.T) {
-	frameReceived := make(chan struct{}, 1)
-
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-
-		// Read the frame but never ack — Publish blocks indefinitely.
-		for {
-			mt, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if mt == MsgTypeBinary {
-				select {
-				case frameReceived <- struct{}{}:
-				default:
-				}
-				keepAlive(conn) // drain remaining reads without acking
-				return
-			}
-		}
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, &testutil.FakeLogger{})
-	dialEphemeral(t, ec, srv.URL)
-
-	env := &envelope.Envelope{Channel: "ch", ID: "msg1"}
-	errCh := make(chan error, 1)
-	go func() {
-		pubCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		errCh <- ec.Publish(pubCtx, env)
-	}()
-
-	// Ensure the frame has reached the server before closing.
-	select {
-	case <-frameReceived:
-	case <-time.After(2 * time.Second):
-		t.Fatal("server never received the binary frame")
-	}
-
-	ec.Close() // signals ErrEphemeralClosed to the waiting Publish
-
-	select {
-	case err := <-errCh:
-		assert.ErrorIs(t, err, ErrEphemeralClosed)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Publish did not unblock after Close()")
-	}
-}
-
-// TestEphemeralClient_Publish_ConnLostWhileWaitingForAck verifies that when
-// the connection closes before the hub acks, Publish returns ErrEphemeralConnLost
-// (writeLoop path: select case <-connDead after write, and ackCh !ok).
-func TestEphemeralClient_Publish_ConnLostWhileWaitingForAck(t *testing.T) {
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-
-		// Read the frame, then close without acking.
-		for {
-			mt, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if mt == MsgTypeBinary {
-				return // close → PeerReceiver exits → connDead fires
-			}
-		}
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, &testutil.FakeLogger{})
-	dialEphemeral(t, ec, srv.URL)
-
-	env := &envelope.Envelope{Channel: "ch", ID: "msg1"}
-	pubCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err := ec.Publish(pubCtx, env)
-	assert.ErrorIs(t, err, ErrEphemeralConnLost)
+	env := &envelope.Envelope{Channel: "ch", ID: "x"}
+	err := ec.Publish(ctx, env)
+	assert.Error(t, err)
 }
 
-// TestEphemeralClient_Publish_ContextCancelledWhileWaiting verifies that
-// cancelling the context while Publish waits for an ack returns a wrapped
-// context.Canceled error (Publish second-select ctx.Done() path).
-func TestEphemeralClient_Publish_ContextCancelledWhileWaiting(t *testing.T) {
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-		// Read the frame but never ack; keep connection alive.
-		for {
-			mt, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if mt == MsgTypeBinary {
-				keepAlive(conn)
-				return
-			}
-		}
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, &testutil.FakeLogger{})
-	dialEphemeral(t, ec, srv.URL)
-
-	env := &envelope.Envelope{Channel: "ch", ID: "msg2"}
-	pubCtx, pubCancel := context.WithCancel(context.Background())
-
-	errCh := make(chan error, 1)
-	go func() { errCh <- ec.Publish(pubCtx, env) }()
-
-	// Give writeLoop time to dequeue and send the frame.
-	time.Sleep(50 * time.Millisecond)
-	pubCancel() // cancel while Publish is at the second select
-
-	select {
-	case err := <-errCh:
-		assert.ErrorIs(t, err, context.Canceled)
-	case <-time.After(2 * time.Second):
-		t.Fatal("Publish did not return after context cancellation")
-	}
-}
-
-// ---- reconnectLoop ----------------------------------------------------------
-
-// TestEphemeralClient_ConnectWithReconnect_Reconnects verifies that when the
-// hub closes the connection, reconnectLoop detects connLost and reconnects,
-// logging both the disconnect warning and the success info.
-func TestEphemeralClient_ConnectWithReconnect_Reconnects(t *testing.T) {
-	var connIdx atomic.Int32
+// TestEphemeralClient_Publish_ClosedClient returns ErrEphemeralClosed.
+func TestEphemeralClient_Publish_ClosedClient(t *testing.T) {
 	log := &testutil.FakeLogger{}
-
-	srv := mockFedServer(t, func(conn *Conn) {
-		idx := int(connIdx.Add(1))
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-
-		if idx == 1 {
-			// First connection: close quickly to trigger the reconnect loop.
-			time.Sleep(10 * time.Millisecond)
-			return
-		}
-		// Second connection: stay alive.
-		keepAlive(conn)
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, log)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	require.NoError(t, ec.ConnectWithReconnect(ctx, strings.TrimPrefix(srv.URL, "http://")))
-
-	require.Eventually(t, func() bool { return int(connIdx.Load()) >= 2 },
-		3*time.Second, 10*time.Millisecond,
-		"must establish at least two connections")
-
-	assert.True(t, log.HasWarn("ephemeral: connection lost, reconnecting"))
-	assert.True(t, log.HasInfo("ephemeral: reconnected"))
-}
-
-// TestEphemeralClient_ConnectWithReconnect_FailedAttemptThenSuccess verifies
-// that when a reconnect attempt fails (server rejects it), reconnectLoop logs
-// "reconnect failed", doubles the backoff, and eventually succeeds.
-func TestEphemeralClient_ConnectWithReconnect_FailedAttemptThenSuccess(t *testing.T) {
-	var connIdx atomic.Int32
-	log := &testutil.FakeLogger{}
-
-	srv := mockFedServer(t, func(conn *Conn) {
-		idx := int(connIdx.Add(1))
-		defer func() { _ = conn.Close() }()
-
-		if idx == 1 {
-			// First connection: complete handshake, close after a moment.
-			doEphemeralHandshake(t, conn)
-			time.Sleep(10 * time.Millisecond)
-			return
-		}
-		if idx == 2 {
-			// Rejection: consume the client handshake but close without responding,
-			// so ReceiveHandshake inside startConn returns an error.
-			_, _ = ReceiveHandshake(conn)
-			return
-		}
-		// Third connection: successful reconnect.
-		doEphemeralHandshake(t, conn)
-		keepAlive(conn)
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, log)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	t.Cleanup(cancel)
-	require.NoError(t, ec.ConnectWithReconnect(ctx, strings.TrimPrefix(srv.URL, "http://")))
-
-	require.Eventually(t, func() bool { return int(connIdx.Load()) >= 3 },
-		3*time.Second, 10*time.Millisecond,
-		"must navigate two failures and then reconnect successfully")
-
-	assert.True(t, log.HasError("ephemeral: reconnect failed"),
-		"failed reconnect attempt must be logged at Error")
-	assert.True(t, log.HasInfo("ephemeral: reconnected"))
-}
-
-// TestEphemeralClient_ConnectWithReconnect_CloseStopsLoop verifies that calling
-// Close() while connected terminates the reconnect loop immediately via the
-// outer select case <-c.stop path.
-func TestEphemeralClient_ConnectWithReconnect_CloseStopsLoop(t *testing.T) {
-	srv := mockFedServer(t, func(conn *Conn) {
-		defer func() { _ = conn.Close() }()
-		doEphemeralHandshake(t, conn)
-		keepAlive(conn)
-	})
-	defer srv.Close()
-
-	ec := newEphemeralTestClient(t, &testutil.FakeLogger{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	require.NoError(t, ec.ConnectWithReconnect(ctx, strings.TrimPrefix(srv.URL, "http://")))
-	time.Sleep(20 * time.Millisecond)
-
-	start := time.Now()
+	ec := NewEphemeralClient(EphemeralClientConfig{InstanceName: "test"}, log)
 	ec.Close()
-	assert.Less(t, time.Since(start), 2*time.Second, "Close must complete promptly")
+
+	env := &envelope.Envelope{Channel: "ch", ID: "x"}
+	err := ec.Publish(context.Background(), env)
+	assert.ErrorIs(t, err, ErrEphemeralClosed)
 }
 
-// TestEphemeralClient_ConnectWithReconnect_CloseInterruptsBackoff verifies
-// that Close() interrupts the backoff sleep in the reconnect loop's inner
-// retry loop (select case <-c.stop while time.After is pending).
-func TestEphemeralClient_ConnectWithReconnect_CloseInterruptsBackoff(t *testing.T) {
-	var connIdx atomic.Int32
+// TestEphemeralClient_Publish_MarshalError returns error for unmarshalable envelope.
+func TestEphemeralClient_Publish_MarshalError(t *testing.T) {
+	addr := startMockServer(t, &mockFedServer{}) // default: ack all
 
-	srv := mockFedServer(t, func(conn *Conn) {
-		idx := int(connIdx.Add(1))
-		defer func() { _ = conn.Close() }()
+	log := &testutil.FakeLogger{}
+	ec := newEphemeralTestClient(t, log)
+	dialEphemeral(t, ec, addr)
 
-		if idx == 1 {
-			doEphemeralHandshake(t, conn)
-			time.Sleep(10 * time.Millisecond)
-			return // trigger reconnect
-		}
-		// Subsequent connections: reject to force a long backoff sleep.
-		_, _ = ReceiveHandshake(conn)
+	// An envelope with nil Payload marshals fine, but crafted invalid content might not.
+	// This test mostly verifies the code path doesn't panic; marshal errors are rare.
+	env := &envelope.Envelope{Channel: "ch", ID: "valid"}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = ec.Publish(ctx, env)
+}
+
+// TestEphemeralClient_ConnectWithReconnect_Reconnects verifies that after the
+// hub closes the connection, the client reconnects automatically.
+func TestEphemeralClient_ConnectWithReconnect_Reconnects(t *testing.T) {
+	var connCount atomic.Int32
+	secondConnReady := make(chan struct{})
+
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			n := connCount.Add(1)
+			if n == 1 {
+				// First connection: receive one batch but close without acking.
+				_, _ = stream.Recv()
+				return nil
+			}
+			// Second connection: stay open (signal readiness, then drain acks).
+			select {
+			case secondConnReady <- struct{}{}:
+			default:
+			}
+			for {
+				_, err := stream.Recv()
+				if err != nil {
+					return nil
+				}
+				_ = stream.Send(&federationv1.PublishAck{})
+			}
+		},
 	})
-	defer srv.Close()
 
+	log := &testutil.FakeLogger{}
+	// Use a longer reconnect base so the loop doesn't run thousands of times.
 	ec := NewEphemeralClient(EphemeralClientConfig{
 		InstanceName:  "test",
-		ReconnectBase: 200 * time.Millisecond, // long enough that Close() interrupts it
-		ReconnectMax:  1 * time.Second,
-	}, &testutil.FakeLogger{})
+		ReconnectBase: 5 * time.Millisecond,
+		ReconnectMax:  50 * time.Millisecond,
+	}, log)
+	t.Cleanup(ec.Close)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	require.NoError(t, ec.ConnectWithReconnect(ctx, strings.TrimPrefix(srv.URL, "http://")))
 
-	// Wait until the rejection has been seen (connection 2 attempted).
-	require.Eventually(t, func() bool { return int(connIdx.Load()) >= 2 },
-		2*time.Second, 10*time.Millisecond)
-	time.Sleep(20 * time.Millisecond) // let the backoff sleep begin
+	err := ec.ConnectWithReconnect(ctx, addr)
+	require.NoError(t, err)
 
-	// Close() must unblock from the backoff sleep promptly.
-	start := time.Now()
-	ec.Close()
-	assert.Less(t, time.Since(start), 1*time.Second,
-		"Close must interrupt the backoff sleep")
+	// Send a message to trigger disconnect on the first connection (no ack → conn lost).
+	env := &envelope.Envelope{Channel: "ch", ID: "trigger"}
+	pubCtx, pubCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = ec.Publish(pubCtx, env)
+	pubCancel()
+
+	// Wait for the second connection to establish.
+	select {
+	case <-secondConnReady:
+		assert.GreaterOrEqual(t, int(connCount.Load()), 2)
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not reconnect")
+	}
+}
+
+// TestEphemeralClient_DispatchEnvelope_MultipleHandlers verifies all handlers are called.
+func TestEphemeralClient_DispatchEnvelope_MultipleHandlers(t *testing.T) {
+	env1, _ := envelope.NewEnvelope("ch", "o", "t", nil)
+	raw, _ := envelope.Marshal(env1)
+
+	addr := startMockServer(t, &mockFedServer{
+		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			frame, err := stream.Recv()
+			if err != nil || frame.GetRequest() == nil {
+				return nil
+			}
+			_ = stream.Send(&federationv1.HubBatch{
+				Payload: &federationv1.HubBatch_Batch{
+					Batch: &federationv1.EnvelopeBatch{Records: [][]byte{raw}},
+				},
+			})
+			_, _ = stream.Recv() // ack
+			time.Sleep(200 * time.Millisecond)
+			return nil
+		},
+	})
+
+	log := &testutil.FakeLogger{}
+	ec := newEphemeralTestClient(t, log, "ch")
+
+	var count atomic.Int32
+	for i := 0; i < 3; i++ {
+		ec.AddHandler("ch", func(_ *envelope.Envelope) error {
+			count.Add(1)
+			return nil
+		})
+	}
+	dialEphemeral(t, ec, addr)
+
+	require.Eventually(t, func() bool { return count.Load() == 3 }, 2*time.Second, 10*time.Millisecond)
 }

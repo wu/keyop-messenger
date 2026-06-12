@@ -3,24 +3,26 @@ package federation
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
-	"io"
 	"math/rand"
-	"net"
-	"net/http"
 	"sync"
 	"time"
 
-	"golang.org/x/net/http2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
 
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
-// Client dials a hub over HTTP/2, runs a PeerSender for outbound messages, and
-// reconnects with exponential backoff on disconnect. A PeerReceiver can be
-// optionally started for hubs that also push messages back to the client.
+// Client dials a hub over gRPC, runs a PeerSender for outbound messages on the
+// Publish stream, and reconnects with exponential backoff on disconnect. A
+// PeerReceiver can be optionally started for hubs that also push messages back
+// to the client, using the Subscribe stream.
 type Client struct {
 	instanceName      string
 	tlsCfg            *tls.Config
@@ -31,18 +33,19 @@ type Client struct {
 	log               logger
 	sendBufSize       int
 	maxBatchBytes     int
-	subscribeChannels []string // channels this client wants to receive from the hub
-	publishChannels   []string // channels this client is allowed to publish to the hub
+	subscribeChannels []string
+	publishChannels   []string
 
-	// Reconnect parameters.
 	reconnectBase   time.Duration
 	reconnectMax    time.Duration
-	reconnectJitter float64 // fraction, e.g. 0.2
+	reconnectJitter float64
 
 	mu     sync.Mutex
 	sender *PeerSender
 
-	httpClient *http.Client
+	// grpcConn is created lazily on the first dial and reused across reconnects.
+	grpcConnMu sync.Mutex
+	grpcConn   *grpc.ClientConn
 
 	stop       chan struct{}
 	stopCtx    context.Context
@@ -52,9 +55,6 @@ type Client struct {
 
 // NewClient constructs a Client that is ready to dial. Call Dial or
 // ConnectWithReconnect to establish a connection.
-// subscribeChannels is the list of channels to request from the hub; the hub
-// may deliver a subset based on its access control policy.
-// publishChannels is the list of channels the client is allowed to publish to the hub.
 func NewClient(
 	instanceName string,
 	tlsCfg *tls.Config,
@@ -85,7 +85,6 @@ func NewClient(
 		reconnectJitter:   reconnectJitter,
 		subscribeChannels: subscribeChannels,
 		publishChannels:   publishChannels,
-		httpClient:        newHTTPClient(tlsCfg),
 		stop:              make(chan struct{}),
 		stopCtx:           stopCtx,
 		stopCancel:        stopCancel,
@@ -94,105 +93,56 @@ func NewClient(
 
 // Dial connects to hubAddr once, exchanges the handshake, and starts goroutines.
 // Returns the PeerSender the caller can use to enqueue outbound messages.
-// On disconnect, Done() fires; call Dial again or use ConnectWithReconnect.
 func (c *Client) Dial(hubAddr string) (*PeerSender, error) {
 	return c.dial(hubAddr)
 }
 
 func (c *Client) dial(hubAddr string) (*PeerSender, error) {
-	scheme := "https"
-	if c.tlsCfg == nil {
-		scheme = "http"
-	}
-	url := scheme + "://" + hubAddr
-
-	// Create a pipe for the HTTP/2 request body (client→hub direction).
-	pr, pw := io.Pipe()
-
-	req, err := http.NewRequestWithContext(c.stopCtx, http.MethodPost, url, pr)
+	conn, err := c.getOrCreateGRPCConn(hubAddr)
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
-		return nil, fmt.Errorf("federation: client build request %s: %w", hubAddr, err)
+		return nil, fmt.Errorf("federation: client grpc connect %s: %w", hubAddr, err)
 	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = -1 // streaming body of unknown length
 
-	// Marshal the client handshake before dialing so it can be written
-	// concurrently with the HTTP/2 HEADERS exchange.
-	hsData, err := json.Marshal(HandshakeMsg{
-		InstanceName: c.instanceName,
-		Role:         "client",
-		Version:      wireVersion,
-		Subscribe:    c.subscribeChannels,
-	})
+	stub := federationv1.NewFederationServiceClient(conn)
+	outMD := metadata.Pairs("x-federation-instance", c.instanceName)
+
+	// Open the Publish stream.
+	pubCtx, pubCancel := context.WithCancel(c.stopCtx)
+	pubStream, err := stub.Publish(metadata.NewOutgoingContext(pubCtx, outMD))
 	if err != nil {
-		_ = pr.Close()
-		_ = pw.Close()
-		return nil, fmt.Errorf("federation: client marshal handshake: %w", err)
+		pubCancel()
+		return nil, fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, err)
 	}
 
-	httpClient := c.httpClient
+	sender := NewPeerSender(pubStream, pubCancel, c.sendBufSize, c.maxBatchBytes, c.log)
 
-	// Write the handshake to the request body pipe concurrently with Do().
-	// Do() reads from pr (via HTTP/2 DATA frames) once the server starts reading
-	// the request body. The goroutine blocks on pw.Write until pr is drained.
-	writeErrCh := make(chan error, 1)
-	go func() {
-		// Use a temporary write-only conn to frame the handshake correctly.
-		tmpConn := NewConn(nil, pw, nil, nil)
-		writeErrCh <- tmpConn.WriteMessage(MsgTypeJSON, hsData)
-	}()
+	// Open the Subscribe stream if this client subscribes to channels.
+	if c.localWriter != nil && len(c.subscribeChannels) > 0 {
+		subCtx, subCancel := context.WithCancel(c.stopCtx)
+		subStream, err := stub.Subscribe(metadata.NewOutgoingContext(subCtx, outMD))
+		if err != nil {
+			subCancel()
+			sender.Close()
+			return nil, fmt.Errorf("federation: client open subscribe stream %s: %w", hubAddr, err)
+		}
 
-	// Do() blocks until the server sends HTTP response headers (200 OK).
-	// This happens after the server reads and processes the client handshake.
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		_ = pw.Close()
-		_ = pr.Close()
-		<-writeErrCh
-		return nil, fmt.Errorf("federation: client connect %s: %w", hubAddr, err)
-	}
+		// Send the SubscribeRequest as the first frame on the Subscribe stream.
+		if err := subStream.Send(&federationv1.SubscribeFrame{
+			Payload: &federationv1.SubscribeFrame_Request{
+				Request: &federationv1.SubscribeRequest{
+					InstanceName: c.instanceName,
+					Version:      wireVersion,
+					Subscribe:    c.subscribeChannels,
+				},
+			},
+		}); err != nil {
+			subCancel()
+			sender.Close()
+			return nil, fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, err)
+		}
 
-	if writeErr := <-writeErrCh; writeErr != nil {
-		_ = pw.Close()
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("federation: client send handshake: %w", writeErr)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		_ = pw.Close()
-		_ = resp.Body.Close()
-		return nil, fmt.Errorf("federation: client connect %s: unexpected status %d", hubAddr, resp.StatusCode)
-	}
-
-	// Build the full-duplex Conn: read from response body (hub→client),
-	// write to request body pipe (client→hub).
-	closeFn := func() error {
-		_ = pw.Close()
-		_ = resp.Body.Close()
-		return nil
-	}
-	conn := NewConn(resp.Body, pw, &stringAddr{"tcp", hubAddr}, closeFn)
-
-	// Receive hub's handshake.
-	if _, err := ReceiveHandshake(conn); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("federation: client receive handshake: %w", err)
-	}
-
-	// When the hub pushes messages back to this client both a PeerSender and a
-	// PeerReceiver share the same conn. Route acks through an internal channel
-	// so the PeerReceiver owns all reads and avoids a concurrent-read race.
-	connWriteMu := &sync.Mutex{}
-	var sender *PeerSender
-	if c.localWriter != nil {
-		ackCh := make(chan AckMsg, 4)
-		newPeerReceiverWithAck(conn, connWriteMu, c.policy, c.dedup, c.localWriter,
-			c.auditL, c.log, hubAddr, c.maxBatchBytes, ackCh)
-		sender = newPeerSenderWithAck(conn, connWriteMu, c.sendBufSize, c.maxBatchBytes, c.log, ackCh)
-	} else {
-		sender = NewPeerSender(conn, connWriteMu, c.sendBufSize, c.maxBatchBytes, c.log)
+		NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
+			c.auditL, c.log, hubAddr, c.maxBatchBytes)
 	}
 
 	c.mu.Lock()
@@ -203,9 +153,24 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	return sender, nil
 }
 
+// getOrCreateGRPCConn returns the existing gRPC connection or creates a new one
+// targeting hubAddr. The connection is reused across reconnects.
+func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
+	c.grpcConnMu.Lock()
+	defer c.grpcConnMu.Unlock()
+	if c.grpcConn != nil {
+		return c.grpcConn, nil
+	}
+	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg)
+	if err != nil {
+		return nil, err
+	}
+	c.grpcConn = conn
+	return conn, nil
+}
+
 // ConnectWithReconnect dials hubAddr and reconnects automatically on disconnect.
-// It returns after the first successful connection. Subsequent reconnects happen
-// in the background. Use Sender() to get the current PeerSender.
+// It returns after the first successful connection.
 func (c *Client) ConnectWithReconnect(hubAddr string) error {
 	sender, err := c.dial(hubAddr)
 	if err != nil {
@@ -224,10 +189,8 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			case <-sender.Done():
 			}
 
-			// Gather unacked outbound messages for replay to hub.
 			unacked := sender.Unacked()
 
-			// Audit the disconnect so the cause is visible in the log.
 			disconnDetail := fmt.Sprintf("unacked=%d", len(unacked))
 			_ = c.auditL.Log(audit.Event{
 				Event:    audit.EventPeerDisconnected,
@@ -238,7 +201,6 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			c.log.Warn("federation: client disconnected, reconnecting",
 				"hub", hubAddr, "unacked", len(unacked))
 
-			// Wait with backoff + jitter.
 			//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 			sleep := backoff + jitter
@@ -265,7 +227,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 					break
 				}
 				if c.stopCtx.Err() != nil {
-					return // shutdown cancelled the dial; exit without logging
+					return
 				}
 				c.log.Error("federation: client reconnect failed", "err", dialErr, "attempt", attempt)
 				_ = c.auditL.Log(audit.Event{
@@ -287,12 +249,11 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				}
 			}
 
-			// Replay unacked outbound messages on new sender.
 			for _, env := range unacked {
 				newSender.Enqueue(env)
 			}
 
-			backoff = c.reconnectBase // reset on success
+			backoff = c.reconnectBase
 			attempt = 0
 			sender = newSender
 		}
@@ -308,7 +269,6 @@ func (c *Client) Sender() *PeerSender {
 }
 
 // AllowPublish reports whether the given channel is allowed to be published to the hub.
-// An empty publishChannels list means the client does not publish to the hub at all.
 func (c *Client) AllowPublish(channel string) bool {
 	for _, ch := range c.publishChannels {
 		if ch == channel {
@@ -325,14 +285,18 @@ func (c *Client) Close() {
 	default:
 		close(c.stop)
 	}
-	c.stopCancel() // cancels any in-flight httpClient.Do in dial()
+	c.stopCancel() // cancels all open gRPC streams
 	c.mu.Lock()
 	if c.sender != nil {
 		c.sender.Close()
 	}
 	c.mu.Unlock()
 	c.wg.Wait()
-	c.httpClient.CloseIdleConnections()
+	c.grpcConnMu.Lock()
+	if c.grpcConn != nil {
+		_ = c.grpcConn.Close()
+	}
+	c.grpcConnMu.Unlock()
 }
 
 func minDuration(a, b time.Duration) time.Duration {
@@ -342,23 +306,23 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-// newHTTPClient constructs an http.Client for HTTP/2 over TLS (tlsCfg non-nil)
-// or h2c cleartext HTTP/2 (tlsCfg nil). Callers should create one instance per
-// logical endpoint and reuse it across dials so the transport can pool connections.
-func newHTTPClient(tlsCfg *tls.Config) *http.Client {
+// newGRPCClientConn creates a gRPC client connection to target. Uses TLS when
+// tlsCfg is non-nil, otherwise uses insecure (plaintext) credentials.
+// The connection is created with lazy dialing; the actual TCP connection is
+// established on the first RPC call.
+func newGRPCClientConn(target string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
+	var creds credentials.TransportCredentials
 	if tlsCfg != nil {
-		return &http.Client{
-			Transport: &http2.Transport{
-				TLSClientConfig: tlsCfg,
-			},
-		}
+		creds = credentials.NewTLS(tlsCfg)
+	} else {
+		creds = insecure.NewCredentials()
 	}
-	return &http.Client{
-		Transport: &http2.Transport{
-			AllowHTTP: true,
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, network, addr)
-			},
-		},
-	}
+	return grpc.NewClient(target,
+		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 }

@@ -1,3 +1,5 @@
+//go:build integration
+
 package federation_test
 
 import (
@@ -10,7 +12,6 @@ import (
 	"github.com/wu/keyop-messenger/internal/federation"
 )
 
-// findAuditEvent returns the first recorded event with the given name.
 func findAuditEvent(auditL *fakeAuditLog, name string) (audit.Event, bool) {
 	auditL.mu.Lock()
 	defer auditL.mu.Unlock()
@@ -22,17 +23,17 @@ func findAuditEvent(auditL *fakeAuditLog, name string) (audit.Event, bool) {
 	return audit.Event{}, false
 }
 
-// TestHubClientConnected_AuditIncludesPeerAddr verifies that the client_connected
-// audit event records the remote peer address.
 func TestHubClientConnected_AuditIncludesPeerAddr(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
 	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "peer-addr-test"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "peer-addr-test")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	_, cancel := openPublish(t, stub, "peer-addr-test")
+	defer cancel()
 
 	require.Eventually(t, func() bool {
 		return auditL.has(audit.EventClientConnected)
@@ -44,8 +45,6 @@ func TestHubClientConnected_AuditIncludesPeerAddr(t *testing.T) {
 	assert.Contains(t, evt.Detail, "addr=", "client_connected Detail should contain addr=")
 }
 
-// TestHubClientConnected_AuditDetailIncludesPublishChannels verifies that the
-// client_connected audit event Detail includes the publish channel allowlist.
 func TestHubClientConnected_AuditDetailIncludesPublishChannels(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
@@ -57,9 +56,11 @@ func TestHubClientConnected_AuditDetailIncludesPublishChannels(t *testing.T) {
 	}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "pub-ch-test")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	_, cancel := openPublish(t, stub, "pub-ch-test")
+	defer cancel()
 
 	require.Eventually(t, func() bool {
 		return auditL.has(audit.EventClientConnected)

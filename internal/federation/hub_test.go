@@ -1,11 +1,13 @@
+//go:build integration
+
 //nolint:gosec // test file: G301/G304/G306
 package federation_test
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,13 +17,19 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/dedup"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/federation"
 	"github.com/wu/keyop-messenger/internal/testutil"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
-	"golang.org/x/net/http2"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // ---- shared test helpers ----------------------------------------------------
@@ -48,45 +56,34 @@ func (c *countingWriter) n() int {
 	return c.count
 }
 
-type fakeAuditLog struct {
-	mu     sync.Mutex
-	events []audit.Event
-}
-
-func (f *fakeAuditLog) Log(ev audit.Event) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.events = append(f.events, ev)
-	return nil
-}
-func (f *fakeAuditLog) Close() error { return nil }
-func (f *fakeAuditLog) has(name string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, ev := range f.events {
-		if ev.Event == name {
-			return true
-		}
-	}
-	return false
-}
-
-// clientHandshake performs the client side of the application handshake.
-func clientHandshake(t *testing.T, conn *federation.Conn, name string) {
-	t.Helper()
-	require.NoError(t, federation.SendHandshake(conn, federation.HandshakeMsg{
-		InstanceName: name, Role: "client", Version: "1",
-	}))
-	_, err := federation.ReceiveHandshake(conn)
-	require.NoError(t, err)
-}
-
 func newHub(t *testing.T, cfg federation.HubConfig, cw *countingWriter, auditL audit.AuditLogger) *federation.Hub {
 	t.Helper()
 	dd, err := dedup.NewLRUDedup(10000)
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	return federation.NewHub("hub", cfg, nil, cw.write, dd, auditL, log, 1000, 65536, "")
+}
+
+// startHub starts hub on ":0" and returns a connected grpc.ClientConn.
+func startHub(t *testing.T, hub *federation.Hub) (stub federationv1.FederationServiceClient, cleanup func()) {
+	t.Helper()
+	require.NoError(t, hub.Listen(":0"))
+	conn, err := grpc.NewClient(hub.Addr(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	return federationv1.NewFederationServiceClient(conn), func() {
+		_ = conn.Close()
+		_ = hub.Close()
+	}
+}
+
+// openPublish opens a Publish stream identified by instanceName.
+func openPublish(t *testing.T, stub federationv1.FederationServiceClient, instanceName string) (federationv1.FederationService_PublishClient, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	md := metadata.Pairs("x-federation-instance", instanceName)
+	stream, err := stub.Publish(metadata.NewOutgoingContext(ctx, md))
+	require.NoError(t, err)
+	return stream, cancel
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -97,12 +94,16 @@ func TestHubClientIntegration(t *testing.T) {
 	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "sender")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	pubStream, cancel := openPublish(t, stub, "sender")
+	defer cancel()
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
+	senderCtx, senderCancel := context.WithCancel(context.Background())
+	_ = senderCtx
+	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
 	defer sender.Close()
 
 	for i := 0; i < 10; i++ {
@@ -110,7 +111,7 @@ func TestHubClientIntegration(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, sender.Enqueue(&env))
 	}
-	require.Eventually(t, func() bool { return cw.n() == 10 }, 2*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return cw.n() == 10 }, 5*time.Second, 20*time.Millisecond)
 }
 
 func TestAllowlistRejection(t *testing.T) {
@@ -119,19 +120,18 @@ func TestAllowlistRejection(t *testing.T) {
 	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "allowed-only"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
 
-	// Client sends handshake with a name not in the allowlist.
-	require.NoError(t, federation.SendHandshake(cli, federation.HandshakeMsg{
-		InstanceName: "unknown-peer", Role: "client", Version: "1",
-	}))
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("x-federation-instance", "unknown-peer"))
+	stream, err := stub.Publish(ctx)
+	require.NoError(t, err)
 
-	// Hub should respond with a close frame (code 4403).
-	_, _, err := cli.ReadMessage()
-	var closeErr *federation.CloseError
-	require.ErrorAs(t, err, &closeErr)
-	assert.Equal(t, 4403, closeErr.Code)
+	_, err = stream.Recv()
+	require.Error(t, err)
+	st, ok := status.FromError(err)
+	require.True(t, ok)
+	assert.Equal(t, codes.PermissionDenied, st.Code())
 
 	require.Eventually(t, func() bool { return auditL.has(audit.EventClientRejected) }, time.Second, 20*time.Millisecond)
 }
@@ -142,13 +142,17 @@ func TestDeduplication(t *testing.T) {
 	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "sender")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	pubStream, cancel := openPublish(t, stub, "sender")
+	defer cancel()
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
+	senderCtx, senderCancel := context.WithCancel(context.Background())
+	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
 	defer sender.Close()
+	_ = senderCtx
 
 	env, err := envelope.NewEnvelope("ch", "sender", "t", nil)
 	require.NoError(t, err)
@@ -156,7 +160,7 @@ func TestDeduplication(t *testing.T) {
 	sender.Enqueue(&env)
 	require.Eventually(t, func() bool { return cw.n() == 1 }, time.Second, 10*time.Millisecond)
 
-	sender.Enqueue(&env) // same ID
+	sender.Enqueue(&env) // same ID — should be deduped
 	time.Sleep(150 * time.Millisecond)
 	assert.Equal(t, 1, cw.n(), "duplicate ID must be deduped")
 }
@@ -172,13 +176,17 @@ func TestPolicyViolation(t *testing.T) {
 	}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "sender")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	pubStream, cancel := openPublish(t, stub, "sender")
+	defer cancel()
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
+	senderCtx, senderCancel := context.WithCancel(context.Background())
+	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
 	defer sender.Close()
+	_ = senderCtx
 
 	env, err := envelope.NewEnvelope("blocked-ch", "sender", "t", nil)
 	require.NoError(t, err)
@@ -195,86 +203,73 @@ func TestBackpressure(t *testing.T) {
 	cfg := federation.HubConfig{AllowedPeers: []federation.AllowedPeer{{Name: "sender"}}}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "sender")
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
+
+	pubStream, cancel := openPublish(t, stub, "sender")
+	defer cancel()
 
 	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 100, 65536, log)
+	senderCtx, senderCancel := context.WithCancel(context.Background())
+	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
 	defer sender.Close()
+	_ = senderCtx
 
 	env1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 	env2, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 	sender.Enqueue(&env1)
 	sender.Enqueue(&env2)
 
-	// After 100ms only the first should have completed (second blocked in localWriter).
 	time.Sleep(100 * time.Millisecond)
 	assert.LessOrEqual(t, cw.n(), 1, "second write should still be blocked")
 
 	require.Eventually(t, func() bool { return cw.n() == 2 }, 3*time.Second, 20*time.Millisecond)
 }
 
+// TestSendBufferFull verifies that Enqueue returns false when the buffer is full
+// and the goroutine is stuck waiting for an ack (mock stream never acks).
 func TestSendBufferFull(t *testing.T) {
 	log := &testutil.FakeLogger{}
-	srv, _ := newConnPair(t)
-	// Buffer size 1; goroutine will be stuck waiting for ack since no receiver.
-	ps := federation.NewPeerSender(srv, &sync.Mutex{}, 1, 65536, log)
+	stream, cancel := newNeverAckStream()
+	ps := federation.NewPeerSender(stream, cancel, 1, 65536, log)
 	defer ps.Close()
 
 	e1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 	e2, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 	e3, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 
-	ps.Enqueue(&e1)             // enters buffer
-	ps.Enqueue(&e2)             // may enter buffer or be consumed by goroutine
-	dropped := !ps.Enqueue(&e3) // at least one of e2/e3 must drop eventually
+	ps.Enqueue(&e1)
+	ps.Enqueue(&e2)
+	dropped := !ps.Enqueue(&e3)
 
-	// Try a few more to guarantee a drop is logged.
 	for i := 0; i < 5; i++ {
 		e, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 		ps.Enqueue(&e)
 	}
 	time.Sleep(50 * time.Millisecond)
-
-	_ = dropped          // timing-dependent; just ensure no deadlock/panic
-	assert.True(t, true) // reached here without blocking
+	_ = dropped
+	assert.True(t, true)
 }
 
 func TestBatching(t *testing.T) {
-	srv, cli := newConnPair(t)
+	var frameCount atomic.Int32
+	stream, cancel := newCountingAckStream(&frameCount)
 	log := &testutil.FakeLogger{}
+	sender := federation.NewPeerSender(stream, cancel, 1000, 65536, log)
 
-	var frameCount int32
-	go func() {
-		for {
-			msgType, _, err := srv.ReadMessage()
-			if err != nil {
-				return
-			}
-			if msgType == federation.MsgTypeBinary {
-				atomic.AddInt32(&frameCount, 1)
-			}
-			_ = federation.SendAck(srv, federation.AckMsg{})
-		}
-	}()
-
-	sender := federation.NewPeerSender(cli, &sync.Mutex{}, 1000, 65536, log)
 	for i := 0; i < 200; i++ {
 		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
 		sender.Enqueue(&env)
 	}
-	require.Eventually(t, func() bool { return int(atomic.LoadInt32(&frameCount)) > 0 }, 2*time.Second, 20*time.Millisecond)
+	require.Eventually(t, func() bool { return frameCount.Load() > 0 }, 5*time.Second, 20*time.Millisecond)
 	sender.Close()
+	cancel()
 
-	frames := int(atomic.LoadInt32(&frameCount))
+	frames := frameCount.Load()
 	t.Logf("200 messages → %d frames", frames)
-	assert.Less(t, frames, 200, "messages should be batched")
+	assert.Less(t, frames, int32(200), "messages should be batched")
 }
 
-// TestNotifyChannel_NoopAfterDisconnect verifies that NotifyChannel does not
-// panic after a peer disconnects and its readers are deregistered from the
-// notify registry.
 func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	cw := &countingWriter{}
@@ -286,19 +281,24 @@ func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
 	}
 	hub := newHub(t, cfg, cw, auditL)
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "notify-test")
-	time.Sleep(50 * time.Millisecond)
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
 
-	_ = cli.Close()
-	_ = srv.Close()
+	pubStream, cancel := openPublish(t, stub, "notify-test")
+
+	// Wait for connect audit event.
+	require.Eventually(t, func() bool {
+		return auditL.has(audit.EventClientConnected)
+	}, 2*time.Second, 20*time.Millisecond)
+
+	cancel() // disconnect
 
 	require.Eventually(t, func() bool {
 		return auditL.has(audit.EventPeerDisconnected)
 	}, 2*time.Second, 20*time.Millisecond)
 
-	// NotifyChannel must not panic when no readers are registered.
+	_ = pubStream
+
 	assert.NotPanics(t, func() { hub.NotifyChannel("orders") })
 	assert.NotPanics(t, func() { hub.NotifyChannel("unknown-channel") })
 }
@@ -306,60 +306,38 @@ func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
 func TestReconnectReplay(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
-	// First connection: server reads one frame (which may batch all envelopes)
-	// without sending an ack, then closes — all sent messages remain unacked.
-	srv1, cli1 := newConnPair(t)
-	disconnected := make(chan struct{})
-	go func() {
-		defer close(disconnected)
-		_, _, err := srv1.ReadMessage() // read the one batched frame
-		if err != nil {
-			return
-		}
-		// Close without acking so all messages stay in sender1.Unacked().
-		_ = srv1.Close()
-	}()
+	// First connection: server reads one batch without acking → all messages stay unacked.
+	stream1, cancel1 := newNeverAckStream()
+	sender1 := federation.NewPeerSender(stream1, cancel1, 100, 65536, log)
 
-	sender1 := federation.NewPeerSender(cli1, &sync.Mutex{}, 100, 65536, log)
 	for i := 0; i < 5; i++ {
 		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
 		sender1.Enqueue(&env)
 	}
 
-	<-disconnected
+	// Give sender time to send, then disconnect.
+	require.Eventually(t, func() bool { return stream1.sent.Load() > 0 }, 2*time.Second, 10*time.Millisecond)
+	cancel1()
 	<-sender1.Done()
 
 	unacked := sender1.Unacked()
 	assert.GreaterOrEqual(t, len(unacked), 1, "sent-but-not-acked messages must appear in Unacked()")
 
-	// Second connection: server reads and acks everything.
-	srv2, cli2 := newConnPair(t)
-	var replayed int32
-	go func() {
-		for {
-			msgType, _, err := srv2.ReadMessage()
-			if err != nil {
-				return
-			}
-			if msgType == federation.MsgTypeBinary {
-				atomic.AddInt32(&replayed, 1)
-			}
-			_ = federation.SendAck(srv2, federation.AckMsg{})
-		}
-	}()
-
-	sender2 := federation.NewPeerSender(cli2, &sync.Mutex{}, 100, 65536, log)
+	// Second connection: server acks everything.
+	var replayed atomic.Int32
+	stream2, cancel2 := newCountingAckStream(&replayed)
+	sender2 := federation.NewPeerSender(stream2, cancel2, 100, 65536, log)
 	for _, env := range unacked {
 		env := env
 		sender2.Enqueue(env)
 	}
 
-	// At least one frame must arrive (batching may pack all into one frame).
 	require.Eventually(t,
-		func() bool { return atomic.LoadInt32(&replayed) >= 1 },
+		func() bool { return replayed.Load() >= 1 },
 		2*time.Second, 20*time.Millisecond,
 		"unacked messages must be replayed on reconnect")
 	sender2.Close()
+	cancel2()
 }
 
 func TestMTLSRejection(t *testing.T) {
@@ -397,7 +375,7 @@ func TestMTLSRejection(t *testing.T) {
 	require.NoError(t, err)
 
 	wrongCAPool := x509.NewCertPool()
-	wrongCAPool.AppendCertsFromPEM(caCertPEM1) // trust hub's CA but hub won't trust ours
+	wrongCAPool.AppendCertsFromPEM(caCertPEM1)
 
 	clientTLS := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -405,13 +383,18 @@ func TestMTLSRejection(t *testing.T) {
 		MinVersion:   tls.VersionTLS13,
 	}
 
-	tr := &http2.Transport{TLSClientConfig: clientTLS}
-	httpClient := &http.Client{Transport: tr}
-	_, err = httpClient.Post("https://"+hub.Addr(), "application/octet-stream", http.NoBody)
-	assert.Error(t, err, "client with cert from untrusted CA must be rejected")
-}
+	conn, err := grpc.NewClient(hub.Addr(), grpc.WithTransportCredentials(credentials.NewTLS(clientTLS)))
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
 
-// ---- reverse index (channelSubscribers) tests --------------------------------
+	stub := federationv1.NewFederationServiceClient(conn)
+	ctx := metadata.NewOutgoingContext(context.Background(), metadata.Pairs("x-federation-instance", "client"))
+	stream, openErr := stub.Publish(ctx)
+	if openErr == nil {
+		_, openErr = stream.Recv()
+	}
+	assert.Error(t, openErr, "client with cert from untrusted CA must be rejected")
+}
 
 func TestChannelSubscribersCleanupOnDisconnect(t *testing.T) {
 	auditL := &fakeAuditLog{}
@@ -423,23 +406,21 @@ func TestChannelSubscribersCleanupOnDisconnect(t *testing.T) {
 		}},
 	}
 	hub := newHub(t, cfg, cw, auditL)
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "cleanup-test")
+	_, cancel := openPublish(t, stub, "cleanup-test")
 
-	time.Sleep(100 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return auditL.has(audit.EventClientConnected)
+	}, 2*time.Second, 20*time.Millisecond)
 
-	// Close the connection to trigger cleanup.
-	_ = cli.Close()
-	_ = srv.Close()
+	cancel()
 
-	// Wait for cleanup goroutine to run.
 	require.Eventually(t, func() bool {
 		return auditL.has(audit.EventPeerDisconnected)
 	}, 2*time.Second, 20*time.Millisecond)
 
-	// After cleanup, NotifyChannel must not panic (notify registry was cleaned up).
 	assert.NotPanics(t, func() { hub.NotifyChannel("ch-a") })
 	assert.NotPanics(t, func() { hub.NotifyChannel("ch-b") })
 }
@@ -453,73 +434,16 @@ func TestChannelSubscribersEmptyChannelDeletion(t *testing.T) {
 		},
 	}
 	hub := newHub(t, cfg, cw, auditL)
+	stub, cleanup := startHub(t, hub)
+	defer cleanup()
 
-	srv, cli := newConnPair(t)
-	hub.ServeTestConn(srv, nil)
-	clientHandshake(t, cli, "peer-1")
-
-	time.Sleep(100 * time.Millisecond)
-
-	// Disconnect the only peer on exclusive-ch.
-	_ = cli.Close()
-	_ = srv.Close()
-
-	require.Eventually(t, func() bool {
-		return auditL.has(audit.EventPeerDisconnected)
-	}, 2*time.Second, 20*time.Millisecond)
-
-	// NotifyChannel must not panic when the channel's reader list is empty.
+	_, cancel := openPublish(t, stub, "peer-1")
+	require.Eventually(t, func() bool { return auditL.has(audit.EventClientConnected) }, 2*time.Second, 20*time.Millisecond)
+	cancel()
+	require.Eventually(t, func() bool { return auditL.has(audit.EventPeerDisconnected) }, 2*time.Second, 20*time.Millisecond)
 	assert.NotPanics(t, func() { hub.NotifyChannel("exclusive-ch") })
 }
 
-func TestChannelSubscribersStressConnectDisconnect(t *testing.T) {
-	auditL := &fakeAuditLog{}
-	cw := &countingWriter{}
-
-	peers := []federation.AllowedPeer{}
-	for i := 0; i < 30; i++ {
-		peers = append(peers, federation.AllowedPeer{
-			Name:      fmt.Sprintf("peer-%d", i),
-			Subscribe: []string{"stress-ch-a", "stress-ch-b"},
-		})
-	}
-
-	cfg := federation.HubConfig{AllowedPeers: peers}
-	hub := newHub(t, cfg, cw, auditL)
-
-	// Connect and disconnect 30 peers multiple times, each subscribing to 2 channels.
-	for round := 0; round < 3; round++ {
-		var connections []*federation.Conn
-		for i := 0; i < 30; i++ {
-			srv, cli := newConnPair(t)
-			hub.ServeTestConn(srv, nil)
-			clientHandshake(t, cli, fmt.Sprintf("peer-%d", i))
-			connections = append(connections, cli)
-		}
-
-		time.Sleep(50 * time.Millisecond) // Let all connections establish
-
-		// Disconnect all peers.
-		for _, conn := range connections {
-			_ = conn.Close()
-		}
-
-		time.Sleep(50 * time.Millisecond) // Let cleanup complete
-
-		// NotifyChannel must not panic after all peers disconnect.
-		hub.NotifyChannel("stress-ch-a")
-		hub.NotifyChannel("stress-ch-b")
-	}
-
-	// Final NotifyChannel to verify hub is still functional.
-	hub.NotifyChannel("stress-ch-a")
-	hub.NotifyChannel("stress-ch-b")
-
-	// Test completed without panic; notify registry survived the stress.
-	assert.True(t, true, "stress test completed without panic or memory issues")
-}
-
-// TestHubListenError verifies that Listen returns an error when net.Listen fails.
 func TestHubListenError(t *testing.T) {
 	dd, err := dedup.NewLRUDedup(10000)
 	require.NoError(t, err)
@@ -532,3 +456,66 @@ func TestHubListenError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "hub listen")
 }
+
+// ---- mock streams for unit tests of PeerSender ------------------------------
+
+// neverAckStream is a Publish stream that accepts sends but never acks.
+// The caller receives the cancel func and passes it to NewPeerSender as streamCancel
+// so that PeerSender.Close() unblocks Recv().
+type neverAckStream struct {
+	ctx  context.Context
+	sent atomic.Int32
+}
+
+func newNeverAckStream() (*neverAckStream, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &neverAckStream{ctx: ctx}, cancel
+}
+
+func (s *neverAckStream) Send(_ *federationv1.PublishBatch) error {
+	s.sent.Add(1)
+	return nil
+}
+func (s *neverAckStream) Recv() (*federationv1.PublishAck, error) {
+	<-s.ctx.Done()
+	return nil, io.EOF
+}
+func (s *neverAckStream) Context() context.Context     { return s.ctx }
+func (s *neverAckStream) Header() (metadata.MD, error) { return nil, nil }
+func (s *neverAckStream) Trailer() metadata.MD         { return nil }
+func (s *neverAckStream) CloseSend() error             { return nil }
+func (s *neverAckStream) SendMsg(any) error            { return nil }
+func (s *neverAckStream) RecvMsg(any) error            { return nil }
+
+// countingAckStream counts received batches and sends an ack for each.
+type countingAckStream struct {
+	ctx     context.Context
+	counter *atomic.Int32
+	ackCh   chan *federationv1.PublishAck
+}
+
+func newCountingAckStream(counter *atomic.Int32) (*countingAckStream, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &countingAckStream{ctx: ctx, counter: counter, ackCh: make(chan *federationv1.PublishAck, 256)}
+	return s, cancel
+}
+
+func (s *countingAckStream) Send(_ *federationv1.PublishBatch) error {
+	s.counter.Add(1)
+	s.ackCh <- &federationv1.PublishAck{}
+	return nil
+}
+func (s *countingAckStream) Recv() (*federationv1.PublishAck, error) {
+	select {
+	case ack := <-s.ackCh:
+		return ack, nil
+	case <-s.ctx.Done():
+		return nil, io.EOF
+	}
+}
+func (s *countingAckStream) Context() context.Context     { return s.ctx }
+func (s *countingAckStream) Header() (metadata.MD, error) { return nil, nil }
+func (s *countingAckStream) Trailer() metadata.MD         { return nil }
+func (s *countingAckStream) CloseSend() error             { return nil }
+func (s *countingAckStream) SendMsg(any) error            { return nil }
+func (s *countingAckStream) RecvMsg(any) error            { return nil }

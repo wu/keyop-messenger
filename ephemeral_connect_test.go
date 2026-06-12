@@ -1,100 +1,92 @@
+//go:build integration
+
 // Package-level tests for EphemeralMessenger that require a live (in-process)
-// HTTP/2 hub to exercise code paths that unit tests cannot reach.
+// gRPC hub to exercise code paths that unit tests cannot reach.
 package messenger
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
-	"github.com/wu/keyop-messenger/internal/federation"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
-// mockEphemeralHub returns a plain-text (h2c) HTTP/2 test server that
-// completes the ephemeral handshake with every connecting client. The caller
-// supplies afterHandshake, which is invoked on the server-side conn immediately
-// after the handshake completes. Pass nil to just keep the connection alive.
-func mockEphemeralHub(t *testing.T, afterHandshake func(*federation.Conn)) *httptest.Server {
-	t.Helper()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		conn := federation.NewConn(r.Body, w, nil, func() error { return nil })
-
-		// Read and respond to the client handshake.
-		if _, err := federation.ReceiveHandshake(conn); err != nil {
-			return
-		}
-		if err := federation.SendHandshake(conn, federation.HandshakeMsg{
-			InstanceName: "hub", Role: "hub", Version: "1",
-		}); err != nil {
-			return
-		}
-
-		if afterHandshake != nil {
-			afterHandshake(conn)
-		} else {
-			// Keep alive: drain any messages the client sends.
-			for {
-				if _, _, err := conn.ReadMessage(); err != nil {
-					return
-				}
-			}
-		}
-	})
-	srv := httptest.NewUnstartedServer(h2c.NewHandler(mux, &http2.Server{}))
-	srv.Start()
-	t.Cleanup(srv.Close)
-	return srv
+// mockEphemeralGRPCHub is a minimal FederationServiceServer for EphemeralMessenger tests.
+type mockEphemeralGRPCHub struct {
+	federationv1.UnimplementedFederationServiceServer
+	publishFn   func(grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error
+	subscribeFn func(grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error
 }
 
-// sendEnvelopeFromHub writes a length-prefixed binary frame containing one
-// envelope to conn (the server side).
-func sendEnvelopeFromHub(t *testing.T, conn *federation.Conn, channel, payloadType string, payload any) {
-	t.Helper()
-	env, err := envelope.NewEnvelope(channel, "hub", payloadType, payload)
-	require.NoError(t, err)
-	data, err := envelope.Marshal(env)
-	require.NoError(t, err)
+func (s *mockEphemeralGRPCHub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+	if s.publishFn != nil {
+		return s.publishFn(stream)
+	}
+	for {
+		_, err := stream.Recv()
+		if err != nil {
+			return nil
+		}
+		_ = stream.Send(&federationv1.PublishAck{})
+	}
+}
 
-	w, err := conn.NextWriter(federation.MsgTypeBinary)
+func (s *mockEphemeralGRPCHub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+	if s.subscribeFn != nil {
+		return s.subscribeFn(stream)
+	}
+	_, _ = stream.Recv() // read SubscribeRequest
+	<-stream.Context().Done()
+	return nil
+}
+
+// startEphemeralHub starts a gRPC server and returns its addr.
+func startEphemeralHub(t *testing.T, srv *mockEphemeralGRPCHub) string {
+	t.Helper()
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.NoError(t, federation.WriteFrame(w, [][]byte{data}))
-	require.NoError(t, w.Close())
+	grpcSrv := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
+	federationv1.RegisterFederationServiceServer(grpcSrv, srv)
+	go grpcSrv.Serve(lis) //nolint:errcheck
+	t.Cleanup(grpcSrv.Stop)
+	return lis.Addr().String()
 }
 
 // TestEphemeralMessenger_Subscribe_HandlerInvoked exercises the handler closure
-// registered by EphemeralMessenger.Subscribe (ephemeral.go:124–144).
-// This closure builds a Message from the incoming *envelope.Envelope and calls
-// the user-supplied handler; it runs inside dispatchEnvelope and is never
-// executed by the existing unit tests (no real connection → no inbound frames).
+// registered by EphemeralMessenger.Subscribe.
 func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
-	var received atomic.Int32
-	var mu sync.Mutex
-	var lastMsg Message
+	env, err := envelope.NewEnvelope("events", "hub", "test.Msg", map[string]string{"x": "1"})
+	require.NoError(t, err)
+	raw, err := envelope.Marshal(env)
+	require.NoError(t, err)
 
-	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
-		// Push one envelope to the client, then keep the connection alive so
-		// the PeerReceiver can ack it and the client doesn't disconnect.
-		sendEnvelopeFromHub(t, conn, "events", "test.Msg", map[string]string{"x": "1"})
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
+	addr := startEphemeralHub(t, &mockEphemeralGRPCHub{
+		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			if _, err := stream.Recv(); err != nil { // read SubscribeRequest
+				return nil
 			}
-		}
+			_ = stream.Send(&federationv1.HubBatch{
+				Payload: &federationv1.HubBatch_Batch{
+					Batch: &federationv1.EnvelopeBatch{Records: [][]byte{raw}},
+				},
+			})
+			_, _ = stream.Recv() // read ack
+			<-stream.Context().Done()
+			return nil
+		},
 	})
 
+	var received atomic.Int32
 	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      strings.TrimPrefix(srv.URL, "http://"),
+		HubAddr:      addr,
 		InstanceName: "test-client",
 		Subscribe:    []string{"events"},
 	})
@@ -102,10 +94,9 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	t.Cleanup(func() { _ = em.Close() })
 
 	require.NoError(t, em.Subscribe("events", func(msg Message) {
-		mu.Lock()
-		lastMsg = msg
-		mu.Unlock()
 		received.Add(1)
+		assert.Equal(t, "events", msg.Channel)
+		assert.Equal(t, "test.Msg", msg.PayloadType)
 	}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -115,12 +106,6 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	require.Eventually(t, func() bool { return received.Load() >= 1 },
 		2*time.Second, 10*time.Millisecond,
 		"Subscribe handler must be invoked when the hub pushes a message")
-
-	mu.Lock()
-	ch, pt := lastMsg.Channel, lastMsg.PayloadType
-	mu.Unlock()
-	assert.Equal(t, "events", ch)
-	assert.Equal(t, "test.Msg", pt)
 }
 
 // TestEphemeralMessenger_Subscribe_PayloadDecoded verifies that a registered
@@ -128,20 +113,32 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 func TestEphemeralMessenger_Subscribe_PayloadDecoded(t *testing.T) {
 	type MyEvent struct{ Name string }
 
+	env, err := envelope.NewEnvelope("typed", "hub", "test.MyEvent", MyEvent{Name: "hello"})
+	require.NoError(t, err)
+	raw, err := envelope.Marshal(env)
+	require.NoError(t, err)
+
+	addr := startEphemeralHub(t, &mockEphemeralGRPCHub{
+		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			if _, err := stream.Recv(); err != nil {
+				return nil
+			}
+			_ = stream.Send(&federationv1.HubBatch{
+				Payload: &federationv1.HubBatch_Batch{
+					Batch: &federationv1.EnvelopeBatch{Records: [][]byte{raw}},
+				},
+			})
+			_, _ = stream.Recv()
+			<-stream.Context().Done()
+			return nil
+		},
+	})
+
 	var gotPayload any
 	var received atomic.Bool
 
-	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
-		sendEnvelopeFromHub(t, conn, "typed", "test.MyEvent", MyEvent{Name: "hello"})
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	})
-
 	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      strings.TrimPrefix(srv.URL, "http://"),
+		HubAddr:      addr,
 		InstanceName: "test-client",
 		Subscribe:    []string{"typed"},
 	})
@@ -158,17 +155,15 @@ func TestEphemeralMessenger_Subscribe_PayloadDecoded(t *testing.T) {
 	defer cancel()
 	require.NoError(t, em.Connect(ctx))
 
-	require.Eventually(t, received.Load, 2*time.Second, 10*time.Millisecond,
-		"handler must receive the decoded payload")
+	require.Eventually(t, received.Load, 2*time.Second, 10*time.Millisecond)
 
 	event, ok := gotPayload.(MyEvent)
 	require.True(t, ok, "payload must be decoded to MyEvent, got %T", gotPayload)
 	assert.Equal(t, "hello", event.Name)
 }
 
-// TestEphemeralMessenger_Publish_EnvelopeCreateError exercises the
-// `if err != nil { return fmt.Errorf("ephemeral publish: create envelope: ...") }`
-// branch in Publish by passing an unmarshalable payload (a channel value).
+// TestEphemeralMessenger_Publish_EnvelopeCreateError exercises the error path
+// when an unmarshalable payload is passed to Publish.
 func TestEphemeralMessenger_Publish_EnvelopeCreateError(t *testing.T) {
 	em, err := NewEphemeralMessenger(EphemeralConfig{
 		HubAddr:      "hub.example.com:7740",
@@ -178,36 +173,35 @@ func TestEphemeralMessenger_Publish_EnvelopeCreateError(t *testing.T) {
 	t.Cleanup(func() { _ = em.Close() })
 
 	ctx := context.Background()
-	// A channel value cannot be JSON-marshaled, so NewEnvelope returns an error.
 	err = em.Publish(ctx, "events", "test.Event", make(chan struct{}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "ephemeral publish: create envelope")
 }
 
 // TestEphemeralMessenger_Publish_WithCorrelationAndService verifies that
-// CorrelationID and ServiceName are stamped onto the envelope from context.
+// CorrelationID and ServiceName are stamped onto the envelope.
 func TestEphemeralMessenger_Publish_WithCorrelationAndService(t *testing.T) {
 	acked := make(chan struct{}, 1)
 
-	srv := mockEphemeralHub(t, func(conn *federation.Conn) {
-		// Read the binary frame from the client and send a JSON ack.
-		for {
-			mt, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if mt == federation.MsgTypeBinary {
-				_ = federation.SendAck(conn, federation.AckMsg{LastID: "x"})
+	addr := startEphemeralHub(t, &mockEphemeralGRPCHub{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			for {
+				batch, err := stream.Recv()
+				if err != nil {
+					return nil
+				}
+				_ = batch
+				_ = stream.Send(&federationv1.PublishAck{})
 				select {
 				case acked <- struct{}{}:
 				default:
 				}
 			}
-		}
+		},
 	})
 
 	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      strings.TrimPrefix(srv.URL, "http://"),
+		HubAddr:      addr,
 		InstanceName: "test-client",
 	})
 	require.NoError(t, err)
