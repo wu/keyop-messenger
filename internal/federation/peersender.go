@@ -114,32 +114,31 @@ func (ps *PeerSender) run() {
 		}
 
 		// Accumulate a batch up to maxBatchBytes or until the buffer is empty.
-		batch := []*envelope.Envelope{first}
-		batchBytes := marshaledSize(first)
+		// Marshal each envelope once: the bytes serve both the size check and Send.
+		firstData, mErr := envelope.Marshal(*first)
+		if mErr != nil {
+			ps.log.Error("federation: sender marshal", "id", first.ID, "err", mErr)
+			continue
+		}
+		envs := []*envelope.Envelope{first}
+		records := [][]byte{firstData}
+		batchBytes := len(firstData)
 
 	drain:
 		for batchBytes < ps.maxBatchBytes {
 			select {
 			case env := <-ps.buf:
-				batch = append(batch, env)
-				batchBytes += marshaledSize(env)
+				data, mErr := envelope.Marshal(*env)
+				if mErr != nil {
+					ps.log.Error("federation: sender marshal", "id", env.ID, "err", mErr)
+					continue drain
+				}
+				envs = append(envs, env)
+				records = append(records, data)
+				batchBytes += len(data)
 			default:
 				break drain
 			}
-		}
-
-		// Marshal each envelope into a wire record.
-		records := make([][]byte, 0, len(batch))
-		for _, env := range batch {
-			data, err := envelope.Marshal(*env)
-			if err != nil {
-				ps.log.Error("federation: sender marshal", "id", env.ID, "err", err)
-				continue
-			}
-			records = append(records, data)
-		}
-		if len(records) == 0 {
-			continue
 		}
 
 		// Send one batch containing all records.
@@ -150,7 +149,7 @@ func (ps *PeerSender) run() {
 
 		// Record as unacked.
 		ps.mu.Lock()
-		ps.unacked = append(ps.unacked, batch...)
+		ps.unacked = append(ps.unacked, envs...)
 		ps.mu.Unlock()
 
 		// Block until ack arrives from the remote receiver.
@@ -175,14 +174,4 @@ func (ps *PeerSender) run() {
 			ps.mu.Unlock()
 		}
 	}
-}
-
-// marshaledSize returns an estimate of the wire size of env for batch sizing.
-// On marshal error it returns 0 (the envelope is skipped later).
-func marshaledSize(env *envelope.Envelope) int {
-	data, err := envelope.Marshal(*env)
-	if err != nil {
-		return 0
-	}
-	return len(data)
 }
