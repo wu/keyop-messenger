@@ -114,13 +114,21 @@ func TestChannelReader_DeliveryAndOffsetPersistence(t *testing.T) {
 	assert.Equal(t, int64(len(data)), req.newOffset)
 	close(req.doneCh)
 
-	// Give the reader time to persist the offset.
-	time.Sleep(50 * time.Millisecond)
-
+	// Poll until the channelreader goroutine persists the offset (WriteOffset
+	// calls fsync before the atomic rename, which can be slow on CI).
 	offsetPath := filepath.Join(offsetDir, "fed-peer1.offset")
-	offset, err := storage.ReadOffset(offsetPath)
-	require.NoError(t, err)
-	assert.Equal(t, int64(len(data)), offset)
+	want := int64(len(data))
+	deadline := time.Now().Add(5 * time.Second)
+	var offset int64
+	for time.Now().Before(deadline) {
+		var readErr error
+		offset, readErr = storage.ReadOffset(offsetPath)
+		if readErr == nil && offset == want {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	require.Equal(t, want, offset)
 }
 
 // TestChannelReader_BatchSizeLimit verifies that large messages are split into
