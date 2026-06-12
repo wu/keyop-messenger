@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"errors"
 	"io"
 	"sync"
 
@@ -111,7 +112,7 @@ func (pr *PeerReceiver) run() {
 			select {
 			case <-pr.stop:
 			default:
-				if err != io.EOF && status.Code(err) != codes.Canceled {
+				if !errors.Is(err, io.EOF) && status.Code(err) != codes.Canceled {
 					pr.log.Error("federation: receiver read error", "peer", pr.peerName, "err", err)
 					pr.mu.Lock()
 					pr.stopErr = err

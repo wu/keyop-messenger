@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"errors"
 	"io"
 	"sync"
 
@@ -155,7 +156,7 @@ func (ps *PeerSender) run() {
 		// Block until ack arrives from the remote receiver.
 		ack, err := ps.stream.Recv()
 		if err != nil {
-			if err != io.EOF && status.Code(err) != codes.Canceled {
+			if !errors.Is(err, io.EOF) && status.Code(err) != codes.Canceled {
 				ps.log.Error("federation: sender receive ack", "err", err)
 			}
 			return

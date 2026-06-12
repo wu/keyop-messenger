@@ -283,7 +283,7 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 	for {
 		batch, recvErr := stream.Recv()
 		if recvErr != nil {
-			if recvErr != io.EOF {
+			if !errors.Is(recvErr, io.EOF) {
 				lastErr = recvErr
 			}
 			break
