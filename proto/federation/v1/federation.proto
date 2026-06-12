@@ -42,9 +42,8 @@ message HubBatch {
 message SubscribeRequest {
   string          instance_name = 1;
   string          version       = 2;
-  string          last_id       = 3; // last acked ID; non-empty on reconnect
-  repeated string subscribe     = 4; // channels to receive from hub
-  bool            ephemeral     = 5; // no replay even if last_id set
+  repeated string subscribe     = 3; // channels to receive from hub
+  bool            ephemeral     = 4; // no replay on reconnect
 }
 
 message EnvelopeBatch {

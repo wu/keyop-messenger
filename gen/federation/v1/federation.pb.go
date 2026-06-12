@@ -282,9 +282,8 @@ type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InstanceName  string                 `protobuf:"bytes,1,opt,name=instance_name,json=instanceName,proto3" json:"instance_name,omitempty"`
 	Version       string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	LastId        string                 `protobuf:"bytes,3,opt,name=last_id,json=lastId,proto3" json:"last_id,omitempty"` // last acked ID; non-empty on reconnect
-	Subscribe     []string               `protobuf:"bytes,4,rep,name=subscribe,proto3" json:"subscribe,omitempty"`         // channels to receive from hub
-	Ephemeral     bool                   `protobuf:"varint,5,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"`        // no replay even if last_id set
+	Subscribe     []string               `protobuf:"bytes,3,rep,name=subscribe,proto3" json:"subscribe,omitempty"`  // channels to receive from hub
+	Ephemeral     bool                   `protobuf:"varint,4,opt,name=ephemeral,proto3" json:"ephemeral,omitempty"` // no replay on reconnect
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -329,13 +328,6 @@ func (x *SubscribeRequest) GetInstanceName() string {
 func (x *SubscribeRequest) GetVersion() string {
 	if x != nil {
 		return x.Version
-	}
-	return ""
-}
-
-func (x *SubscribeRequest) GetLastId() string {
-	if x != nil {
-		return x.LastId
 	}
 	return ""
 }
@@ -511,13 +503,12 @@ const file_federation_proto_rawDesc = "" +
 	"\bHubBatch\x124\n" +
 	"\x05batch\x18\x01 \x01(\v2\x1c.federation.v1.EnvelopeBatchH\x00R\x05batch\x122\n" +
 	"\x05close\x18\x02 \x01(\v2\x1a.federation.v1.CloseNoticeH\x00R\x05closeB\t\n" +
-	"\apayload\"\xa6\x01\n" +
+	"\apayload\"\x8d\x01\n" +
 	"\x10SubscribeRequest\x12#\n" +
 	"\rinstance_name\x18\x01 \x01(\tR\finstanceName\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12\x17\n" +
-	"\alast_id\x18\x03 \x01(\tR\x06lastId\x12\x1c\n" +
-	"\tsubscribe\x18\x04 \x03(\tR\tsubscribe\x12\x1c\n" +
-	"\tephemeral\x18\x05 \x01(\bR\tephemeral\")\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x12\x1c\n" +
+	"\tsubscribe\x18\x03 \x03(\tR\tsubscribe\x12\x1c\n" +
+	"\tephemeral\x18\x04 \x01(\bR\tephemeral\")\n" +
 	"\rEnvelopeBatch\x12\x18\n" +
 	"\arecords\x18\x01 \x03(\fR\arecords\"\x1e\n" +
 	"\x03Ack\x12\x17\n" +
