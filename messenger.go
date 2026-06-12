@@ -661,6 +661,7 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	if err := cs.writer.Write(env); err != nil {
 		return err
 	}
+	cs.publishCount.Add(1)
 
 	// Notify hub channel readers that new data is available for this channel.
 	if m.hub != nil {

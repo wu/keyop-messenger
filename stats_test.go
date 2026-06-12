@@ -7,6 +7,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 func TestStats_Empty(t *testing.T) {
@@ -32,6 +33,7 @@ func TestStats_ChannelStreamBytes(t *testing.T) {
 	require.Len(t, s.Channels, 1)
 	assert.Equal(t, "orders", s.Channels[0].Channel)
 	assert.Positive(t, s.Channels[0].StreamBytes)
+	assert.Equal(t, int64(1), s.Channels[0].MessageCount)
 	assert.Empty(t, s.Channels[0].Subscribers)
 }
 
@@ -107,4 +109,25 @@ func TestStats_StreamBytesGrowsWithPublish(t *testing.T) {
 	require.Len(t, s2.Channels, 1)
 
 	assert.Greater(t, s2.Channels[0].StreamBytes, bytesAfterFirst)
+	assert.Equal(t, int64(2), s2.Channels[0].MessageCount)
+}
+
+func TestStats_MessageCountIncludesFederated(t *testing.T) {
+	dir := t.TempDir()
+	m, err := New(testConfig(dir))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// One locally-published message.
+	require.NoError(t, m.Publish(context.Background(), "ch", "test.E", map[string]any{"v": 1}))
+
+	// One message arriving via federation (writeLocalEnvelope is the callback
+	// used by PeerReceiver/Hub when a remote message is written locally).
+	env, err := envelope.NewEnvelope("ch", "remote-origin", "test.E", map[string]any{"v": 2})
+	require.NoError(t, err)
+	require.NoError(t, m.writeLocalEnvelope(&env))
+
+	s := m.Stats()
+	require.Len(t, s.Channels, 1)
+	assert.Equal(t, int64(2), s.Channels[0].MessageCount)
 }
