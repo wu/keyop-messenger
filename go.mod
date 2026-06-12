@@ -2,6 +2,8 @@ module github.com/wu/keyop-messenger
 
 go 1.22
 
+toolchain go1.22.0
+
 require (
 	github.com/fsnotify/fsnotify v1.7.0
 	github.com/google/uuid v1.6.0
