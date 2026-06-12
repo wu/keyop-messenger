@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/wu/keyop-messenger/compare/v1.4.0...v1.4.1) (2026-06-12)
+
+### Bug Fixes
+
+* count federated messages in Stats() MessageCount ([cefdfbc](https://github.com/wu/keyop-messenger/commit/cefdfbc0dcb955fa85eea6511efdc70456997464))
+* poll for offset persistence in TestChannelReader_DeliveryAndOffsetPersistence ([e716d7a](https://github.com/wu/keyop-messenger/commit/e716d7a2411ef2ac0103d83324bfb751f63c8c4d))
+
 ## [1.4.0](https://github.com/wu/keyop-messenger/compare/v1.3.0...v1.4.0) (2026-06-12)
 
 ### Features
