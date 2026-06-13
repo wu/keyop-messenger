@@ -71,16 +71,17 @@ func startMockServer(t *testing.T, srv *mockFedServer) string {
 	return lis.Addr().String()
 }
 
-// newTestClient creates a sender-only Client suitable for integration tests.
+// newTestClient creates a Client with no outbound channels, suitable for tests
+// that only exercise connection lifecycle (no publishing).
 func newTestClient(log *testutil.FakeLogger, subscribeChannels []string) *Client {
 	dd, _ := dedup.NewLRUDedup(100)
 	return NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
 		dd, &fakeAuditLogger2{}, log,
-		100, 65536,
+		65536,
 		100*time.Millisecond, 500*time.Millisecond, 0.1,
-		subscribeChannels, nil,
+		subscribeChannels, nil, "",
 	)
 }
 
@@ -107,19 +108,17 @@ func TestClient_Dial_Success(t *testing.T) {
 	client := newTestClient(log, nil)
 	defer client.Close()
 
-	sender, err := client.Dial(addr)
-	assert.NoError(t, err)
-	assert.NotNil(t, sender)
+	require.NoError(t, client.Dial(addr))
+	assert.True(t, client.Connected())
 
 	select {
 	case <-connected:
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never saw connection")
 	}
-	sender.Close()
 }
 
-func TestClient_Sender_AfterDial(t *testing.T) {
+func TestClient_Connected_AfterDial(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
@@ -128,12 +127,10 @@ func TestClient_Sender_AfterDial(t *testing.T) {
 	client := newTestClient(log, nil)
 	defer client.Close()
 
-	assert.Nil(t, client.Sender())
+	assert.False(t, client.Connected())
 
-	sender, err := client.Dial(addr)
-	require.NoError(t, err)
-	assert.Equal(t, sender, client.Sender())
-	sender.Close()
+	require.NoError(t, client.Dial(addr))
+	assert.True(t, client.Connected())
 }
 
 func TestClient_ConnectWithReconnect_InitialSuccess(t *testing.T) {
@@ -194,16 +191,14 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 		"sender-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil, // no localWriter
 		dd, &fakeAuditLogger2{}, log,
-		100, 65536,
+		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
-		nil, nil,
+		nil, nil, "",
 	)
 	defer client.Close()
 
-	sender, err := client.Dial(addr)
-	assert.NoError(t, err)
-	assert.NotNil(t, sender)
-	sender.Close()
+	require.NoError(t, client.Dial(addr))
+	assert.True(t, client.Connected())
 }
 
 func TestClient_Dial_WithSubscriptions(t *testing.T) {
@@ -233,14 +228,13 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
 		dd, &fakeAuditLogger2{}, log,
-		100, 65536,
+		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
-		[]string{"chan1", "chan2", "chan3"}, nil,
+		[]string{"chan1", "chan2", "chan3"}, nil, "",
 	)
 	defer client.Close()
 
-	sender, err := client.Dial(addr)
-	require.NoError(t, err)
+	require.NoError(t, client.Dial(addr))
 
 	select {
 	case <-gotSubscribe:
@@ -248,15 +242,13 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never received SubscribeRequest")
 	}
-	sender.Close()
 }
 
-func TestClient_Publish_Batching(t *testing.T) {
+func TestClient_Publish_DeliversFromChannelFile(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	var batchCount atomic.Int32
-	gotMessages := make(chan struct{}, 1)
+	gotIDs := make(chan string, 10)
 
 	addr := startMockServer(t, &mockFedServer{
 		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
@@ -268,37 +260,54 @@ func TestClient_Publish_Batching(t *testing.T) {
 				if err != nil {
 					return nil
 				}
-				batchCount.Add(1)
-				_ = batch
-				_ = stream.Send(&federationv1.PublishAck{})
-				select {
-				case gotMessages <- struct{}{}:
-				default:
+				for _, rec := range batch.Records {
+					env, uErr := envelope.Unmarshal(rec)
+					if uErr == nil {
+						select {
+						case gotIDs <- env.ID:
+						default:
+						}
+					}
 				}
+				_ = stream.Send(&federationv1.PublishAck{})
 			}
 		},
 	})
 
-	client := newTestClient(log, nil)
+	dd, _ := dedup.NewLRUDedup(100)
+	dataDir := t.TempDir()
+	client := NewClient(
+		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
+		nil, dd, &fakeAuditLogger2{}, log,
+		65536,
+		500*time.Millisecond, 60*time.Second, 0.2,
+		nil, []string{"ch"}, dataDir,
+	)
 	defer client.Close()
 
-	sender, err := client.Dial(addr)
-	require.NoError(t, err)
-	defer sender.Close()
+	require.NoError(t, client.Dial(addr))
+	feeder := newChannelFeeder(t, dataDir, "ch", client)
 
+	var sentIDs []string
 	for i := 0; i < 5; i++ {
 		env, _ := envelope.NewEnvelope("ch", "src", "t", map[string]any{"i": i})
-		sender.Enqueue(&env)
+		feeder.publish(t, &env)
+		sentIDs = append(sentIDs, env.ID)
 	}
 
+	var received []string
 	require.Eventually(t, func() bool {
-		select {
-		case <-gotMessages:
-			return true
-		default:
-			return false
+		for {
+			select {
+			case id := <-gotIDs:
+				received = append(received, id)
+			default:
+				return len(received) >= len(sentIDs)
+			}
 		}
 	}, 2*time.Second, 10*time.Millisecond)
+
+	assert.ElementsMatch(t, sentIDs, received[:len(sentIDs)])
 }
 
 func TestClient_PeerConnected_AuditEvent(t *testing.T) {
@@ -312,15 +321,13 @@ func TestClient_PeerConnected_AuditEvent(t *testing.T) {
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil, dd, auditL, log,
-		100, 65536,
+		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
-		nil, nil,
+		nil, nil, "",
 	)
 	defer client.Close()
 
-	sender, err := client.Dial(addr)
-	require.NoError(t, err)
-	defer sender.Close()
+	require.NoError(t, client.Dial(addr))
 
 	require.Eventually(t, func() bool {
 		auditL.mu.Lock()

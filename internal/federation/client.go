@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/rand"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,12 +19,24 @@ import (
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/storage"
 )
 
-// Client dials a hub over gRPC, runs a PeerSender for outbound messages on the
-// Publish stream, and reconnects with exponential backoff on disconnect. A
-// PeerReceiver can be optionally started for hubs that also push messages back
-// to the client, using the Subscribe stream.
+// Client dials a hub over gRPC and maintains two independent streams:
+//
+//   - Publish: outbound messages from this instance's local channel files.
+//     For each configured publishChannel a channelReader watches the local
+//     segment files (driven by the messenger's NotifyChannel calls), and a
+//     pubCoordinator dispatches one batch at a time over the Publish stream,
+//     advancing the per-channel "fedout-{hubAddr}.offset" file after each ack.
+//
+//   - Subscribe (optional): if subscribeChannels is non-empty, a PeerReceiver
+//     consumes hub-pushed envelopes and hands them to localWriter.
+//
+// On disconnect the reconnect loop closes the active coordinator + readers
+// and dials again with exponential backoff. Offsets persist across reconnects,
+// so any message published locally during the disconnect is delivered on
+// reconnect — there is no in-memory unacked window to lose.
 type Client struct {
 	instanceName      string
 	tlsCfg            *tls.Config
@@ -32,8 +45,8 @@ type Client struct {
 	dedup             Deduplicator
 	auditL            audit.AuditLogger
 	log               logger
-	sendBufSize       int
 	maxBatchBytes     int
+	dataDir           string
 	subscribeChannels []string
 	publishChannels   []string
 
@@ -44,9 +57,13 @@ type Client struct {
 	hubAddr        string       // set once in ConnectWithReconnect before the reconnect goroutine starts
 	reconnectCount atomic.Int64 // incremented on each successful reconnect (not the initial dial)
 
-	mu       sync.Mutex
-	sender   *PeerSender
-	receiver *PeerReceiver // nil when no subscribe channels are configured
+	mu          sync.Mutex
+	coordinator *pubCoordinator
+	receiver    *PeerReceiver
+
+	// readersByChannel maps each configured publishChannel to the
+	// channelReader currently feeding the coordinator. Reset on each dial.
+	readersByChannel map[string]*channelReader
 
 	// grpcConn is created lazily on the first dial and reused across reconnects.
 	grpcConnMu sync.Mutex
@@ -60,6 +77,9 @@ type Client struct {
 
 // NewClient constructs a Client that is ready to dial. Call Dial or
 // ConnectWithReconnect to establish a connection.
+//
+// dataDir is the root of the local store ({dataDir}/channels/{channel}/...).
+// Each entry in publishChannels gets its own outbound reader and offset file.
 func NewClient(
 	instanceName string,
 	tlsCfg *tls.Config,
@@ -68,11 +88,12 @@ func NewClient(
 	dedup Deduplicator,
 	auditL audit.AuditLogger,
 	log logger,
-	sendBufSize, maxBatchBytes int,
+	maxBatchBytes int,
 	reconnectBase, reconnectMax time.Duration,
 	reconnectJitter float64,
 	subscribeChannels []string,
 	publishChannels []string,
+	dataDir string,
 ) *Client {
 	stopCtx, stopCancel := context.WithCancel(context.Background())
 	return &Client{
@@ -83,8 +104,8 @@ func NewClient(
 		dedup:             dedup,
 		auditL:            auditL,
 		log:               log,
-		sendBufSize:       sendBufSize,
 		maxBatchBytes:     maxBatchBytes,
+		dataDir:           dataDir,
 		reconnectBase:     reconnectBase,
 		reconnectMax:      reconnectMax,
 		reconnectJitter:   reconnectJitter,
@@ -96,16 +117,17 @@ func NewClient(
 	}
 }
 
-// Dial connects to hubAddr once, exchanges the handshake, and starts goroutines.
-// Returns the PeerSender the caller can use to enqueue outbound messages.
-func (c *Client) Dial(hubAddr string) (*PeerSender, error) {
+// Dial connects to hubAddr once, opens the streams, and starts the per-channel
+// readers + coordinator. Returns once the streams are open; outbound delivery
+// continues in the background.
+func (c *Client) Dial(hubAddr string) error {
 	return c.dial(hubAddr)
 }
 
-func (c *Client) dial(hubAddr string) (*PeerSender, error) {
+func (c *Client) dial(hubAddr string) error {
 	conn, err := c.getOrCreateGRPCConn(hubAddr)
 	if err != nil {
-		return nil, fmt.Errorf("federation: client grpc connect %s: %w", hubAddr, err)
+		return fmt.Errorf("federation: client grpc connect %s: %w", hubAddr, err)
 	}
 
 	stub := federationv1.NewFederationServiceClient(conn)
@@ -116,24 +138,31 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	pubStream, err := stub.Publish(metadata.NewOutgoingContext(pubCtx, outMD))
 	if err != nil {
 		pubCancel()
-		return nil, fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, err)
+		return fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, err)
 	}
 
-	sender := NewPeerSender(pubStream, pubCancel, c.sendBufSize, c.maxBatchBytes, c.log)
+	// Build per-channel readers feeding a coordinator on the Publish stream.
+	readers, readersByChannel, err := c.buildOutboundReaders(hubAddr)
+	if err != nil {
+		pubCancel()
+		return fmt.Errorf("federation: client build outbound readers: %w", err)
+	}
+	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers)
+	coordinator.start()
 
 	// Open the Subscribe stream if this client subscribes to channels.
 	var receiver *PeerReceiver
 	if c.localWriter != nil && len(c.subscribeChannels) > 0 {
 		subCtx, subCancel := context.WithCancel(c.stopCtx)
-		subStream, err := stub.Subscribe(metadata.NewOutgoingContext(subCtx, outMD))
-		if err != nil {
+		subStream, sErr := stub.Subscribe(metadata.NewOutgoingContext(subCtx, outMD))
+		if sErr != nil {
 			subCancel()
-			sender.Close()
-			return nil, fmt.Errorf("federation: client open subscribe stream %s: %w", hubAddr, err)
+			coordinator.close()
+			return fmt.Errorf("federation: client open subscribe stream %s: %w", hubAddr, sErr)
 		}
 
 		// Send the SubscribeRequest as the first frame on the Subscribe stream.
-		if err := subStream.Send(&federationv1.SubscribeFrame{
+		if sErr := subStream.Send(&federationv1.SubscribeFrame{
 			Payload: &federationv1.SubscribeFrame_Request{
 				Request: &federationv1.SubscribeRequest{
 					InstanceName: c.instanceName,
@@ -141,10 +170,10 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 					Subscribe:    c.subscribeChannels,
 				},
 			},
-		}); err != nil {
+		}); sErr != nil {
 			subCancel()
-			sender.Close()
-			return nil, fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, err)
+			coordinator.close()
+			return fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, sErr)
 		}
 
 		receiver = NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
@@ -153,8 +182,9 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 
 	c.mu.Lock()
 	oldReceiver := c.receiver
-	c.sender = sender
+	c.coordinator = coordinator
 	c.receiver = receiver
+	c.readersByChannel = readersByChannel
 	c.mu.Unlock()
 
 	// Close the old receiver outside the lock; on reconnect the underlying stream
@@ -164,7 +194,53 @@ func (c *Client) dial(hubAddr string) (*PeerSender, error) {
 	}
 
 	_ = c.auditL.Log(audit.Event{Event: audit.EventPeerConnected, PeerAddr: hubAddr})
-	return sender, nil
+	return nil
+}
+
+// buildOutboundReaders creates one channelReader per configured publishChannel.
+// Each reader uses an offset file named "fedout-{hubAddr}.offset" within
+// {dataDir}/subscribers/{channel}/. Returns the slice (ordered) and a map for
+// NotifyChannel lookup.
+func (c *Client) buildOutboundReaders(hubAddr string) ([]*channelReader, map[string]*channelReader, error) {
+	if len(c.publishChannels) == 0 || c.dataDir == "" {
+		return nil, map[string]*channelReader{}, nil
+	}
+	peerName := sanitizeForFilename(hubAddr)
+	readers := make([]*channelReader, 0, len(c.publishChannels))
+	byChannel := make(map[string]*channelReader, len(c.publishChannels))
+	for _, ch := range c.publishChannels {
+		channelDir := filepath.Join(c.dataDir, "channels", ch)
+		offsetDir := filepath.Join(c.dataDir, "subscribers", ch)
+		placeholder := make(chan sendReq, 1)
+		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fedout-",
+			c.maxBatchBytes, placeholder, c.log)
+		if err != nil {
+			return nil, nil, fmt.Errorf("channel %q: %w", ch, err)
+		}
+		readers = append(readers, r)
+		byChannel[ch] = r
+	}
+	return readers, byChannel, nil
+}
+
+// sanitizeForFilename returns a filename-safe form of s by replacing characters
+// outside [a-zA-Z0-9._-] with '_'. Used to derive an offset filename from a
+// hub network address like "host:7740".
+func sanitizeForFilename(s string) string {
+	out := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-':
+			out[i] = c
+		default:
+			out[i] = '_'
+		}
+	}
+	return string(out)
 }
 
 // getOrCreateGRPCConn returns the existing gRPC connection or creates a new one
@@ -187,8 +263,7 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 // It returns after the first successful connection.
 func (c *Client) ConnectWithReconnect(hubAddr string) error {
 	c.hubAddr = hubAddr
-	sender, err := c.dial(hubAddr)
-	if err != nil {
+	if err := c.dial(hubAddr); err != nil {
 		return err
 	}
 
@@ -198,23 +273,28 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 		backoff := c.reconnectBase
 		attempt := 0
 		for {
+			c.mu.Lock()
+			coord := c.coordinator
+			c.mu.Unlock()
+
 			select {
 			case <-c.stop:
 				return
-			case <-sender.Done():
+			case <-coord.Done():
 			}
 
-			unacked := sender.Unacked()
+			// Tear down the current connection's readers and coordinator.
+			// Offset files persist; they will be reused by the next dial.
+			coord.close()
 
-			disconnDetail := fmt.Sprintf("unacked=%d", len(unacked))
+			unacked := c.UnackedBytes()
 			_ = c.auditL.Log(audit.Event{
 				Event:    audit.EventPeerDisconnected,
 				PeerAddr: hubAddr,
-				Detail:   disconnDetail,
+				Detail:   fmt.Sprintf("unacked_bytes=%d", unacked),
 			})
-
 			c.log.Warn("federation: client disconnected, reconnecting",
-				"hub", hubAddr, "unacked", len(unacked))
+				"hub", hubAddr, "unacked_bytes", unacked)
 
 			//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
 			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
@@ -228,8 +308,6 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			case <-time.After(sleep):
 			}
 
-			var newSender *PeerSender
-			var dialErr error
 			for {
 				select {
 				case <-c.stop:
@@ -237,18 +315,18 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				default:
 				}
 				attempt++
-				newSender, dialErr = c.dial(hubAddr)
-				if dialErr == nil {
+				dErr := c.dial(hubAddr)
+				if dErr == nil {
 					break
 				}
 				if c.stopCtx.Err() != nil {
 					return
 				}
-				c.log.Error("federation: client reconnect failed", "err", dialErr, "attempt", attempt)
+				c.log.Error("federation: client reconnect failed", "err", dErr, "attempt", attempt)
 				_ = c.auditL.Log(audit.Event{
 					Event:    audit.EventPeerConnected,
 					PeerAddr: hubAddr,
-					Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, dialErr.Error()),
+					Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, dErr.Error()),
 				})
 				backoff = minDuration(backoff*2, c.reconnectMax)
 				//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
@@ -264,27 +342,29 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 				}
 			}
 
-			for _, env := range unacked {
-				newSender.Enqueue(env)
-			}
-
 			c.reconnectCount.Add(1)
 			backoff = c.reconnectBase
 			attempt = 0
-			sender = newSender
 		}
 	}()
 	return nil
 }
 
-// Sender returns the currently active PeerSender, or nil if not connected.
-func (c *Client) Sender() *PeerSender {
+// NotifyChannel wakes the channelReader for channel, if this client has one.
+// Called by the Messenger after every local write so that outbound delivery
+// resumes promptly without waiting for a filesystem-watcher tick.
+func (c *Client) NotifyChannel(channel string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.sender
+	r, ok := c.readersByChannel[channel]
+	c.mu.Unlock()
+	if ok {
+		r.notify()
+	}
 }
 
-// AllowPublish reports whether the given channel is allowed to be published to the hub.
+// AllowPublish reports whether the given channel is in this client's
+// configured publish set. An empty publish list means "no channels" — see
+// DESIGN §6.5 and config.ClientHubRef.Publish.
 func (c *Client) AllowPublish(channel string) bool {
 	for _, ch := range c.publishChannels {
 		if ch == channel {
@@ -300,13 +380,13 @@ func (c *Client) HubAddr() string { return c.hubAddr }
 // Connected reports whether the Publish stream is currently active.
 func (c *Client) Connected() bool {
 	c.mu.Lock()
-	s := c.sender
+	coord := c.coordinator
 	c.mu.Unlock()
-	if s == nil {
+	if coord == nil {
 		return false
 	}
 	select {
-	case <-s.Done():
+	case <-coord.Done():
 		return false
 	default:
 		return true
@@ -317,16 +397,35 @@ func (c *Client) Connected() bool {
 // initial dial. The first connection is not counted.
 func (c *Client) ReconnectCount() int64 { return c.reconnectCount.Load() }
 
-// UnackedCount returns the number of messages sent to the hub that have not
-// yet been acknowledged by the remote. Returns 0 when disconnected.
-func (c *Client) UnackedCount() int {
-	c.mu.Lock()
-	s := c.sender
-	c.mu.Unlock()
-	if s == nil {
+// UnackedBytes returns the total bytes published locally on this client's
+// outbound channels that have not yet been acknowledged by the hub. It is
+// computed as sum(streamEnd - persistedOffset) across all configured
+// publishChannels. Returns 0 when no channels are configured or no data dir
+// is set. The value is read from disk and is a slightly-stale snapshot.
+func (c *Client) UnackedBytes() int64 {
+	if c.dataDir == "" || len(c.publishChannels) == 0 {
 		return 0
 	}
-	return len(s.Unacked())
+	peerName := sanitizeForFilename(c.hubAddr)
+	var total int64
+	for _, ch := range c.publishChannels {
+		channelDir := filepath.Join(c.dataDir, "channels", ch)
+		offsetPath := filepath.Join(c.dataDir, "subscribers", ch, "fedout-"+peerName+".offset")
+		end, err := storage.ChannelStreamEnd(channelDir)
+		if err != nil {
+			continue
+		}
+		var off int64
+		if storage.OffsetFileExists(offsetPath) {
+			if v, err := storage.ReadOffset(offsetPath); err == nil {
+				off = v
+			}
+		}
+		if lag := end - off; lag > 0 {
+			total += lag
+		}
+	}
+	return total
 }
 
 // Close stops the reconnect loop and the current connection.
@@ -338,13 +437,15 @@ func (c *Client) Close() {
 	}
 	c.stopCancel() // cancels all open gRPC streams
 	c.mu.Lock()
-	if c.sender != nil {
-		c.sender.Close()
-	}
-	if c.receiver != nil {
-		c.receiver.Close()
-	}
+	coord := c.coordinator
+	receiver := c.receiver
 	c.mu.Unlock()
+	if coord != nil {
+		coord.close()
+	}
+	if receiver != nil {
+		receiver.Close()
+	}
 	c.wg.Wait()
 	c.grpcConnMu.Lock()
 	if c.grpcConn != nil {

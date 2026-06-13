@@ -95,15 +95,18 @@ type channelReader struct {
 
 // newChannelReader constructs a channelReader and initialises its byte offset.
 //
-// offsetDir is the subscribers/{channel}/ directory; the offset file will be
-// named "fed-{peerName}.offset" within it so the compactor automatically
-// includes federation peers in its minimum-offset calculation.
+// offsetDir is the subscribers/{channel}/ directory; the offset file is named
+// "{offsetPrefix}{peerName}.offset" within it. The hub uses prefix "fed-" for
+// inbound peer subscriptions; the client uses prefix "fedout-" for its own
+// outbound publish queue. Both are included in the compactor's minimum-offset
+// calculation. The hub TTL sweep only matches the "fed-" prefix, so client
+// outbound offsets are not affected by it on a colocated process.
 //
 // If the offset file already exists the reader resumes from the stored position.
 // If it does not exist (first connection) the reader starts at the current end
 // of the channel so the peer only receives messages published after it connects.
 func newChannelReader(
-	peerName, channel, channelDir, offsetDir string,
+	peerName, channel, channelDir, offsetDir, offsetPrefix string,
 	maxBatchBytes int,
 	requestCh chan<- sendReq,
 	log logger,
@@ -112,7 +115,7 @@ func newChannelReader(
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("newChannelReader: mkdir %q: %w", offsetDir, err)
 	}
-	offsetPath := filepath.Join(offsetDir, "fed-"+peerName+".offset")
+	offsetPath := filepath.Join(offsetDir, offsetPrefix+peerName+".offset")
 
 	var offset int64
 	if storage.OffsetFileExists(offsetPath) {
@@ -136,7 +139,7 @@ func newChannelReader(
 		}
 	}
 
-	return &channelReader{
+	cr := &channelReader{
 		peerName:      peerName,
 		channel:       channel,
 		channelDir:    channelDir,
@@ -148,7 +151,15 @@ func newChannelReader(
 		offset:        offset,
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
-	}, nil
+	}
+	// Self-notify so run() drains any backlog already present in the channel
+	// file on startup. New subscribers (offset == stream end) see nothing to
+	// drain and immediately go back to sleep; resuming subscribers — most
+	// importantly client-side outbound readers reconnecting after a hub
+	// disconnect — pick up any data published while the previous coordinator
+	// was disconnected.
+	cr.notify()
+	return cr, nil
 }
 
 // notify wakes the reader goroutine without blocking. Coalesced: if a

@@ -8,6 +8,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 - **Fan-out isolation** — slow subscribers do not affect other subscribers or publishers
 - **Federated messaging** — instances connect via gRPC with mutual TLS; hubs forward select channels to peer hubs under explicit policy
 - **Subscription-based routing** — clients declare which channels they want; hubs enforce per-client allowlists that are statically configured
+- **Symmetric disk-backed delivery** — both inbound (hub→peer) and outbound (publisher→hub) traffic is driven from the same per-channel segment files, with per-peer byte offsets persisted to disk; disconnects of any length never lose locally-published messages
 - **Dead letter queue** — messages that exceed the retry limit are moved to a dead-letter channel rather than blocking delivery
 - **Audit logging** — all cross-hub message forwarding is recorded with automatic rotation
 
@@ -276,9 +277,9 @@ A client that only publishes and does not want to receive any messages opens onl
 
 Each `PublishBatch` or `HubBatch` record list carries one or more serialised envelope records. Individual records use the same `envelope.Marshal` format written to `.jsonl` files on disk — a single JSON line per envelope. gRPC's own HTTP/2 framing handles record delimitation; no additional length-prefix is applied by the application layer.
 
-Batching is applied when messages are queued faster than the network can drain them. The sender flushes the current batch immediately if the queue is empty (no artificial delay). Maximum batch size is configurable (default: 4 MiB).
+Batching is applied when more than one record is available at the time a sender frames its next outbound RPC message. The sender does not wait for additional records; if the channel reader returns a single envelope it is sent immediately. Maximum batch size is configurable (default: 4 MiB).
 
-The receiver sends an acknowledgment (`PublishAck` or `Ack`) after writing a batch to its local `.jsonl` file. The sender buffers unacknowledged messages and retransmits on reconnect.
+The receiver sends an acknowledgment (`PublishAck` or `Ack`) after writing a batch to its local `.jsonl` file. The sender persists its per-channel byte offset to disk after each ack; on reconnect, the next batch begins at the saved offset. There is no in-memory unacked window — the offset file is the entire delivery state.
 
 ### 6.4 Authorization: Two Layers
 
@@ -357,36 +358,37 @@ On `Publish()` (local origin):
 
 The dedup set is shared across all PeerReceivers on the same Messenger instance. This ensures that if the same envelope arrives via two simultaneous incoming connections (dual-path forwarding), only the first arrival triggers a local write.
 
-**Note on ring topologies:** Received federated messages are written to local storage by `writeLocalEnvelope` but are not automatically re-enqueued for outbound forwarding. This means Hub1 → Hub2 → Hub1 loops cannot form with the current implementation. The dedup is in place as a defence-in-depth measure: if forwarding semantics change in the future such that received messages can be re-sent, the LRU set will prevent delivery loops and duplicate local writes.
+**Note on ring topologies:** Because outbound delivery is driven from the per-channel segment files (see §6.7), federated-received messages that are written to local storage by `writeLocalEnvelope` ARE eligible for re-forwarding when an outbound reader is configured for the same channel — a relay instance forwards them onward. The dedup LRU is the live loop-prevention mechanism: if a forwarded message returns to its origin via some ring topology, the origin's seen-ID set will reject the duplicate local write. Note that the re-send still consumes wire bandwidth before being rejected; for ring-prone topologies, restricting `publish` allowlists per peer is the right operational control.
 
 Practical scenarios the dedup handles today:
-- Two client connections from the same publisher both deliver the same envelope to a hub (dual-path test)
-- A publisher's own message arrives back via a federated receive path (self-loop prevention)
+- Two client connections from the same publisher both deliver the same envelope to a hub (dual-path)
+- A publisher's own message arrives back via a federated receive path on a multi-hop topology (self-loop prevention)
 - Reconnect replay delivering messages already written in a previous session
 
-### 6.7 Hub-Side File-Reader Delivery and Reconnection
+### 6.7 File-Reader Delivery and Reconnection
 
-The hub delivers messages to subscribed peers using a **file-reader pull model**, mirroring the local subscriber delivery path:
+Both hub-side and client-side federation delivery use a unified **file-reader pull model**, mirroring the local subscriber delivery path. The two directions share the same `channelReader` machinery and differ only in the gRPC stream type they drive (`HubBatch` on the server-side Subscribe stream vs `PublishBatch` on the client-side Publish stream) and the offset-file prefix used to namespace their state.
 
-- For each `(peer, subscribed channel)` pair, the hub runs a `channelReader` goroutine.
-- When a message is written to a channel (via `Publish` or inbound federation), the hub calls `NotifyChannel(channel)`, which wakes all `channelReader` goroutines registered for that channel.
-- Each `channelReader` reads from the segment files starting at its current byte offset, accumulates envelopes up to the configured batch size, and delivers them to the peer via the `clientCoordinator`.
-- The `clientCoordinator` serialises sends across all channel readers for a single peer: one batch is in-flight at a time; the next batch is not sent until the peer acknowledges the current one.
-- After the peer acks the batch, the reader persists the new byte offset atomically to:
-  ```
-  {dataDir}/subscribers/{channel}/fed-{peerName}.offset
-  ```
-  This is the same format as local subscriber offset files (`{id}.offset`).
+| Direction | Coordinator | gRPC stream | Offset file prefix |
+|---|---|---|---|
+| Hub → peer (inbound peer subscription) | `clientCoordinator` | server-side Subscribe | `fed-{peerName}.offset` |
+| Client → hub (outbound publish) | `pubCoordinator` | client-side Publish | `fedout-{hubAddr}.offset` |
 
-**Offset files and compaction:** Because federation offset files live under `subscribers/{channel}/`, the compactor automatically includes them in its minimum-offset boundary calculation. The hub cannot compact a segment until all connected peers (and all federation clients whose offset files still exist) have consumed past it.
+Operation in both directions:
 
-**Reconnect:** When a peer reconnects, its `channelReader` goroutines resume from the stored byte offset. No `last_id` field is sent by the client; the hub is the authoritative source of delivery state. New messages published during the disconnection are delivered on the next `notify()` call after the readers start.
+- For each `(peer-or-hub, channel)` pair, a `channelReader` goroutine watches the local segment files at `{dataDir}/channels/{channel}/`.
+- When a message is written to a channel (via local `Publish` or `writeLocalEnvelope` from inbound federation), the messenger calls `NotifyChannel(channel)` on every registered notify target — the hub's notify registry for inbound peers, and each client's reader map for outbound channels.
+- Each `channelReader` reads from the segment files starting at its current byte offset, accumulates envelopes up to the configured batch size, and delivers them to the coordinator as one `sendReq`.
+- The coordinator serialises sends across all readers for one connection: one batch is in-flight at a time; the next batch is not sent until the peer acknowledges the current one.
+- After the ack, the reader persists the new byte offset atomically to its offset file. The file is the entire delivery state — there is no in-memory unacked window.
 
-**New subscriber starting position:** When a peer connects for the first time (no offset file exists), the reader starts at the current end of the channel — the peer receives only messages published after it first connects. This avoids replaying unbounded history.
+**Offset files and compaction:** Both prefixes (`fed-` and `fedout-`) live under `subscribers/{channel}/` and are automatically included in the compactor's minimum-offset boundary calculation. A hub cannot compact past a peer that hasn't acked; a publishing client cannot compact past a hub that hasn't acked. On a colocated relay process (both hub and client roles), the two namespaces coexist without interference.
 
-**Offset file TTL:** Offset files for peers that disconnect and never reconnect would otherwise block compaction indefinitely. The hub runs a background TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week) that deletes `fed-*.offset` files whose mtime is older than the TTL. Peers that are actively connected update their offset files on every acked batch, so their files are always recently modified.
+**Reconnect:** When a peer connection drops, its coordinator exits. The reconnect loop closes the active readers + coordinator and dials again with exponential backoff (base 500ms, max 60s, jitter ±20%). On the new connection, fresh `channelReader` instances resume from the saved offset files, so any messages published locally during the disconnect are delivered on reconnect. There is no in-memory queue to lose; bounded disconnects are bounded only by disk capacity.
 
-When a peer connection is lost, reconnection is attempted with exponential backoff (base 500ms, max 60s, jitter ±20%).
+**New reader starting position:** When a reader is created for the first time (no offset file exists), it starts at the current end of the channel. For inbound peer subscriptions this means the peer receives only messages published after it first connects (avoids replaying unbounded history). For outbound client publishing this means the client only forwards messages published from this point on — historic messages from before federation was configured are not back-filled.
+
+**Offset file TTL:** On the hub side, peers that disconnect and never reconnect would otherwise block compaction indefinitely. The hub runs a background TTL sweep (configurable via `hub.fed_client_offset_ttl`, default 1 week) that deletes `fed-*.offset` files whose mtime is older than the TTL. The sweep matches only the `fed-` prefix, so client-side `fedout-*.offset` files on a colocated process are untouched.
 
 ---
 
@@ -538,8 +540,9 @@ The wire format between hubs uses the same JSON envelope bytes, carried as recor
 |---|---|
 | Per-channel file writer | 1 goroutine per channel, owns the file descriptor |
 | Per-subscriber reader | 1 goroutine per subscriber, independent cursor |
-| Per-peer Publish stream sender | 1 goroutine per peer connection, owns all writes on the Publish gRPC stream |
-| Per-peer Subscribe stream receiver | 1 goroutine per peer connection, owns all reads on the Subscribe gRPC stream |
+| Per-(peer,channel) federation reader | 1 goroutine per (connection, subscribed channel), reads segment files and feeds the coordinator |
+| Per-connection coordinator + ack-reader | 2 goroutines per active federation connection, own all writes/reads on the gRPC stream |
+| Per-peer Subscribe receiver | 1 goroutine per client→hub Subscribe stream, dispatches inbound envelopes to `localWriter` |
 | Policy watcher | 1 goroutine, shared |
 | Audit writer | 1 goroutine, shared |
 
@@ -634,7 +637,9 @@ federation:
   reconnect_base_ms: 500
   reconnect_max_ms: 60000
   reconnect_jitter: 0.2
-  send_buffer_messages: 10000   # Max buffered messages per peer during disconnect
+  send_buffer_messages: 10000   # DEPRECATED: ignored by the regular Messenger client
+                                # (the channel file is the buffer). Still honored by
+                                # EphemeralMessenger.WriteQueueSize when set there.
   max_batch_bytes: 4194304      # Max gRPC message payload size (default 4 MiB)
 
 dedup:

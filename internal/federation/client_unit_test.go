@@ -34,12 +34,11 @@ func TestNewClient_ValidConfig(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,                  // sendBufSize
 		65536,                // maxBatchBytes
 		500*time.Millisecond, // reconnectBase
 		60*time.Second,       // reconnectMax
 		0.2,                  // reconnectJitter
-		[]string{"events"}, nil,
+		[]string{"events"}, nil, "",
 	)
 	assert.NotNil(t, client)
 	t.Cleanup(func() { client.Close() })
@@ -61,44 +60,14 @@ func TestNewClient_NoLocalWriter(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	assert.NotNil(t, client)
 	t.Cleanup(func() { client.Close() })
-}
-
-// TestClient_Sender_NilBeforeConnect returns nil sender before connect.
-func TestClient_Sender_NilBeforeConnect(t *testing.T) {
-	t.Parallel()
-	log := &testutil.FakeLogger{}
-	auditL := &fakeAuditLogger{}
-	dedupL, _ := dedup.NewLRUDedup(100)
-	policy := NewAtomicPolicy(ForwardPolicy{})
-
-	client := NewClient(
-		"test-client",
-		nil,
-		policy,
-		func(_ *envelope.Envelope) error { return nil },
-		dedupL,
-		auditL,
-		log,
-		100,
-		65536,
-		500*time.Millisecond,
-		60*time.Second,
-		0.2,
-		[]string{}, nil,
-	)
-	defer client.Close()
-
-	sender := client.Sender()
-	assert.Nil(t, sender)
 }
 
 // TestClient_Close_Idempotent verifies Close can be called multiple times.
@@ -117,12 +86,11 @@ func TestClient_Close_Idempotent(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 
 	// Multiple Close calls should not panic.
@@ -148,12 +116,11 @@ func TestClient_Config_WithTLS(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -175,12 +142,11 @@ func TestClient_Config_WithSubscribeChannels(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{"chan1", "chan2", "chan3"}, nil,
+		[]string{"chan1", "chan2", "chan3"}, nil, "",
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -202,12 +168,11 @@ func TestClient_Config_LargeBuffers(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100000,    // large send buffer
 		1024*1024, // large batch size
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -229,12 +194,11 @@ func TestClient_Config_CustomReconnectParams(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		100*time.Millisecond, // custom base
 		10*time.Second,       // custom max
 		0.5,                  // custom jitter
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	assert.NotNil(t, client)
 	defer client.Close()
@@ -263,12 +227,11 @@ func TestClient_LocalWriter_Signature(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	defer client.Close()
 
@@ -292,12 +255,11 @@ func TestClient_Deduplicator_Provided(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	defer client.Close()
 
@@ -323,12 +285,11 @@ func TestClient_Policy_Provided(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	defer client.Close()
 
@@ -351,12 +312,11 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 		dedupL,
 		auditL,
 		log,
-		100,
 		65536,
 		500*time.Millisecond,
 		60*time.Second,
 		0.2,
-		[]string{}, nil,
+		[]string{}, nil, "",
 	)
 	defer client.Close()
 
@@ -364,7 +324,7 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 }
 
 // TestClient_StatsAccessors_BeforeConnect verifies HubAddr, Connected,
-// ReconnectCount, and UnackedCount return their zero values before a connection
+// ReconnectCount, and UnackedBytes return their zero values before a connection
 // is established.
 func TestClient_StatsAccessors_BeforeConnect(t *testing.T) {
 	t.Parallel()
@@ -375,16 +335,16 @@ func TestClient_StatsAccessors_BeforeConnect(t *testing.T) {
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
 		dd, &fakeAuditLogger{}, log,
-		100, 65536,
+		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
-		[]string{"events"}, nil,
+		[]string{"events"}, nil, "",
 	)
 	defer client.Close()
 
 	assert.Empty(t, client.HubAddr(), "HubAddr should be empty before ConnectWithReconnect")
 	assert.False(t, client.Connected(), "Connected should be false before dialing")
 	assert.Zero(t, client.ReconnectCount(), "ReconnectCount should be zero initially")
-	assert.Zero(t, client.UnackedCount(), "UnackedCount should be zero before dialing")
+	assert.Zero(t, client.UnackedBytes(), "UnackedBytes should be zero before dialing")
 }
 
 // TestClient_MinDuration_Helper tests the minDuration helper function.

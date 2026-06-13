@@ -57,16 +57,23 @@ func (r *recordingAudit) findEventWithDetail(name, substr string) (audit.Event, 
 	return audit.Event{}, false
 }
 
-func newSenderOnlyClient(auditL audit.AuditLogger, log *testutil.FakeLogger) *Client {
+// newClientWithChannel constructs a Client wired to a temporary data dir with
+// one configured outbound publishChannel. Returns the client and a channelFeeder
+// that writes to the local channel file and notifies the client's reader.
+func newClientWithChannel(t *testing.T, auditL audit.AuditLogger, log *testutil.FakeLogger, channel string) (*Client, *channelFeeder) {
+	t.Helper()
 	dd, _ := dedup.NewLRUDedup(100)
-	return NewClient(
+	dataDir := t.TempDir()
+	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil,
 		dd, auditL, log,
-		100, 65536,
+		65536,
 		50*time.Millisecond, 500*time.Millisecond, 0.0,
-		nil, nil,
+		nil, []string{channel}, dataDir,
 	)
+	feeder := newChannelFeeder(t, dataDir, channel, client)
+	return client, feeder
 }
 
 // TestClientDisconnect_AuditsPeerDisconnected verifies that ConnectWithReconnect
@@ -84,7 +91,7 @@ func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 		},
 	})
 
-	client := newSenderOnlyClient(auditL, log)
+	client, feeder := newClientWithChannel(t, auditL, log, "test-ch")
 	defer client.Close()
 
 	err := client.ConnectWithReconnect(addr)
@@ -92,18 +99,16 @@ func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 
 	env, envErr := envelope.NewEnvelope("test-ch", "origin", "test.v1", nil)
 	require.NoError(t, envErr)
-	sender := client.Sender()
-	require.NotNil(t, sender)
-	sender.Enqueue(&env)
+	feeder.publish(t, &env)
 
 	require.Eventually(t, func() bool {
-		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked=")
+		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked_bytes=")
 	}, 5*time.Second, 20*time.Millisecond)
 
-	evt, found := auditL.findEventWithDetail(audit.EventPeerDisconnected, "unacked=")
+	evt, found := auditL.findEventWithDetail(audit.EventPeerDisconnected, "unacked_bytes=")
 	require.True(t, found)
 	assert.NotEmpty(t, evt.PeerAddr)
-	assert.Contains(t, evt.Detail, "unacked=")
+	assert.Contains(t, evt.Detail, "unacked_bytes=")
 }
 
 // TestClientReconnect_AuditsFailedAttempts verifies that failed reconnect
@@ -126,18 +131,18 @@ func TestClientReconnect_AuditsFailedAttempts(t *testing.T) {
 	})
 	go grpcSrv.Serve(lis) //nolint:errcheck
 
-	client := newSenderOnlyClient(auditL, log)
+	client, feeder := newClientWithChannel(t, auditL, log, "test-ch")
 	defer client.Close()
 
 	require.NoError(t, client.ConnectWithReconnect(addr))
 
 	env, envErr := envelope.NewEnvelope("test-ch", "origin", "test.v1", nil)
 	require.NoError(t, envErr)
-	client.Sender().Enqueue(&env)
+	feeder.publish(t, &env)
 
 	// Wait for the disconnect event.
 	require.Eventually(t, func() bool {
-		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked=")
+		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked_bytes=")
 	}, 5*time.Second, 20*time.Millisecond)
 
 	// Stop the server so subsequent reconnect attempts fail.

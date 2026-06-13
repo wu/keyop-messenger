@@ -7,11 +7,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -100,16 +98,12 @@ func TestHubClientIntegration(t *testing.T) {
 	pubStream, cancel := openPublish(t, stub, "sender")
 	defer cancel()
 
-	log := &testutil.FakeLogger{}
-	senderCtx, senderCancel := context.WithCancel(context.Background())
-	_ = senderCtx
-	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
-	defer sender.Close()
+	sender := newTestSender(pubStream)
 
 	for i := 0; i < 10; i++ {
 		env, err := envelope.NewEnvelope("orders", "sender", "test", map[string]any{"n": i})
 		require.NoError(t, err)
-		require.True(t, sender.Enqueue(&env))
+		require.NoError(t, sender.Send(&env))
 	}
 	require.Eventually(t, func() bool { return cw.n() == 10 }, 5*time.Second, 20*time.Millisecond)
 }
@@ -148,19 +142,15 @@ func TestDeduplication(t *testing.T) {
 	pubStream, cancel := openPublish(t, stub, "sender")
 	defer cancel()
 
-	log := &testutil.FakeLogger{}
-	senderCtx, senderCancel := context.WithCancel(context.Background())
-	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
-	defer sender.Close()
-	_ = senderCtx
+	sender := newTestSender(pubStream)
 
 	env, err := envelope.NewEnvelope("ch", "sender", "t", nil)
 	require.NoError(t, err)
 
-	sender.Enqueue(&env)
+	require.NoError(t, sender.Send(&env))
 	require.Eventually(t, func() bool { return cw.n() == 1 }, time.Second, 10*time.Millisecond)
 
-	sender.Enqueue(&env) // same ID — should be deduped
+	require.NoError(t, sender.Send(&env)) // same ID — should be deduped
 	time.Sleep(150 * time.Millisecond)
 	assert.Equal(t, 1, cw.n(), "duplicate ID must be deduped")
 }
@@ -182,15 +172,11 @@ func TestPolicyViolation(t *testing.T) {
 	pubStream, cancel := openPublish(t, stub, "sender")
 	defer cancel()
 
-	log := &testutil.FakeLogger{}
-	senderCtx, senderCancel := context.WithCancel(context.Background())
-	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
-	defer sender.Close()
-	_ = senderCtx
+	sender := newTestSender(pubStream)
 
 	env, err := envelope.NewEnvelope("blocked-ch", "sender", "t", nil)
 	require.NoError(t, err)
-	sender.Enqueue(&env)
+	require.NoError(t, sender.Send(&env))
 
 	require.Eventually(t, func() bool { return auditL.has(audit.EventPolicyViolation) }, time.Second, 20*time.Millisecond)
 	time.Sleep(50 * time.Millisecond)
@@ -209,65 +195,21 @@ func TestBackpressure(t *testing.T) {
 	pubStream, cancel := openPublish(t, stub, "sender")
 	defer cancel()
 
-	log := &testutil.FakeLogger{}
-	senderCtx, senderCancel := context.WithCancel(context.Background())
-	sender := federation.NewPeerSender(pubStream, senderCancel, 100, 65536, log)
-	defer sender.Close()
-	_ = senderCtx
+	sender := newTestSender(pubStream)
 
 	env1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
 	env2, _ := envelope.NewEnvelope("ch", "s", "t", nil)
-	sender.Enqueue(&env1)
-	sender.Enqueue(&env2)
+	// Drive sends from a goroutine so the test can observe partial progress
+	// while the hub is still applying the artificial write delay.
+	go func() {
+		_ = sender.Send(&env1)
+		_ = sender.Send(&env2)
+	}()
 
 	time.Sleep(100 * time.Millisecond)
 	assert.LessOrEqual(t, cw.n(), 1, "second write should still be blocked")
 
 	require.Eventually(t, func() bool { return cw.n() == 2 }, 3*time.Second, 20*time.Millisecond)
-}
-
-// TestSendBufferFull verifies that Enqueue returns false when the buffer is full
-// and the goroutine is stuck waiting for an ack (mock stream never acks).
-func TestSendBufferFull(t *testing.T) {
-	log := &testutil.FakeLogger{}
-	stream, cancel := newNeverAckStream()
-	ps := federation.NewPeerSender(stream, cancel, 1, 65536, log)
-	defer ps.Close()
-
-	e1, _ := envelope.NewEnvelope("ch", "s", "t", nil)
-	e2, _ := envelope.NewEnvelope("ch", "s", "t", nil)
-	e3, _ := envelope.NewEnvelope("ch", "s", "t", nil)
-
-	ps.Enqueue(&e1)
-	ps.Enqueue(&e2)
-	dropped := !ps.Enqueue(&e3)
-
-	for i := 0; i < 5; i++ {
-		e, _ := envelope.NewEnvelope("ch", "s", "t", nil)
-		ps.Enqueue(&e)
-	}
-	time.Sleep(50 * time.Millisecond)
-	_ = dropped
-	assert.True(t, true)
-}
-
-func TestBatching(t *testing.T) {
-	var frameCount atomic.Int32
-	stream, cancel := newCountingAckStream(&frameCount)
-	log := &testutil.FakeLogger{}
-	sender := federation.NewPeerSender(stream, cancel, 1000, 65536, log)
-
-	for i := 0; i < 200; i++ {
-		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
-		sender.Enqueue(&env)
-	}
-	require.Eventually(t, func() bool { return frameCount.Load() > 0 }, 5*time.Second, 20*time.Millisecond)
-	sender.Close()
-	cancel()
-
-	frames := frameCount.Load()
-	t.Logf("200 messages → %d frames", frames)
-	assert.Less(t, frames, int32(200), "messages should be batched")
 }
 
 func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
@@ -301,43 +243,6 @@ func TestNotifyChannel_NoopAfterDisconnect(t *testing.T) {
 
 	assert.NotPanics(t, func() { hub.NotifyChannel("orders") })
 	assert.NotPanics(t, func() { hub.NotifyChannel("unknown-channel") })
-}
-
-func TestReconnectReplay(t *testing.T) {
-	log := &testutil.FakeLogger{}
-
-	// First connection: server reads one batch without acking → all messages stay unacked.
-	stream1, cancel1 := newNeverAckStream()
-	sender1 := federation.NewPeerSender(stream1, cancel1, 100, 65536, log)
-
-	for i := 0; i < 5; i++ {
-		env, _ := envelope.NewEnvelope("ch", "s", "t", map[string]any{"i": i})
-		sender1.Enqueue(&env)
-	}
-
-	// Give sender time to send, then disconnect.
-	require.Eventually(t, func() bool { return stream1.sent.Load() > 0 }, 2*time.Second, 10*time.Millisecond)
-	cancel1()
-	<-sender1.Done()
-
-	unacked := sender1.Unacked()
-	assert.GreaterOrEqual(t, len(unacked), 1, "sent-but-not-acked messages must appear in Unacked()")
-
-	// Second connection: server acks everything.
-	var replayed atomic.Int32
-	stream2, cancel2 := newCountingAckStream(&replayed)
-	sender2 := federation.NewPeerSender(stream2, cancel2, 100, 65536, log)
-	for _, env := range unacked {
-		env := env
-		sender2.Enqueue(env)
-	}
-
-	require.Eventually(t,
-		func() bool { return replayed.Load() >= 1 },
-		2*time.Second, 20*time.Millisecond,
-		"unacked messages must be replayed on reconnect")
-	sender2.Close()
-	cancel2()
 }
 
 func TestMTLSRejection(t *testing.T) {
@@ -456,66 +361,3 @@ func TestHubListenError(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "hub listen")
 }
-
-// ---- mock streams for unit tests of PeerSender ------------------------------
-
-// neverAckStream is a Publish stream that accepts sends but never acks.
-// The caller receives the cancel func and passes it to NewPeerSender as streamCancel
-// so that PeerSender.Close() unblocks Recv().
-type neverAckStream struct {
-	ctx  context.Context
-	sent atomic.Int32
-}
-
-func newNeverAckStream() (*neverAckStream, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &neverAckStream{ctx: ctx}, cancel
-}
-
-func (s *neverAckStream) Send(_ *federationv1.PublishBatch) error {
-	s.sent.Add(1)
-	return nil
-}
-func (s *neverAckStream) Recv() (*federationv1.PublishAck, error) {
-	<-s.ctx.Done()
-	return nil, io.EOF
-}
-func (s *neverAckStream) Context() context.Context     { return s.ctx }
-func (s *neverAckStream) Header() (metadata.MD, error) { return nil, nil }
-func (s *neverAckStream) Trailer() metadata.MD         { return nil }
-func (s *neverAckStream) CloseSend() error             { return nil }
-func (s *neverAckStream) SendMsg(any) error            { return nil }
-func (s *neverAckStream) RecvMsg(any) error            { return nil }
-
-// countingAckStream counts received batches and sends an ack for each.
-type countingAckStream struct {
-	ctx     context.Context
-	counter *atomic.Int32
-	ackCh   chan *federationv1.PublishAck
-}
-
-func newCountingAckStream(counter *atomic.Int32) (*countingAckStream, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &countingAckStream{ctx: ctx, counter: counter, ackCh: make(chan *federationv1.PublishAck, 256)}
-	return s, cancel
-}
-
-func (s *countingAckStream) Send(_ *federationv1.PublishBatch) error {
-	s.counter.Add(1)
-	s.ackCh <- &federationv1.PublishAck{}
-	return nil
-}
-func (s *countingAckStream) Recv() (*federationv1.PublishAck, error) {
-	select {
-	case ack := <-s.ackCh:
-		return ack, nil
-	case <-s.ctx.Done():
-		return nil, io.EOF
-	}
-}
-func (s *countingAckStream) Context() context.Context     { return s.ctx }
-func (s *countingAckStream) Header() (metadata.MD, error) { return nil, nil }
-func (s *countingAckStream) Trailer() metadata.MD         { return nil }
-func (s *countingAckStream) CloseSend() error             { return nil }
-func (s *countingAckStream) SendMsg(any) error            { return nil }
-func (s *countingAckStream) RecvMsg(any) error            { return nil }

@@ -17,12 +17,15 @@ import (
 	"google.golang.org/grpc"
 )
 
-// newReconnectClient builds a sender-only Client with explicit reconnect timing.
+// newReconnectClient builds a Client with explicit reconnect timing and one
+// outbound publish channel rooted at the given data dir.
 func newReconnectClient(
 	t *testing.T,
 	log *testutil.FakeLogger,
 	reconnBase, reconnMax time.Duration,
 	jitter float64,
+	dataDir string,
+	publishChannel string,
 ) *Client {
 	t.Helper()
 	dd, err := dedup.NewLRUDedup(1000)
@@ -31,17 +34,20 @@ func newReconnectClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil,
 		dd, &fakeAuditLogger2{}, log,
-		100, 65536,
+		65536,
 		reconnBase, reconnMax, jitter,
-		nil, nil,
+		nil, []string{publishChannel}, dataDir,
 	)
 	t.Cleanup(c.Close)
 	return c
 }
 
-// TestClient_ConnectWithReconnect_ReplayUnacked verifies that messages in the
-// unacked window are replayed on the next successful reconnect.
-func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
+// TestClient_ConnectWithReconnect_DeliversAfterReconnect verifies that messages
+// written to the local channel file before the hub first acks them are
+// delivered after the reconnect. The first hub connection drops without
+// acking; the per-channel offset file stays at zero so the second connection
+// re-sends from the beginning.
+func TestClient_ConnectWithReconnect_DeliversAfterReconnect(t *testing.T) {
 	var connIdx atomic.Int32
 	replayed := make(chan string, 20)
 
@@ -49,7 +55,9 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
 			idx := int(connIdx.Add(1))
 			if idx == 1 {
-				// First connection: read one batch but never ack — simulate mid-transfer failure.
+				// First connection: read one batch but never ack — simulate
+				// a mid-transfer failure. The reader's offset file is not
+				// advanced because the ack never arrives.
 				_, _ = stream.Recv()
 				return nil
 			}
@@ -78,15 +86,16 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 		},
 	})
 
-	client := newReconnectClient(t, &testutil.FakeLogger{}, 0, 0, 0)
+	dataDir := t.TempDir()
+	client := newReconnectClient(t, &testutil.FakeLogger{}, 5*time.Millisecond, 50*time.Millisecond, 0, dataDir, "orders")
 	require.NoError(t, client.ConnectWithReconnect(addr))
 
-	sender := client.Sender()
-	require.NotNil(t, sender)
+	feeder := newChannelFeeder(t, dataDir, "orders", client)
+
 	var sentIDs []string
 	for i := 0; i < 3; i++ {
 		env, _ := envelope.NewEnvelope("orders", "test", "t", map[string]int{"n": i})
-		sender.Enqueue(&env)
+		feeder.publish(t, &env)
 		sentIDs = append(sentIDs, env.ID)
 	}
 
@@ -106,8 +115,9 @@ func TestClient_ConnectWithReconnect_ReplayUnacked(t *testing.T) {
 	assert.GreaterOrEqual(t, int(connIdx.Load()), 2)
 }
 
-// TestClient_ConnectWithReconnect_BackoffOnFailedAttempts verifies that the inner
-// retry loop backs off and eventually recovers.
+// TestClient_ConnectWithReconnect_BackoffOnFailedAttempts verifies that the
+// inner retry loop backs off and eventually recovers. The first conn drops
+// without acking; subsequent conns reject the stream; finally a conn acks.
 func TestClient_ConnectWithReconnect_BackoffOnFailedAttempts(t *testing.T) {
 	const rejectCount = 2
 
@@ -119,15 +129,14 @@ func TestClient_ConnectWithReconnect_BackoffOnFailedAttempts(t *testing.T) {
 		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
 			idx := int(connIdx.Add(1))
 			if idx == 1 {
-				// First connection: receive without acking (to trigger disconnect and unacked window).
+				// First connection: receive without acking.
 				_, _ = stream.Recv()
 				return nil
 			}
 			if idx <= rejectCount+1 {
-				// Reject connections 2..N: return immediately without acking.
+				// Reject connections 2..N: return immediately.
 				return nil
 			}
-			// Final connection: receive replayed batches and ack.
 			for {
 				batch, err := stream.Recv()
 				if err != nil {
@@ -147,11 +156,13 @@ func TestClient_ConnectWithReconnect_BackoffOnFailedAttempts(t *testing.T) {
 		},
 	})
 
-	client := newReconnectClient(t, log, 5*time.Millisecond, 50*time.Millisecond, 0)
+	dataDir := t.TempDir()
+	client := newReconnectClient(t, log, 5*time.Millisecond, 50*time.Millisecond, 0, dataDir, "ch")
 	require.NoError(t, client.ConnectWithReconnect(addr))
 
+	feeder := newChannelFeeder(t, dataDir, "ch", client)
 	env, _ := envelope.NewEnvelope("ch", "test", "t", nil)
-	client.Sender().Enqueue(&env)
+	feeder.publish(t, &env)
 	sentID := env.ID
 
 	var gotID string

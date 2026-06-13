@@ -88,9 +88,12 @@ func (c *Compactor) MinOffset() (int64, error) {
 	return minOffset, nil
 }
 
-// fedMinOffset returns the minimum byte offset across all fed-*.offset files
-// in c.offsetDir. Returns (math.MaxInt64, nil) when none are present, and
-// (0, err) on a read error that prevents a safe calculation.
+// fedMinOffset returns the minimum byte offset across all federation offset
+// files in c.offsetDir. This covers both hub-side inbound peer offsets
+// ("fed-*.offset", written by hub channelReaders) and client-side outbound
+// publish offsets ("fedout-*.offset", written by client channelReaders).
+// Returns (math.MaxInt64, nil) when none are present, and (0, err) on a read
+// error that prevents a safe calculation.
 func (c *Compactor) fedMinOffset() (int64, error) {
 	entries, err := os.ReadDir(c.offsetDir)
 	if os.IsNotExist(err) {
@@ -101,7 +104,10 @@ func (c *Compactor) fedMinOffset() (int64, error) {
 	}
 	minOffset := int64(math.MaxInt64)
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasPrefix(e.Name(), "fed-") || !strings.HasSuffix(e.Name(), ".offset") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".offset") {
+			continue
+		}
+		if !strings.HasPrefix(e.Name(), "fed-") && !strings.HasPrefix(e.Name(), "fedout-") {
 			continue
 		}
 		off, err := ReadOffset(filepath.Join(c.offsetDir, e.Name()))

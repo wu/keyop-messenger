@@ -50,7 +50,8 @@ type ClientStats struct {
 	// ReconnectCount is the number of successful reconnections after the initial
 	// dial. The first connection is not counted.
 	ReconnectCount int64
-	// UnackedMessages is the number of messages sent to the hub but not yet
-	// acknowledged by the remote.
-	UnackedMessages int
+	// UnackedBytes is the total bytes of locally-published messages on this
+	// client's outbound channels that have not yet been acknowledged by the hub.
+	// Computed from the per-channel offset files against the channel stream end.
+	UnackedBytes int64
 }

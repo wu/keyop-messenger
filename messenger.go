@@ -240,13 +240,13 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				dd,
 				auditL,
 				log,
-				cfg.Federation.SendBufferMessages,
 				cfg.Federation.MaxBatchBytes,
 				time.Duration(cfg.Federation.ReconnectBaseMS)*time.Millisecond,
 				time.Duration(cfg.Federation.ReconnectMaxMS)*time.Millisecond,
 				cfg.Federation.ReconnectJitter,
 				ref.Subscribe,
 				ref.Publish,
+				cfg.Storage.DataDir,
 			)
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)
@@ -302,8 +302,11 @@ func (m *Messenger) RegisterPayloadType(typeStr string, prototype any) error {
 }
 
 // Publish creates an envelope for payload, writes it to channel's storage
-// file, notifies local subscribers, and enqueues it for any configured peer
-// senders. Publish blocks until the write is confirmed (per sync_interval_ms).
+// file, and notifies local subscribers and any configured outbound peer
+// readers. Publish blocks until the write is confirmed (per sync_interval_ms).
+// Outbound delivery to configured client hubs continues asynchronously from the
+// channel file; a hub disconnect does not lose messages because each outbound
+// reader tracks its own durable offset.
 func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, payload any) error {
 	if err := ValidateChannelName(channel); err != nil {
 		return err
@@ -342,10 +345,12 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	if m.hub != nil {
 		m.hub.NotifyChannel(env.Channel)
 	}
-	// Enqueue to client senders (client's publish policy decides acceptance).
+	// Wake any outbound client readers configured for this channel. Each client
+	// pulls from the local channel file via its channelReader, so the message
+	// is durable through hub disconnects.
 	for _, c := range m.clients {
-		if s := c.Sender(); s != nil && c.AllowPublish(env.Channel) {
-			s.Enqueue(&env)
+		if c.AllowPublish(env.Channel) {
+			c.NotifyChannel(env.Channel)
 		}
 	}
 
@@ -577,10 +582,10 @@ func (m *Messenger) Stats() Stats {
 		s.Federation.Clients = make([]ClientStats, 0, len(m.clients))
 		for _, c := range m.clients {
 			s.Federation.Clients = append(s.Federation.Clients, ClientStats{
-				HubAddr:         c.HubAddr(),
-				Connected:       c.Connected(),
-				ReconnectCount:  c.ReconnectCount(),
-				UnackedMessages: c.UnackedCount(),
+				HubAddr:        c.HubAddr(),
+				Connected:      c.Connected(),
+				ReconnectCount: c.ReconnectCount(),
+				UnackedBytes:   c.UnackedBytes(),
 			})
 		}
 	}
@@ -651,8 +656,10 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 }
 
 // writeLocalEnvelope is the federation localWriter callback. It is called by
-// PeerReceivers after deduplication to store a remotely-published envelope and
-// wake local subscribers.
+// PeerReceivers after deduplication to store a remotely-published envelope,
+// wake local subscribers, and (in a relay role) propagate the envelope on to
+// outbound client peers. The LRU dedup catches any loop where a forwarded
+// message returns to its origin.
 func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	cs, err := m.getOrCreateChannelState(env.Channel)
 	if err != nil {
@@ -666,6 +673,13 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	// Notify hub channel readers that new data is available for this channel.
 	if m.hub != nil {
 		m.hub.NotifyChannel(env.Channel)
+	}
+	// Also wake outbound client readers so a relay instance forwards the
+	// message onward without waiting for a subsequent local publish.
+	for _, c := range m.clients {
+		if c.AllowPublish(env.Channel) {
+			c.NotifyChannel(env.Channel)
+		}
 	}
 
 	return nil

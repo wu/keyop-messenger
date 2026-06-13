@@ -538,7 +538,7 @@ func (h *Hub) buildChannelReaders(
 		offsetDir := filepath.Join(h.dataDir, "subscribers", ch)
 
 		placeholder := make(chan sendReq, 1)
-		r, err := newChannelReader(peerName, ch, channelDir, offsetDir,
+		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fed-",
 			h.maxBatchBytes, placeholder, h.log)
 		if err != nil {
 			return nil, fmt.Errorf("channel %q: %w", ch, err)
