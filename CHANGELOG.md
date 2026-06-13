@@ -1,3 +1,14 @@
+## [2.0.0](https://github.com/wu/keyop-messenger/compare/v1.5.0...v2.0.0) (2026-06-13)
+
+### ⚠ BREAKING CHANGES
+
+* federated messaging protocol changed
+
+### Features
+
+* add workflow_dispatch to release.yaml for manual trigger support ([92b3599](https://github.com/wu/keyop-messenger/commit/92b35999575c80fb8edbf975c92d2faaca3e7eb1))
+* bumping version for incompatible change ([0d1db16](https://github.com/wu/keyop-messenger/commit/0d1db1688a83ddfdbbb59a55ef5ddfcff96e5c79))
+
 ## [1.6.0](https://github.com/wu/keyop-messenger/compare/v1.5.0...v1.6.0) (2026-06-13)
 
 ### Features
