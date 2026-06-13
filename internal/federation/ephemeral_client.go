@@ -243,7 +243,8 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 
 	// Start the Subscribe stream if the client has subscriptions.
 	if len(c.subscribe) > 0 {
-		subStream, subErr := stub.Subscribe(metadata.NewOutgoingContext(connCtx, outMD))
+		subCtx, subCancel := context.WithCancel(connCtx)
+		subStream, subErr := stub.Subscribe(metadata.NewOutgoingContext(subCtx, outMD))
 		if subErr == nil {
 			subErr = subStream.Send(&federationv1.SubscribeFrame{
 				Payload: &federationv1.SubscribeFrame_Request{
@@ -257,10 +258,10 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 			})
 		}
 		if subErr != nil {
+			subCancel()
 			c.log.Warn("ephemeral: subscribe stream setup failed", "hub", hubAddr, "err", subErr)
 		} else {
 			dd, _ := dedup.NewLRUDedup(1024)
-			_, subCancel := context.WithCancel(connCtx)
 			recv := NewPeerReceiver(subStream, subCancel, nil, dd, c.dispatchEnvelope,
 				noopAuditLogger{}, c.log, hubAddr, c.maxBatchBytes)
 			c.wg.Add(1)
