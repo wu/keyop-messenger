@@ -1,3 +1,11 @@
+## [4.2.0](https://github.com/wu/keyop-messenger/compare/v4.1.0...v4.2.0) (2026-06-13)
+
+### Features
+
+* hardcode TLS 1.3 minimum; drop tls.min_version config field ([46b1cea](https://github.com/wu/keyop-messenger/commit/46b1cea0e94b7002a223874c2aa86cc919f7f606))
+* tighten federation TLS verifier; mark BasicConstraints on leaves ([392582d](https://github.com/wu/keyop-messenger/commit/392582d706c75745538661cc88915d4ea30a8887))
+* verify federation TLS by CA chain only, not by DNS-SAN matching ([75b46a7](https://github.com/wu/keyop-messenger/commit/75b46a7ed652afada1f2c26ddc3a85e9b40d6efb))
+
 ## [4.1.0](https://github.com/wu/keyop-messenger/compare/v4.0.0...v4.1.0) (2026-06-13)
 
 ### Features
