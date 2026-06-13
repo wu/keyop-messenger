@@ -1,3 +1,9 @@
+## [4.1.0](https://github.com/wu/keyop-messenger/compare/v4.0.0...v4.1.0) (2026-06-13)
+
+### Features
+
+* require TLS only when federation is enabled ([56a8073](https://github.com/wu/keyop-messenger/commit/56a8073b3bf4554ec92bd3f1a41efd25d6300077))
+
 ## [4.0.0](https://github.com/wu/keyop-messenger/compare/v3.0.1...v4.0.0) (2026-06-13)
 
 ### Features
