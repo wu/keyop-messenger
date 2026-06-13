@@ -45,7 +45,7 @@ type FederationStats struct {
 type ClientStats struct {
 	// HubAddr is the network address of the hub.
 	HubAddr string
-	// Connected reports whether the sender is currently active.
+	// Connected reports whether the gRPC Publish stream is currently active.
 	Connected bool
 	// ReconnectCount is the number of successful reconnections after the initial
 	// dial. The first connection is not counted.

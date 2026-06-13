@@ -1,27 +1,27 @@
 package federation
 
 import (
+	"context"
 	"errors"
+	"io"
 	"sync"
 
-	"github.com/gorilla/websocket"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
-// PeerSender manages outbound delivery to one peer over a WebSocket connection.
-// One goroutine owns all writes; it batches, sends a binary frame, then blocks
-// waiting for a text-frame ack before sending the next batch. Unacked messages
+// PeerSender manages outbound delivery to one peer over the Publish gRPC stream.
+// One goroutine owns all writes; it batches, sends a PublishBatch, then blocks
+// waiting for a PublishAck before sending the next batch. Unacked messages
 // are retained for replay on reconnect.
 type PeerSender struct {
-	conn          *websocket.Conn
-	connWriteMu   *sync.Mutex // protects concurrent writes to conn (shared with PeerReceiver if present)
+	stream        federationv1.FederationService_PublishClient
+	streamCancel  context.CancelFunc
 	maxBatchBytes int
 	log           logger
-
-	// ackCh is non-nil when a PeerReceiver owns all reads on the same conn.
-	// receiveAck() reads from this channel instead of the connection directly,
-	// avoiding a concurrent-read race.
-	ackCh <-chan AckMsg
 
 	buf  chan *envelope.Envelope // bounded outbound buffer
 	stop chan struct{}
@@ -32,12 +32,18 @@ type PeerSender struct {
 	lastAckedID string
 }
 
-// NewPeerSender starts a PeerSender goroutine on conn.
-// bufSize is the capacity of the outbound buffer (send_buffer_messages).
-func NewPeerSender(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger) *PeerSender {
+// NewPeerSender starts a PeerSender goroutine on the given Publish stream.
+// streamCancel cancels the stream context; call it in Close() to unblock Recv.
+// bufSize is the capacity of the outbound buffer.
+func NewPeerSender(
+	stream federationv1.FederationService_PublishClient,
+	streamCancel context.CancelFunc,
+	bufSize, maxBatchBytes int,
+	log logger,
+) *PeerSender {
 	ps := &PeerSender{
-		conn:          conn,
-		connWriteMu:   connWriteMu,
+		stream:        stream,
+		streamCancel:  streamCancel,
 		maxBatchBytes: maxBatchBytes,
 		log:           log,
 		buf:           make(chan *envelope.Envelope, bufSize),
@@ -46,37 +52,6 @@ func NewPeerSender(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBa
 	}
 	go ps.run()
 	return ps
-}
-
-// newPeerSenderWithAck creates a PeerSender that reads acks from ackCh instead
-// of the connection directly. Use this when a PeerReceiver also reads from conn
-// to avoid concurrent reads violating gorilla/websocket's single-reader rule.
-func newPeerSenderWithAck(conn *websocket.Conn, connWriteMu *sync.Mutex, bufSize, maxBatchBytes int, log logger, ackCh <-chan AckMsg) *PeerSender {
-	ps := &PeerSender{
-		conn:          conn,
-		connWriteMu:   connWriteMu,
-		maxBatchBytes: maxBatchBytes,
-		log:           log,
-		ackCh:         ackCh,
-		buf:           make(chan *envelope.Envelope, bufSize),
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
-	}
-	go ps.run()
-	return ps
-}
-
-// receiveAck reads the next ack from the shared ackCh (if set) or directly
-// from the connection.
-func (ps *PeerSender) receiveAck() (AckMsg, error) {
-	if ps.ackCh != nil {
-		ack, ok := <-ps.ackCh
-		if !ok {
-			return AckMsg{}, errors.New("federation: ack channel closed (connection lost)")
-		}
-		return ack, nil
-	}
-	return ReceiveAck(ps.conn)
 }
 
 // Enqueue adds env to the outbound buffer. Returns false (and logs a warning)
@@ -120,7 +95,7 @@ func (ps *PeerSender) Close() {
 	default:
 		close(ps.stop)
 	}
-	_ = ps.conn.Close() // unblock ReceiveAck if blocked in run()
+	ps.streamCancel() // cancel stream context to unblock Recv
 	<-ps.done
 }
 
@@ -128,82 +103,70 @@ func (ps *PeerSender) run() {
 	defer close(ps.done)
 
 	for {
-		// Wait for at least one message or stop signal.
+		// Wait for at least one message, stop signal, or stream context cancellation.
 		var first *envelope.Envelope
 		select {
 		case <-ps.stop:
+			return
+		case <-ps.stream.Context().Done():
 			return
 		case first = <-ps.buf:
 		}
 
 		// Accumulate a batch up to maxBatchBytes or until the buffer is empty.
-		batch := []*envelope.Envelope{first}
-		batchBytes := marshaledSize(first)
+		// Marshal each envelope once: the bytes serve both the size check and Send.
+		firstData, mErr := envelope.Marshal(*first)
+		if mErr != nil {
+			ps.log.Error("federation: sender marshal", "id", first.ID, "err", mErr)
+			continue
+		}
+		envs := []*envelope.Envelope{first}
+		records := [][]byte{firstData}
+		batchBytes := len(firstData)
 
 	drain:
 		for batchBytes < ps.maxBatchBytes {
 			select {
 			case env := <-ps.buf:
-				batch = append(batch, env)
-				batchBytes += marshaledSize(env)
+				data, mErr := envelope.Marshal(*env)
+				if mErr != nil {
+					ps.log.Error("federation: sender marshal", "id", env.ID, "err", mErr)
+					continue drain
+				}
+				envs = append(envs, env)
+				records = append(records, data)
+				batchBytes += len(data)
 			default:
 				break drain
 			}
 		}
 
-		// Marshal each envelope into a wire record.
-		records := make([][]byte, 0, len(batch))
-		for _, env := range batch {
-			data, err := envelope.Marshal(*env)
-			if err != nil {
-				ps.log.Error("federation: sender marshal", "id", env.ID, "err", err)
-				continue
-			}
-			records = append(records, data)
-		}
-		if len(records) == 0 {
-			continue
-		}
-
-		// Write one binary frame containing all records.
-		ps.connWriteMu.Lock()
-		w, err := ps.conn.NextWriter(websocket.BinaryMessage)
-		if err != nil {
-			ps.connWriteMu.Unlock()
-			ps.log.Error("federation: sender next writer", "err", err)
+		// Send one batch containing all records.
+		if err := ps.stream.Send(&federationv1.PublishBatch{Records: records}); err != nil {
+			ps.log.Error("federation: sender send batch", "err", err)
 			return
 		}
-		if err := WriteFrame(w, records); err != nil {
-			_ = w.Close()
-			ps.connWriteMu.Unlock()
-			ps.log.Error("federation: sender write frame", "err", err)
-			return
-		}
-		if err := w.Close(); err != nil {
-			ps.connWriteMu.Unlock()
-			ps.log.Error("federation: sender close writer", "err", err)
-			return
-		}
-		ps.connWriteMu.Unlock()
 
 		// Record as unacked.
 		ps.mu.Lock()
-		ps.unacked = append(ps.unacked, batch...)
+		ps.unacked = append(ps.unacked, envs...)
 		ps.mu.Unlock()
 
 		// Block until ack arrives from the remote receiver.
-		ack, err := ps.receiveAck()
+		ack, err := ps.stream.Recv()
 		if err != nil {
-			ps.log.Error("federation: sender receive ack", "err", err)
+			if !errors.Is(err, io.EOF) && status.Code(err) != codes.Canceled {
+				ps.log.Error("federation: sender receive ack", "err", err)
+			}
 			return
 		}
 
-		// Advance the unacked window up to ack.LastID.
-		if ack.LastID != "" {
+		// Advance the unacked window up to ack.LastId.
+		if ack.LastId != "" {
 			ps.mu.Lock()
-			ps.lastAckedID = ack.LastID
+			ps.lastAckedID = ack.LastId
 			for i, env := range ps.unacked {
-				if env.ID == ack.LastID {
+				if env.ID == ack.LastId {
 					ps.unacked = ps.unacked[i+1:]
 					break
 				}
@@ -211,14 +174,4 @@ func (ps *PeerSender) run() {
 			ps.mu.Unlock()
 		}
 	}
-}
-
-// marshaledSize returns an estimate of the wire size of env for batch sizing.
-// On marshal error it returns 0 (the envelope is skipped later).
-func marshaledSize(env *envelope.Envelope) int {
-	data, err := envelope.Marshal(*env)
-	if err != nil {
-		return 0
-	}
-	return len(data)
 }

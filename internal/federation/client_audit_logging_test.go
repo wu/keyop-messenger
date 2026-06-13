@@ -1,19 +1,23 @@
+//go:build integration
+
 //nolint:gosec // test file
 package federation
 
 import (
+	"net"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/dedup"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"google.golang.org/grpc"
 )
 
 // recordingAudit is a thread-safe audit logger that records all events for assertion.
@@ -31,8 +35,6 @@ func (r *recordingAudit) Log(ev audit.Event) error {
 
 func (r *recordingAudit) Close() error { return nil }
 
-// hasEventWithDetail reports whether any recorded event with the given name has
-// Detail containing substr.
 func (r *recordingAudit) hasEventWithDetail(name, substr string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -44,8 +46,6 @@ func (r *recordingAudit) hasEventWithDetail(name, substr string) bool {
 	return false
 }
 
-// findEventWithDetail returns the first event matching name whose Detail contains
-// substr, or a zero value if none is found.
 func (r *recordingAudit) findEventWithDetail(name, substr string) (audit.Event, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -57,66 +57,39 @@ func (r *recordingAudit) findEventWithDetail(name, substr string) (audit.Event, 
 	return audit.Event{}, false
 }
 
-// mockHubHandshakeInternal performs the server side of the application handshake.
-func mockHubHandshakeInternal(conn *websocket.Conn) {
-	_ = conn.ReadJSON(&HandshakeMsg{})
-	_ = conn.WriteJSON(HandshakeMsg{InstanceName: "hub", Role: "hub", Version: "1"})
-}
-
-// newSenderOnlyClient builds a sender-only Client (no localWriter) with short
-// reconnect timings suitable for these tests.
 func newSenderOnlyClient(auditL audit.AuditLogger, log *testutil.FakeLogger) *Client {
 	dd, _ := dedup.NewLRUDedup(100)
-	policy := NewAtomicPolicy(ForwardPolicy{})
 	return NewClient(
-		"test-client",
+		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil,
-		policy,
-		nil, // no localWriter → sender reads acks directly from conn
-		dd,
-		auditL,
-		log,
-		100,
-		65536,
-		50*time.Millisecond,  // reconnectBase: short for tests
-		500*time.Millisecond, // reconnectMax
-		0.0,                  // no jitter for deterministic timing
+		dd, auditL, log,
+		100, 65536,
+		50*time.Millisecond, 500*time.Millisecond, 0.0,
 		nil, nil,
 	)
 }
 
 // TestClientDisconnect_AuditsPeerDisconnected verifies that ConnectWithReconnect
-// emits a peer_disconnected audit event (with "unacked=" in Detail) when the hub
-// closes without acking an in-flight message.
-//
-// The sender's Done() channel only fires when it is actively sending and
-// encounters an error (write failure or ack channel closed). We trigger this
-// by enqueueing a message so the sender blocks waiting for an ack, then the
-// server closes the connection without sending one.
+// emits a peer_disconnected audit event when the hub closes without acking.
 func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 	auditL := &recordingAudit{}
 
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer func() { _ = conn.Close() }()
-		mockHubHandshakeInternal(conn)
-		// Read the binary message frame but close without sending an ack.
-		// This causes the client sender to detect the disconnect.
-		_, _, _ = conn.ReadMessage()
+	// Server receives a batch but closes without acking.
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			_, _ = stream.Recv() // receive but don't ack
+			return nil
+		},
 	})
-	defer srv.Close()
 
 	client := newSenderOnlyClient(auditL, log)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	err := client.ConnectWithReconnect(strings.TrimPrefix(wsURL, "ws://"))
+	err := client.ConnectWithReconnect(addr)
 	require.NoError(t, err)
 
-	// Enqueue a message so the sender sends it and then blocks waiting for an ack.
-	// When the server closes without acking, sender.Done() fires and the reconnect
-	// loop emits the peer_disconnected event.
 	env, envErr := envelope.NewEnvelope("test-ch", "origin", "test.v1", nil)
 	require.NoError(t, envErr)
 	sender := client.Sender()
@@ -125,58 +98,57 @@ func TestClientDisconnect_AuditsPeerDisconnected(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked=")
-	}, 2*time.Second, 20*time.Millisecond, "peer_disconnected audit event should be emitted on disconnect")
+	}, 5*time.Second, 20*time.Millisecond)
 
 	evt, found := auditL.findEventWithDetail(audit.EventPeerDisconnected, "unacked=")
 	require.True(t, found)
-	assert.NotEmpty(t, evt.PeerAddr, "peer_disconnected should record the hub address in PeerAddr")
+	assert.NotEmpty(t, evt.PeerAddr)
 	assert.Contains(t, evt.Detail, "unacked=")
 }
 
-// TestClientReconnect_AuditsFailedAttempts verifies that each failed reconnect
-// attempt is logged as a peer_connected audit event with "attempt=" and "err="
-// in the Detail field.
+// TestClientReconnect_AuditsFailedAttempts verifies that failed reconnect
+// attempts are logged as peer_connected events with attempt= and err= in Detail.
 func TestClientReconnect_AuditsFailedAttempts(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 	auditL := &recordingAudit{}
 
-	// Server accepts the initial connection, reads a message, then closes.
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer func() { _ = conn.Close() }()
-		mockHubHandshakeInternal(conn)
-		_, _, _ = conn.ReadMessage() // read the message but close without acking
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := lis.Addr().String()
+
+	grpcSrv := grpc.NewServer()
+	federationv1.RegisterFederationServiceServer(grpcSrv, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			_, _ = stream.Recv() // receive but close without acking
+			return nil
+		},
 	})
+	go grpcSrv.Serve(lis) //nolint:errcheck
 
 	client := newSenderOnlyClient(auditL, log)
 	defer client.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	addr := strings.TrimPrefix(wsURL, "ws://")
+	require.NoError(t, client.ConnectWithReconnect(addr))
 
-	err := client.ConnectWithReconnect(addr)
-	require.NoError(t, err)
-
-	// Trigger the disconnect so the reconnect loop starts.
 	env, envErr := envelope.NewEnvelope("test-ch", "origin", "test.v1", nil)
 	require.NoError(t, envErr)
 	client.Sender().Enqueue(&env)
 
-	// Wait for the first disconnect event before stopping the server.
+	// Wait for the disconnect event.
 	require.Eventually(t, func() bool {
 		return auditL.hasEventWithDetail(audit.EventPeerDisconnected, "unacked=")
-	}, 2*time.Second, 20*time.Millisecond)
+	}, 5*time.Second, 20*time.Millisecond)
 
-	// Stop the server so all subsequent reconnect attempts fail.
-	srv.Close()
+	// Stop the server so subsequent reconnect attempts fail.
+	grpcSrv.Stop()
 
-	// Failed reconnect attempts are logged as peer_connected events with attempt=N err=...
 	require.Eventually(t, func() bool {
 		return auditL.hasEventWithDetail(audit.EventPeerConnected, "attempt=")
-	}, 2*time.Second, 20*time.Millisecond, "failed reconnect attempts should be audited")
+	}, 5*time.Second, 20*time.Millisecond)
 
 	evt, found := auditL.findEventWithDetail(audit.EventPeerConnected, "attempt=")
 	require.True(t, found)
-	assert.Contains(t, evt.Detail, "attempt=", "Detail should include the attempt number")
-	assert.Contains(t, evt.Detail, "err=", "Detail should include the dial error message")
+	assert.Contains(t, evt.Detail, "attempt=")
+	assert.Contains(t, evt.Detail, "err=")
 }

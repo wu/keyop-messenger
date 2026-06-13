@@ -1,81 +1,88 @@
 package federation
 
 import (
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
+	"context"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/storage"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
-// wsUpgrader is a permissive upgrader for coordinator tests.
-var wsUpgrader = websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-
-// newCoordTestPair creates a connected WebSocket pair for coordinator tests.
-// serverFn runs in a goroutine on the server side.
-func newCoordTestPair(t *testing.T, serverFn func(*websocket.Conn)) *websocket.Conn {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := wsUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		serverFn(conn)
-	}))
-	t.Cleanup(srv.Close)
-
-	u := "ws" + strings.TrimPrefix(srv.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(u, nil)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	return conn
+// mockSubServerStream implements grpc.BidiStreamingServer[SubscribeFrame, HubBatch]
+// for coordinator unit tests. The test goroutine reads batches from sendCh and
+// can deliver acks by writing to ackCh (or by closing ackCh).
+type mockSubServerStream struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	sendCh chan *federationv1.HubBatch
+	ackCh  chan *federationv1.SubscribeFrame
 }
 
+func newMockSubServerStream() *mockSubServerStream {
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in struct
+	return &mockSubServerStream{
+		ctx:    ctx,
+		cancel: cancel,
+		sendCh: make(chan *federationv1.HubBatch, 16),
+		ackCh:  make(chan *federationv1.SubscribeFrame, 16),
+	}
+}
+
+func (m *mockSubServerStream) Send(batch *federationv1.HubBatch) error {
+	select {
+	case m.sendCh <- batch:
+		return nil
+	case <-m.ctx.Done():
+		return m.ctx.Err()
+	}
+}
+
+func (m *mockSubServerStream) Recv() (*federationv1.SubscribeFrame, error) {
+	select {
+	case f, ok := <-m.ackCh:
+		if !ok {
+			return nil, context.Canceled
+		}
+		return f, nil
+	case <-m.ctx.Done():
+		return nil, m.ctx.Err()
+	}
+}
+
+func (m *mockSubServerStream) Context() context.Context { return m.ctx }
+
+// grpc.ServerStream methods (no-ops for tests)
+func (m *mockSubServerStream) SetHeader(metadata.MD) error  { return nil }
+func (m *mockSubServerStream) SendHeader(metadata.MD) error { return nil }
+func (m *mockSubServerStream) SetTrailer(metadata.MD)       {}
+func (m *mockSubServerStream) SendMsg(any) error            { return nil }
+func (m *mockSubServerStream) RecvMsg(any) error            { return nil }
+
+// Ensure mockSubServerStream satisfies the interface at compile time.
+var _ grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch] = (*mockSubServerStream)(nil)
+
+// ---- tests ------------------------------------------------------------------
+
 // TestClientCoordinator_SendBatch_AckFlow verifies that a batch is sent over
-// the WebSocket and doneCh is closed once the ack arrives.
+// the stream and doneCh is closed once the ack arrives.
 func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	ackCh := make(chan AckMsg, 4)
-	var serverReceivedFrames int
-	var serverMu sync.Mutex
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
-		for {
-			msgType, _, err := conn.NextReader()
-			if err != nil {
-				return
-			}
-			if msgType == websocket.BinaryMessage {
-				serverMu.Lock()
-				serverReceivedFrames++
-				serverMu.Unlock()
-				// Send an ack back (simulates PeerReceiver on client side).
-				_ = conn.WriteJSON(AckMsg{LastID: "x"})
-			}
-		}
-	})
-
-	connWriteMu := &sync.Mutex{}
-	cc := newClientCoordinator(clientConn, connWriteMu, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
 	cc.start()
 	defer cc.close()
 
-	// Build a raw line and a sendReq.
 	rawLine := []byte(`{"v":1,"id":"abc","channel":"events","origin":"test","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
 	doneCh := make(chan struct{})
 	req := sendReq{
@@ -85,58 +92,39 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 		doneCh:    doneCh,
 	}
 
-	// Simulate the server sending the ack to ackCh when the frame arrives.
+	// Deliver ack to coordinator before it can block waiting.
 	go func() {
-		// Deliver ack to coordinator via the ackCh (normally routed by PeerReceiver).
-		ackCh <- AckMsg{LastID: "abc"}
+		// Wait for the coordinator to send the batch first.
+		select {
+		case <-stream.sendCh:
+		case <-time.After(2 * time.Second):
+			return
+		}
+		ackCh <- struct{}{}
 	}()
 
-	// Submit request directly to coordinator's requestCh.
 	select {
 	case cc.requestCh <- req:
 	case <-time.After(time.Second):
 		t.Fatal("timed out submitting request")
 	}
 
-	// doneCh must be closed after the ack.
 	select {
 	case <-doneCh:
-		// expected
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for doneCh to close")
 	}
 }
 
-// TestClientCoordinator_SequentialDelivery verifies that two batches are
-// delivered strictly in order: the second batch is not sent until the first
-// is acked.
+// TestClientCoordinator_SequentialDelivery verifies two batches are delivered in order.
 func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	ackCh := make(chan AckMsg, 8)
-	received := make(chan []byte, 16)
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 8)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
-		for {
-			msgType, data, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if msgType == websocket.BinaryMessage {
-				received <- data
-				_ = conn.WriteJSON(AckMsg{LastID: "ok"})
-			}
-		}
-	})
-
-	connWriteMu := &sync.Mutex{}
-	cc := newClientCoordinator(clientConn, connWriteMu, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
 	cc.start()
 	defer cc.close()
 
@@ -146,24 +134,24 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	done1 := make(chan struct{})
 	done2 := make(chan struct{})
 
-	go func() { ackCh <- AckMsg{LastID: "id1"} }()
+	// Goroutine that acks batches in order as they arrive.
 	go func() {
-		<-done1 // send second ack only after first batch is done
-		ackCh <- AckMsg{LastID: "id2"}
+		// Batch 1 arrives → ack → batch 2 arrives → ack.
+		<-stream.sendCh
+		ackCh <- struct{}{}
+		<-stream.sendCh
+		ackCh <- struct{}{}
 	}()
 
-	// Submit batch 1.
 	require.NoError(t, submitReq(t, cc, sendReq{
 		channel: "ch", rawLines: [][]byte{line1},
 		newOffset: int64(len(line1) + 1), doneCh: done1,
 	}))
-	// Submit batch 2 right after.
 	require.NoError(t, submitReq(t, cc, sendReq{
 		channel: "ch", rawLines: [][]byte{line2},
 		newOffset: int64(len(line1)+1) + int64(len(line2)+1), doneCh: done2,
 	}))
 
-	// Verify both dones close.
 	select {
 	case <-done1:
 	case <-time.After(2 * time.Second):
@@ -193,47 +181,28 @@ func submitReq(t *testing.T, cc *clientCoordinator, req sendReq) error {
 func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
-	ackCh := make(chan AckMsg, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
-		time.Sleep(200 * time.Millisecond)
-	})
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
 
-	connWriteMu := &sync.Mutex{}
-	cc := newClientCoordinator(clientConn, connWriteMu, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
 	cc.start()
 
 	cc.close()
-	// Second close should not panic.
 	assert.NotPanics(t, func() { cc.close() })
 }
 
-// TestClientCoordinator_AckChannelClosed stops the coordinator when the ack
-// channel is closed (simulating a PeerReceiver exit on connection loss).
+// TestClientCoordinator_AckChannelClosed stops coordinator when ackCh is closed.
 func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
-	ackCh := make(chan AckMsg, 4)
 
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
-		time.Sleep(500 * time.Millisecond)
-	})
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
 
-	connWriteMu := &sync.Mutex{}
-	cc := newClientCoordinator(clientConn, connWriteMu, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
 	cc.start()
 
-	// Send a batch so the coordinator is waiting for an ack.
 	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
 	doneCh := make(chan struct{})
 	go func() {
@@ -243,25 +212,23 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 		}
 	}()
 
-	// Give coordinator time to block on ackCh.
-	time.Sleep(30 * time.Millisecond)
-
-	// Close the ackCh to simulate receiver exit.
+	// Wait for batch to arrive at stream, then close ackCh.
+	select {
+	case <-stream.sendCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch never sent")
+	}
 	close(ackCh)
 
-	// The coordinator run() goroutine should exit promptly.
 	select {
 	case <-cc.done:
-		// expected
 	case <-time.After(2 * time.Second):
 		t.Fatal("coordinator did not exit after ackCh closed")
 	}
-
-	cc.close() // should not hang
+	cc.close()
 }
 
-// TestClientCoordinator_WithReaders verifies integration with channelReader:
-// a reader can submit via the shared requestCh and the coordinator routes acks.
+// TestClientCoordinator_WithReaders verifies integration with channelReader.
 func TestClientCoordinator_WithReaders(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -270,64 +237,33 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	channelDir := dir + "/channels/feed"
 	offsetDir := dir + "/subscribers/feed"
 
-	// Write one message to the channel directory before creating the reader.
-	// The reader will be created with no existing offset → starts at 0.
-	// (We create the reader before writing data so it starts at offset 0.)
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
 
-	ackCh := make(chan AckMsg, 4)
-
-	clientConn := newCoordTestPair(t, func(conn *websocket.Conn) {
-		defer func() {
-			if err := conn.Close(); err != nil {
-				t.Logf("failed to close connection: %v", err)
-			}
-		}()
-		for {
-			msgType, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-			if msgType == websocket.BinaryMessage {
-				if err := conn.WriteJSON(AckMsg{LastID: "ok"}); err != nil {
-					t.Logf("failed to write ack: %v", err)
-				}
-			}
-		}
-	})
-
-	connWriteMu := &sync.Mutex{}
-
-	// Create a placeholder requestCh; newClientCoordinator will replace it.
 	placeholder := make(chan sendReq, 1)
 	reader, err := newChannelReader("peer1", "feed", channelDir, offsetDir, 65536, placeholder, log)
 	require.NoError(t, err)
 
-	cc := newClientCoordinator(clientConn, connWriteMu, ackCh, 65536, log, []*channelReader{reader})
+	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader})
 	cc.start()
 	defer cc.close()
 
-	// Write a message and notify the reader.
 	env1 := makeEnvelope(t, "feed", "m1")
 	writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1})
 
-	// Route the ack that the server will send back to ackCh.
+	// Route the ack when the batch arrives at the stream.
 	go func() {
-		time.Sleep(50 * time.Millisecond)
-		ackCh <- AckMsg{LastID: "m1"}
+		select {
+		case <-stream.sendCh:
+			ackCh <- struct{}{}
+		case <-time.After(2 * time.Second):
+		}
 	}()
 
 	reader.notify()
 
-	// The reader should have its offset updated to the end of the segment.
-	time.Sleep(300 * time.Millisecond)
-
-	offset, err := readOffsetFile(t, offsetDir+"/fed-peer1.offset")
-	require.NoError(t, err)
-	assert.Greater(t, offset, int64(0), "offset should be advanced after delivery")
-}
-
-// readOffsetFile is a thin test helper around storage.ReadOffset.
-func readOffsetFile(t *testing.T, path string) (int64, error) {
-	t.Helper()
-	return storage.ReadOffset(path)
+	require.Eventually(t, func() bool {
+		offset, readErr := storage.ReadOffset(offsetDir + "/fed-peer1.offset")
+		return readErr == nil && offset > 0
+	}, 2*time.Second, 10*time.Millisecond, "offset should be advanced after delivery")
 }

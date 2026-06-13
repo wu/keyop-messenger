@@ -26,10 +26,10 @@ test-coverage:
 	go tool cover -func=coverage.out
 
 # Run tests with coverage, excluding example and testutil packages
-COVER_PKGS := $(shell go list ./... | grep -Ev '/(example|internal/testutil)$$')
+COVER_PKGS := $(shell go list ./... | grep -Ev '/(example|internal/testutil|gen/)$$')
 coverage:
-	go test -race -coverprofile=coverage.out $(COVER_PKGS)
-	@grep -v -E '^github\.com/wu/keyop-messenger/(example|internal/testutil)/' coverage.out > coverage-filtered.out
+	go test -race -tags integration -coverprofile=coverage.out $(COVER_PKGS)
+	@grep -v -E '^github\.com/wu/keyop-messenger/(example|internal/testutil|gen/)' coverage.out > coverage-filtered.out
 	go tool cover -func=coverage-filtered.out
 	@rm -f coverage-filtered.out
 

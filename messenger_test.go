@@ -3,7 +3,6 @@ package messenger
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +11,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
 // testConfig returns a minimal valid Config for a temporary data directory.
@@ -143,107 +141,6 @@ func TestMultipleSubscribers(t *testing.T) {
 				t.Fatalf("subscriber %d: received %d/%d messages", i, got, numMsgs)
 			}
 		}
-	}
-}
-
-// TestFederationEndToEnd publishes on a client Messenger and asserts that a
-// subscriber on the hub Messenger receives the message.
-func TestFederationEndToEnd(t *testing.T) {
-	dir := t.TempDir()
-
-	// Generate a shared CA and per-instance certificates.
-	// The hub cert uses "localhost" as its name so that the DNS SAN matches the
-	// hostname the client will dial (TLS does not accept IP addresses unless an
-	// IP SAN is present, and GenerateInstance only sets a DNS SAN).
-	caCert, caKey, err := tlsutil.GenerateCA(90)
-	require.NoError(t, err)
-
-	hubCert, hubKey, err := tlsutil.GenerateInstance(caCert, caKey, "localhost", 90)
-	require.NoError(t, err)
-
-	clientCert, clientKey, err := tlsutil.GenerateInstance(caCert, caKey, "test-client", 90)
-	require.NoError(t, err)
-
-	writePEM := func(name string, data []byte) string {
-		p := filepath.Join(dir, name)
-		require.NoError(t, os.WriteFile(p, data, 0o600))
-		return p
-	}
-	caFile := writePEM("ca.crt", caCert)
-
-	// Hub Messenger — listen on 127.0.0.1:0 (OS assigns port).
-	hubDir := filepath.Join(dir, "hub-data")
-	hubCfg := &Config{
-		Name: "test-hub",
-		Storage: StorageConfig{
-			DataDir: hubDir,
-		},
-		Hub: HubConfig{
-			Enabled:      true,
-			ListenAddr:   "127.0.0.1:0",
-			AllowedPeers: []AllowedPeer{{Name: "test-client"}},
-		},
-		TLS: TLSConfig{
-			Cert: writePEM("hub.crt", hubCert),
-			Key:  writePEM("hub.key", hubKey),
-			CA:   caFile,
-		},
-	}
-	hubCfg.ApplyDefaults()
-
-	hubM, err := New(hubCfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = hubM.Close() })
-
-	// hub.Addr() returns "127.0.0.1:PORT"; translate to "localhost:PORT" so that
-	// TLS hostname verification passes against the DNS SAN "localhost".
-	boundAddr := hubM.HubAddr()
-	require.NotEmpty(t, boundAddr, "hub must be listening")
-	_, port, err := net.SplitHostPort(boundAddr)
-	require.NoError(t, err)
-	hubAddr := net.JoinHostPort("localhost", port)
-
-	// Client Messenger.
-	clientDir := filepath.Join(dir, "client-data")
-	clientCfg := &Config{
-		Name: "test-client",
-		Storage: StorageConfig{
-			DataDir: clientDir,
-		},
-		Client: ClientConfig{
-			Enabled: true,
-			Hubs:    []ClientHubRef{{Addr: hubAddr, Publish: []string{"orders"}}},
-		},
-		TLS: TLSConfig{
-			Cert: writePEM("client.crt", clientCert),
-			Key:  writePEM("client.key", clientKey),
-			CA:   caFile,
-		},
-	}
-	clientCfg.ApplyDefaults()
-
-	clientM, err := New(clientCfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = clientM.Close() })
-
-	// Subscribe on the hub for the "orders" channel.
-	received := make(chan Message, 1)
-	require.NoError(t, hubM.Subscribe(context.Background(), "orders", "hub-sub",
-		func(_ context.Context, msg Message) error {
-			received <- msg
-			return nil
-		}))
-
-	// Publish from the client.
-	require.NoError(t, clientM.Publish(context.Background(), "orders", "test.Order",
-		map[string]any{"id": "xyz"}))
-
-	select {
-	case msg := <-received:
-		assert.Equal(t, "orders", msg.Channel)
-		assert.Equal(t, "test-client", msg.Origin)
-	case <-time.After(2 * time.Second):
-		t.Fatal("hub subscriber did not receive message from client within 2s")
 	}
 }
 

@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"google.golang.org/grpc/metadata"
+
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/dedup"
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -29,12 +31,11 @@ var (
 type EphemeralClientConfig struct {
 	// InstanceName identifies this client to the hub (must match TLS CN).
 	InstanceName string
-	// TLSConfig is the mTLS configuration. nil means plain-text ws://.
+	// TLSConfig is the mTLS configuration. nil means plain-text gRPC.
 	TLSConfig *tls.Config
 	// Subscribe is the list of channels to receive from the hub.
-	// Sent in the handshake; the hub may deliver a subset per its policy.
 	Subscribe []string
-	// MaxBatchBytes is the max WebSocket frame payload size. Default: 4194304 (4 MiB). Set to 0 to disable.
+	// MaxBatchBytes is the max record size. Default: 4194304 (4 MiB). Set to 0 to disable.
 	MaxBatchBytes int
 	// WriteQueueSize is the outbound buffer depth. Default: 256.
 	WriteQueueSize int
@@ -73,9 +74,11 @@ type EphemeralClient struct {
 	// across reconnects so that ConnectWithReconnect can resume delivery.
 	writeQ chan ephemeralWriteItem
 
-	stop     chan struct{}
-	stopOnce sync.Once
-	wg       sync.WaitGroup
+	stop       chan struct{}
+	stopOnce   sync.Once
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	wg         sync.WaitGroup
 }
 
 // ephemeralWriteItem is a pending Publish request waiting for a hub ack.
@@ -89,7 +92,7 @@ type ephemeralWriteItem struct {
 // ConnectWithReconnect to dial the hub.
 func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient {
 	if cfg.MaxBatchBytes == 0 {
-		cfg.MaxBatchBytes = 4 * 1024 * 1024 // 4 MiB
+		cfg.MaxBatchBytes = 4 * 1024 * 1024
 	}
 	if cfg.WriteQueueSize == 0 {
 		cfg.WriteQueueSize = 256
@@ -103,6 +106,7 @@ func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient 
 	if cfg.ReconnectJitter == 0 {
 		cfg.ReconnectJitter = 0.2
 	}
+	baseCtx, baseCancel := context.WithCancel(context.Background()) //nolint:gosec // cancel stored in struct and called in Close()
 	return &EphemeralClient{
 		instanceName:    cfg.InstanceName,
 		tlsCfg:          cfg.TLSConfig,
@@ -115,12 +119,13 @@ func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient 
 		handlers:        make(map[string][]func(*envelope.Envelope) error),
 		writeQ:          make(chan ephemeralWriteItem, cfg.WriteQueueSize),
 		stop:            make(chan struct{}),
+		baseCtx:         baseCtx,
+		baseCancel:      baseCancel,
 	}
 }
 
 // AddHandler registers fn to be called for inbound messages on channel.
-// Thread-safe; may be called before or after Connect. Only channels listed in
-// EphemeralClientConfig.Subscribe will receive messages from the hub.
+// Thread-safe; may be called before or after Connect.
 func (c *EphemeralClient) AddHandler(channel string, fn func(*envelope.Envelope) error) {
 	c.handlersMu.Lock()
 	defer c.handlersMu.Unlock()
@@ -128,16 +133,12 @@ func (c *EphemeralClient) AddHandler(channel string, fn func(*envelope.Envelope)
 }
 
 // Connect dials hubAddr once and starts the background goroutines.
-// Returns after the connection is established. Disconnection is detected via
-// subsequent Publish calls returning ErrEphemeralConnLost.
 func (c *EphemeralClient) Connect(ctx context.Context, hubAddr string) error {
 	_, err := c.startConn(ctx, hubAddr)
 	return err
 }
 
 // ConnectWithReconnect dials hubAddr and starts an auto-reconnect loop.
-// Returns after the first successful connection; subsequent reconnects happen
-// in the background until Close is called.
 func (c *EphemeralClient) ConnectWithReconnect(ctx context.Context, hubAddr string) error {
 	connLost, err := c.startConn(ctx, hubAddr)
 	if err != nil {
@@ -150,8 +151,6 @@ func (c *EphemeralClient) ConnectWithReconnect(ctx context.Context, hubAddr stri
 }
 
 // Publish sends env to the hub and blocks until the hub acks or ctx is done.
-// Returns nil on success, ErrEphemeralConnLost if the connection drops first,
-// or a wrapped ctx.Err() if the context is cancelled.
 func (c *EphemeralClient) Publish(ctx context.Context, env *envelope.Envelope) error {
 	item := ephemeralWriteItem{env: env, doneCh: make(chan error, 1)}
 	select {
@@ -171,96 +170,123 @@ func (c *EphemeralClient) Publish(ctx context.Context, env *envelope.Envelope) e
 	}
 }
 
-// Close stops all background goroutines and closes the current connection.
-// Pending Publish calls receive ErrEphemeralClosed. Safe to call more than once.
+// Close stops all background goroutines. Safe to call more than once.
 func (c *EphemeralClient) Close() {
-	c.stopOnce.Do(func() { close(c.stop) })
+	c.stopOnce.Do(func() {
+		close(c.stop)
+		c.baseCancel() // cancel all active gRPC stream contexts to unblock blocked Recv calls
+	})
 	c.wg.Wait()
 }
 
-// startConn dials hubAddr, completes the ephemeral handshake, and starts the
-// per-connection goroutines. Returns a channel closed when the connection is lost.
+// startConn dials hubAddr, opens Publish (and optionally Subscribe) gRPC streams,
+// and starts per-connection goroutines. Returns a channel closed when the
+// connection is lost.
 func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, error) {
-	dialer := websocket.Dialer{TLSClientConfig: c.tlsCfg}
-	wsURL := "wss://" + hubAddr
-	if c.tlsCfg == nil {
-		wsURL = "ws://" + hubAddr
-	}
-	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
+	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg)
 	if err != nil {
-		// If context was cancelled, return context.Canceled to maintain error chain semantics
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		return nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
+	}
+
+	stub := federationv1.NewFederationServiceClient(grpcConn)
+	outMD := metadata.Pairs("x-federation-instance", c.instanceName)
+
+	// Propagate caller context cancellation (e.g. timeout, early cancel).
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// connCtx is derived from baseCtx so Close() → baseCancel() terminates streams.
+	// A goroutine bridges ctx → connCtx so the caller's deadline/cancel is respected too.
+	connCtx, connCancel := context.WithCancel(c.baseCtx)
+	go func() {
+		select {
+		case <-ctx.Done():
+			connCancel()
+		case <-connCtx.Done():
 		}
-		return nil, fmt.Errorf("ephemeral: dial %s: %w", hubAddr, err)
+	}()
+
+	// Open the Publish stream.
+	pubStream, err := stub.Publish(metadata.NewOutgoingContext(connCtx, outMD))
+	if err != nil {
+		connCancel()
+		_ = grpcConn.Close()
+		return nil, fmt.Errorf("ephemeral: open publish stream %s: %w", hubAddr, err)
 	}
 
-	if err := SendHandshake(conn, HandshakeMsg{
-		InstanceName: c.instanceName,
-		Role:         "client",
-		Version:      wireVersion,
-		Subscribe:    c.subscribe,
-		Ephemeral:    true,
-	}); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("ephemeral: send handshake: %w", err)
-	}
-	if _, err := ReceiveHandshake(conn); err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("ephemeral: receive handshake: %w", err)
-	}
+	// ackCh carries PublishAck messages from the Publish stream to writeLoop.
+	ackCh := make(chan *federationv1.PublishAck, 4)
 
-	// ackCh: PeerReceiver routes text-frame acks (from the hub's PeerReceiver
-	// acknowledging our published messages) here so the write goroutine can
-	// unblock waiting Publish callers.
-	ackCh := make(chan AckMsg, 4)
-
-	connWriteMu := &sync.Mutex{}     // shared mutex for protecting concurrent writes to conn
-	dd, _ := dedup.NewLRUDedup(1024) // small dedup for defense-in-depth
-	receiver := newPeerReceiverWithAck(
-		conn,
-		connWriteMu,
-		nil, // nil policy → accept all channels forwarded by the hub
-		dd,
-		c.dispatchEnvelope,
-		noopAuditLogger{},
-		c.log,
-		hubAddr,
-		c.maxBatchBytes,
-		ackCh,
-	)
-
-	// connDead is closed when the PeerReceiver exits (read error or stop).
-	// The write goroutine selects on it so it exits promptly even when blocked
-	// waiting for new Publish calls rather than waiting for an ack.
+	// connDead is closed when either the Publish stream ends or c.stop fires.
 	connDead := make(chan struct{})
+
+	// Publish-ack reader goroutine: drains PublishAck messages from pubStream
+	// and forwards them to ackCh. Closes connDead when the stream ends.
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		select {
-		case <-receiver.Done():
-		case <-c.stop:
+		defer close(connDead)
+		defer connCancel()
+		defer func() { _ = grpcConn.Close() }()
+		for {
+			ack, recvErr := pubStream.Recv()
+			if recvErr != nil {
+				return
+			}
+			select {
+			case ackCh <- ack:
+			case <-c.stop:
+				return
+			}
 		}
-		close(connDead)
-		_ = conn.Close() // unblock any in-progress write; idempotent
-		// Wait for the receiver to fully exit so Close() → wg.Wait() leaves
-		// no dangling PeerReceiver goroutine.
-		<-receiver.Done()
 	}()
+
+	// Start the Subscribe stream if the client has subscriptions.
+	if len(c.subscribe) > 0 {
+		subStream, subErr := stub.Subscribe(metadata.NewOutgoingContext(connCtx, outMD))
+		if subErr == nil {
+			subErr = subStream.Send(&federationv1.SubscribeFrame{
+				Payload: &federationv1.SubscribeFrame_Request{
+					Request: &federationv1.SubscribeRequest{
+						InstanceName: c.instanceName,
+						Version:      wireVersion,
+						Subscribe:    c.subscribe,
+						Ephemeral:    true,
+					},
+				},
+			})
+		}
+		if subErr != nil {
+			c.log.Warn("ephemeral: subscribe stream setup failed", "hub", hubAddr, "err", subErr)
+		} else {
+			dd, _ := dedup.NewLRUDedup(1024)
+			_, subCancel := context.WithCancel(connCtx)
+			recv := NewPeerReceiver(subStream, subCancel, nil, dd, c.dispatchEnvelope,
+				noopAuditLogger{}, c.log, hubAddr, c.maxBatchBytes)
+			c.wg.Add(1)
+			go func() {
+				defer c.wg.Done()
+				select {
+				case <-recv.Done():
+				case <-c.stop:
+					recv.Close()
+				}
+			}()
+		}
+	}
 
 	connLost := make(chan struct{})
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
 		defer close(connLost)
-		c.writeLoop(conn, ackCh, connDead)
+		c.writeLoop(pubStream, ackCh, connDead)
 	}()
 
 	return connLost, nil
 }
 
 // dispatchEnvelope calls all registered handlers for env.Channel in order.
-// Handler errors are logged but do not stop delivery to subsequent handlers.
 func (c *EphemeralClient) dispatchEnvelope(env *envelope.Envelope) error {
 	c.handlersMu.RLock()
 	fns := c.handlers[env.Channel]
@@ -274,11 +300,12 @@ func (c *EphemeralClient) dispatchEnvelope(env *envelope.Envelope) error {
 	return nil
 }
 
-// writeLoop is the outbound write goroutine for a single connection. It drains
-// writeQ, writes batched binary frames, and blocks waiting for each hub ack.
-// All items in a batch are signalled together: nil on ack, ErrEphemeralConnLost
-// on connection loss, or ErrEphemeralClosed on Close.
-func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, connDead <-chan struct{}) {
+// writeLoop is the outbound write goroutine for a single connection.
+func (c *EphemeralClient) writeLoop(
+	pubStream federationv1.FederationService_PublishClient,
+	ackCh <-chan *federationv1.PublishAck,
+	connDead <-chan struct{},
+) {
 	signalAll := func(items []ephemeralWriteItem, err error) {
 		for _, item := range items {
 			select {
@@ -289,7 +316,6 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 	}
 
 	for {
-		// Block until the first item arrives, stop is signalled, or connection dies.
 		var first ephemeralWriteItem
 		select {
 		case <-c.stop:
@@ -300,7 +326,6 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 			first = item
 		}
 
-		// Non-blocking drain: add any additional waiting items to the batch.
 		batch := []ephemeralWriteItem{first}
 	drainQ:
 		for {
@@ -312,8 +337,6 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 			}
 		}
 
-		// Marshal each envelope. Items that fail to marshal are signalled with
-		// an error immediately and excluded from the wire frame.
 		var validBatch []ephemeralWriteItem
 		records := make([][]byte, 0, len(batch))
 		for _, item := range batch {
@@ -334,24 +357,11 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 			continue
 		}
 
-		// Write one binary WebSocket frame containing all records in the batch.
-		w, err := conn.NextWriter(websocket.BinaryMessage)
-		if err != nil {
-			signalAll(batch, ErrEphemeralConnLost)
-			return
-		}
-		if err := WriteFrame(w, records); err != nil {
-			_ = w.Close()
-			signalAll(batch, ErrEphemeralConnLost)
-			return
-		}
-		if err := w.Close(); err != nil {
+		if sendErr := pubStream.Send(&federationv1.PublishBatch{Records: records}); sendErr != nil {
 			signalAll(batch, ErrEphemeralConnLost)
 			return
 		}
 
-		// Wait for the hub's text-frame ack, routed here via ackCh by PeerReceiver.
-		// The hub acks the entire batch; all waiting callers in the batch are unblocked.
 		select {
 		case <-c.stop:
 			signalAll(batch, ErrEphemeralClosed)
@@ -369,9 +379,7 @@ func (c *EphemeralClient) writeLoop(conn *websocket.Conn, ackCh <-chan AckMsg, c
 	}
 }
 
-// reconnectLoop watches connLost and redials hubAddr with exponential backoff
-// until Close is called. It runs as a background goroutine started by
-// ConnectWithReconnect.
+// reconnectLoop watches connLost and redials hubAddr with exponential backoff.
 func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}) {
 	defer c.wg.Done()
 	backoff := c.reconnectBase
@@ -412,7 +420,6 @@ func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}
 }
 
 // noopAuditLogger satisfies audit.AuditLogger by discarding all events.
-// EphemeralClient has no audit log file.
 type noopAuditLogger struct{}
 
 func (noopAuditLogger) Log(audit.Event) error { return nil }

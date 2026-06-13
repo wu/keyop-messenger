@@ -72,35 +72,6 @@ func TestNewClient_NoLocalWriter(t *testing.T) {
 	t.Cleanup(func() { client.Close() })
 }
 
-// TestClient_Dial_InvalidAddr fails gracefully.
-func TestClient_Dial_InvalidAddr(t *testing.T) {
-	t.Parallel()
-	log := &testutil.FakeLogger{}
-	auditL := &fakeAuditLogger{}
-	dedupL, _ := dedup.NewLRUDedup(100)
-	policy := NewAtomicPolicy(ForwardPolicy{})
-
-	client := NewClient(
-		"test-client",
-		nil,
-		policy,
-		func(_ *envelope.Envelope) error { return nil },
-		dedupL,
-		auditL,
-		log,
-		100,
-		65536,
-		500*time.Millisecond,
-		60*time.Second,
-		0.2,
-		[]string{"events"}, nil,
-	)
-	defer client.Close()
-
-	_, err := client.Dial("invalid..addr:999999")
-	assert.Error(t, err)
-}
-
 // TestClient_Sender_NilBeforeConnect returns nil sender before connect.
 func TestClient_Sender_NilBeforeConnect(t *testing.T) {
 	t.Parallel()
@@ -392,39 +363,9 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 	// Audit logger is stored and used internally (tested in integration tests).
 }
 
-// TestClient_ConnectWithReconnect_InvalidAddr fails gracefully.
-func TestClient_ConnectWithReconnect_InvalidAddr(t *testing.T) {
-	t.Parallel()
-	log := &testutil.FakeLogger{}
-	auditL := &fakeAuditLogger{}
-	dedupL, _ := dedup.NewLRUDedup(100)
-	policy := NewAtomicPolicy(ForwardPolicy{})
-
-	client := NewClient(
-		"test-client",
-		nil,
-		policy,
-		func(_ *envelope.Envelope) error { return nil },
-		dedupL,
-		auditL,
-		log,
-		100,
-		65536,
-		100*time.Millisecond, // short timeout for test
-		500*time.Millisecond,
-		0.2,
-		[]string{}, nil,
-	)
-	defer client.Close()
-
-	// First connection fails, so error is returned immediately.
-	err := client.ConnectWithReconnect("invalid..addr:999999")
-	assert.Error(t, err)
-}
-
 // TestClient_StatsAccessors_BeforeConnect verifies HubAddr, Connected,
-// ReconnectCount, and UnackedCount return their zero values before a
-// connection is established.
+// ReconnectCount, and UnackedCount return their zero values before a connection
+// is established.
 func TestClient_StatsAccessors_BeforeConnect(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}

@@ -1,17 +1,27 @@
 package federation
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"net"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
+
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
@@ -39,26 +49,19 @@ type logger interface {
 
 const wireVersion = "1"
 
-// peerEntry tracks an active peer connection on the hub.
-type peerEntry struct {
-	name        string
-	receiver    *PeerReceiver
-	coordinator *clientCoordinator // non-nil when peer has subscriptions
-	policy      *AtomicPolicy
-	conn        *websocket.Conn
-	connWriteMu *sync.Mutex
-}
-
-// Hub accepts incoming WebSocket connections and enforces the allowlist and
-// receive policy. Hub-to-peer delivery uses a file-reader pull model: one
-// channelReader goroutine per (peer, channel) reads segment files and delivers
-// batches via a clientCoordinator, writing per-peer byte offsets to
+// Hub accepts incoming gRPC connections and enforces the allowlist and receive
+// policy. Hub-to-peer delivery uses a file-reader pull model: one channelReader
+// goroutine per (peer, channel) reads segment files and delivers batches via a
+// clientCoordinator, writing per-peer byte offsets to
 //
 //	{dataDir}/subscribers/{channel}/fed-{peerName}.offset
 //
-// The compactor automatically includes federation peers in compaction boundary
-// calculations because it reads all files in subscribers/{channel}/.
+// Hub implements FederationServiceServer: the Publish RPC handles inbound
+// publishes from clients, and the Subscribe RPC handles outbound delivery to
+// subscribing clients.
 type Hub struct {
+	federationv1.UnimplementedFederationServiceServer
+
 	instanceName       string
 	tlsCfg             *tls.Config
 	localWriter        func(*envelope.Envelope) error
@@ -70,19 +73,19 @@ type Hub struct {
 	dataDir            string
 	fedClientOffsetTTL time.Duration
 
-	mu       sync.RWMutex
-	cfg      HubConfig
-	peers    map[string]*peerEntry
-	listener net.Listener
-	httpSrv  *http.Server
+	mu      sync.RWMutex
+	cfg     HubConfig
+	grpcSrv *grpc.Server
+	lis     net.Listener
 
 	// notifyMu protects notifyRegistry; use RLock for reads (NotifyChannel),
-	// Lock for writes (serveConn register/deregister).
+	// Lock for writes (Subscribe handler register/deregister).
 	notifyMu       sync.RWMutex
 	notifyRegistry map[string][]*channelReader // channel → readers for that channel
 
-	stop chan struct{}
-	wg   sync.WaitGroup
+	stop      chan struct{}
+	wg        sync.WaitGroup // Serve goroutine + TTL sweep
+	handlerWg sync.WaitGroup // active Publish/Subscribe RPC handler goroutines
 }
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
@@ -108,38 +111,55 @@ func NewHub(
 		sendBufSize:    sendBufSize,
 		maxBatchBytes:  maxBatchBytes,
 		dataDir:        dataDir,
-		peers:          make(map[string]*peerEntry),
 		notifyRegistry: make(map[string][]*channelReader),
 		stop:           make(chan struct{}),
 	}
 }
 
-var hubUpgrader = websocket.Upgrader{
-	CheckOrigin: func(*http.Request) bool { return true },
+// SetFedClientOffsetTTL configures the TTL for disconnected federation client
+// offset files. Must be called before Listen.
+func (h *Hub) SetFedClientOffsetTTL(ttl time.Duration) {
+	h.fedClientOffsetTTL = ttl
 }
 
-// Listen starts a TLS-wrapped HTTP/WebSocket listener on addr and returns
-// immediately; connections are served in background goroutines.
+// newGRPCServer creates a configured gRPC server and registers the hub on it.
+func (h *Hub) newGRPCServer() *grpc.Server {
+	var opts []grpc.ServerOption
+	if h.tlsCfg != nil {
+		opts = append(opts, grpc.Creds(credentials.NewTLS(h.tlsCfg)))
+	}
+	opts = append(opts, grpc.KeepaliveParams(keepalive.ServerParameters{
+		MaxConnectionIdle: 5 * time.Minute,
+		Time:              30 * time.Second,
+		Timeout:           10 * time.Second,
+	}))
+	srv := grpc.NewServer(opts...)
+	federationv1.RegisterFederationServiceServer(srv, h)
+	return srv
+}
+
+// Listen starts a gRPC listener on addr and returns immediately.
 func (h *Hub) Listen(addr string) error {
-	ln, err := tls.Listen("tcp", addr, h.tlsCfg)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("federation: hub listen %s: %w", addr, err)
 	}
-	srv := &http.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			conn, err := hubUpgrader.Upgrade(w, r, nil)
-			if err != nil {
-				h.log.Error("federation: hub ws upgrade", "err", err)
-				return
-			}
-			tlsState := r.TLS
-			h.serveConn(conn, tlsState)
-		}),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	h.serveOn(ln)
+	return nil
+}
+
+// ServeOn registers the gRPC server on lis and starts background goroutines.
+// Use in tests with a custom listener (e.g. bufconn).
+func (h *Hub) ServeOn(lis net.Listener) {
+	h.serveOn(lis)
+}
+
+func (h *Hub) serveOn(lis net.Listener) {
+	grpcSrv := h.newGRPCServer()
+
 	h.mu.Lock()
-	h.listener = ln
-	h.httpSrv = srv
+	h.lis = lis
+	h.grpcSrv = grpcSrv
 	h.mu.Unlock()
 
 	if h.fedClientOffsetTTL > 0 && h.dataDir != "" {
@@ -153,32 +173,18 @@ func (h *Hub) Listen(addr string) error {
 	h.wg.Add(1)
 	go func() {
 		defer h.wg.Done()
-		_ = srv.Serve(ln)
+		_ = grpcSrv.Serve(lis)
 	}()
-	return nil
-}
-
-// SetFedClientOffsetTTL configures the TTL for disconnected federation client
-// offset files. Must be called before Listen. A zero or negative value disables
-// the sweep.
-func (h *Hub) SetFedClientOffsetTTL(ttl time.Duration) {
-	h.fedClientOffsetTTL = ttl
-}
-
-// ServeTestConn is the same as the internal serveConn; exported so tests can
-// inject pre-dialed websocket connections without a real TLS listener.
-func (h *Hub) ServeTestConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
-	go h.serveConn(conn, tlsState)
 }
 
 // Addr returns the listener address, or empty string if not listening.
 func (h *Hub) Addr() string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	if h.listener == nil {
+	if h.lis == nil {
 		return ""
 	}
-	return h.listener.Addr().String()
+	return h.lis.Addr().String()
 }
 
 // NotifyChannel wakes all channelReader goroutines registered for channel.
@@ -191,192 +197,310 @@ func (h *Hub) NotifyChannel(channel string) {
 	}
 }
 
-// Close stops the listener and all active peer connections.
+// Close stops the listener and all active peer connections, then waits for
+// all in-flight handler goroutines to finish.
 func (h *Hub) Close() error {
 	close(h.stop)
 	h.mu.Lock()
-	if h.httpSrv != nil {
-		_ = h.httpSrv.Close()
-	}
-	for _, entry := range h.peers {
-		_ = entry.conn.Close()
+	if h.grpcSrv != nil {
+		h.grpcSrv.Stop()
 	}
 	h.mu.Unlock()
-	h.wg.Wait()
+	h.wg.Wait()        // Serve goroutine + TTL sweep
+	h.handlerWg.Wait() // Publish + Subscribe handler goroutines
 	return nil
 }
 
-// serveConn handles one incoming WebSocket connection: receives the peer
-// handshake, checks the allowlist, sends the hub handshake if allowed, then
-// starts the receiver and (if the peer has subscriptions) a clientCoordinator.
-func (h *Hub) serveConn(conn *websocket.Conn, tlsState *tls.ConnectionState) {
-	// Receive peer handshake first so we know its identity.
-	hs, err := ReceiveHandshake(conn)
+// peerNameFromContext extracts the peer instance name from gRPC metadata,
+// overriding with the TLS certificate CN when mTLS is in use.
+func (h *Hub) peerNameFromContext(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", errors.New("missing gRPC metadata")
+	}
+	vals := md.Get("x-federation-instance")
+	if len(vals) == 0 {
+		return "", errors.New("missing x-federation-instance metadata")
+	}
+	peerName := vals[0]
+
+	// Override with TLS cert CN when mTLS is in use (tamper-proof).
+	if p, ok := peer.FromContext(ctx); ok {
+		if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok {
+			if len(tlsInfo.State.PeerCertificates) > 0 {
+				peerName = tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0])
+			}
+		}
+	}
+	return peerName, nil
+}
+
+// peerAddrFromContext extracts the remote address string from gRPC peer info.
+func peerAddrFromContext(ctx context.Context) string {
+	if p, ok := peer.FromContext(ctx); ok {
+		return p.Addr.String()
+	}
+	return "unknown"
+}
+
+// Publish implements FederationServiceServer. It receives envelope batches from
+// a client, deduplicates, enforces the publish policy, writes to local storage,
+// and sends a PublishAck after each batch.
+func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+	h.handlerWg.Add(1)
+	defer h.handlerWg.Done()
+
+	peerName, err := h.peerNameFromContext(stream.Context())
 	if err != nil {
-		h.log.Error("federation: hub receive handshake", "err", err)
-		_ = conn.Close()
-		return
+		return status.Errorf(codes.InvalidArgument, "federation: %v", err)
 	}
 
-	// Extract instance name: prefer TLS CN (tamper-proof) over handshake field.
-	peerName := hs.InstanceName
-	if tlsState != nil && len(tlsState.PeerCertificates) > 0 {
-		peerName = tlsutil.ExtractCN(tlsState.PeerCertificates[0])
-	}
-
-	// Allowlist check before sending any response.
 	h.mu.RLock()
 	cfg := h.cfg
 	h.mu.RUnlock()
 
 	if !cfg.IsPeerAllowed(peerName) {
-		_ = conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(4403, "not in allowlist"))
-		_ = conn.Close()
 		_ = h.auditL.Log(audit.Event{Event: audit.EventClientRejected, Peer: peerName})
-		h.log.Warn("federation: hub rejected connection", "peer", peerName)
-		return
+		h.log.Warn("federation: hub rejected publish connection", "peer", peerName)
+		return status.Errorf(codes.PermissionDenied, "not in allowlist")
 	}
 
-	// Send hub handshake.
-	if err := SendHandshake(conn, HandshakeMsg{
-		InstanceName: h.instanceName,
-		Role:         "hub",
-		Version:      wireVersion,
-	}); err != nil {
-		h.log.Error("federation: hub send handshake", "err", err)
-		_ = conn.Close()
-		return
-	}
-
-	// Compute effective channels: intersection of peer's Subscribe request and
-	// the hub's per-peer allowlist.
-	subChannels := effectiveSubscribeChannels(hs.Subscribe, peerName, cfg)
 	pubChannels := publishChannelsFor(peerName, cfg)
-	policy := NewAtomicPolicy(ForwardPolicy{
-		Forward: subChannels,
-		Receive: pubChannels,
-	})
-
-	connWriteMu := &sync.Mutex{}
-
-	// Set up inbound receiver. When the peer also subscribes, the receiver owns
-	// all reads and routes text-frame acks to the coordinator via ackCh.
-	var receiver *PeerReceiver
-	var coordinator *clientCoordinator
-
-	if len(subChannels) > 0 && h.dataDir != "" {
-		ackCh := make(chan AckMsg, 4)
-		receiver = newPeerReceiverWithAck(conn, connWriteMu, policy, h.dedup, h.localWriter,
-			h.auditL, h.log, peerName, h.maxBatchBytes, ackCh)
-
-		readers, err := h.buildChannelReaders(peerName, subChannels, ackCh, connWriteMu, conn)
-		if err != nil {
-			h.log.Error("federation: hub build channel readers", "peer", peerName, "err", err)
-			_ = conn.Close()
-			return
-		}
-		coordinator = readers
-		coordinator.start()
-
-		// Register channel readers into the notify registry.
-		h.notifyMu.Lock()
-		for _, r := range coordinator.readers {
-			h.notifyRegistry[r.channel] = append(h.notifyRegistry[r.channel], r)
-		}
-		h.notifyMu.Unlock()
-	} else {
-		// No subscriptions: only receive inbound messages from the peer.
-		receiver = NewPeerReceiver(conn, connWriteMu, policy, h.dedup, h.localWriter,
-			h.auditL, h.log, peerName, h.maxBatchBytes)
-	}
-
-	entry := &peerEntry{
-		name:        peerName,
-		receiver:    receiver,
-		coordinator: coordinator,
-		policy:      policy,
-		conn:        conn,
-		connWriteMu: connWriteMu,
-	}
-
-	peerAddr := conn.RemoteAddr().String()
-	connectedAt := time.Now()
-
-	h.mu.Lock()
-	h.peers[peerName] = entry
-	h.mu.Unlock()
+	policy := NewAtomicPolicy(ForwardPolicy{Receive: pubChannels})
+	peerAddr := peerAddrFromContext(stream.Context())
 
 	_ = h.auditL.Log(audit.Event{
 		Event:    audit.EventClientConnected,
 		Peer:     peerName,
 		PeerAddr: peerAddr,
-		Detail:   connDetail(peerAddr, subChannels, pubChannels),
+		Detail:   connDetail(peerAddr, nil, pubChannels),
 	})
-	if hs.Ephemeral {
-		h.log.Info("federation: hub accepted ephemeral connection", "peer", peerName, "addr", peerAddr)
-	} else {
-		h.log.Info("federation: hub accepted connection", "peer", peerName, "addr", peerAddr)
+	h.log.Info("federation: hub accepted publish connection", "peer", peerName, "addr", peerAddr)
+
+	connectedAt := time.Now()
+	var lastErr error
+
+	for {
+		batch, recvErr := stream.Recv()
+		if recvErr != nil {
+			if !errors.Is(recvErr, io.EOF) {
+				lastErr = recvErr
+			}
+			break
+		}
+
+		var lastID string
+		for _, rec := range batch.Records {
+			env, uErr := envelope.Unmarshal(rec)
+			if uErr != nil {
+				h.log.Error("federation: hub unmarshal", "peer", peerName, "err", uErr)
+				continue
+			}
+
+			if h.dedup.SeenOrAdd(env.ID) {
+				continue
+			}
+
+			if !policy.AllowReceive(env.Channel) {
+				h.log.Warn("federation: receive policy violation",
+					"channel", env.Channel, "peer", peerName, "id", env.ID)
+				_ = h.auditL.Log(audit.Event{
+					Event:     audit.EventPolicyViolation,
+					Channel:   env.Channel,
+					Peer:      peerName,
+					Direction: "inbound",
+					MessageID: env.ID,
+				})
+				lastID = env.ID
+				continue
+			}
+
+			envCopy := env
+			if wErr := h.localWriter(&envCopy); wErr != nil {
+				h.log.Error("federation: hub local write", "id", env.ID, "err", wErr, "channel", env.Channel)
+				lastID = env.ID
+				continue
+			}
+
+			_ = h.auditL.Log(audit.Event{
+				Event:     audit.EventForward,
+				MessageID: env.ID,
+				Channel:   env.Channel,
+				Peer:      peerName,
+				Direction: "inbound",
+			})
+			lastID = env.ID
+		}
+
+		if sendErr := stream.Send(&federationv1.PublishAck{LastId: lastID}); sendErr != nil {
+			lastErr = sendErr
+			break
+		}
 	}
 
-	// Wait for receiver to finish, then clean up.
-	h.wg.Add(1)
-	go func() {
-		defer h.wg.Done()
-		<-receiver.Done()
+	duration := time.Since(connectedAt).Round(time.Millisecond)
+	detail := "duration=" + duration.String()
+	if lastErr != nil {
+		detail += " err=" + lastErr.Error()
+	}
+	_ = h.auditL.Log(audit.Event{
+		Event:    audit.EventPeerDisconnected,
+		Peer:     peerName,
+		PeerAddr: peerAddr,
+		Detail:   detail,
+	})
 
-		// Deregister channel readers from the notify registry.
-		if coordinator != nil {
-			h.notifyMu.Lock()
-			for _, r := range coordinator.readers {
-				readers := h.notifyRegistry[r.channel]
-				for i, rr := range readers {
-					if rr == r {
-						h.notifyRegistry[r.channel] = append(readers[:i], readers[i+1:]...)
-						break
-					}
-				}
-				if len(h.notifyRegistry[r.channel]) == 0 {
-					delete(h.notifyRegistry, r.channel)
+	return nil
+}
+
+// Subscribe implements FederationServiceServer. It reads the initial
+// SubscribeRequest, validates the peer, starts channelReaders for each
+// subscribed channel, and streams EnvelopeBatch messages to the client.
+// Acks from the client are routed to the clientCoordinator via an internal channel.
+func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+	h.handlerWg.Add(1)
+	defer h.handlerWg.Done()
+
+	// First frame must be a SubscribeRequest.
+	frame, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	req := frame.GetRequest()
+	if req == nil {
+		return status.Error(codes.InvalidArgument, "first frame must be SubscribeRequest")
+	}
+
+	peerName := req.InstanceName
+	// Override with TLS cert CN when mTLS is in use.
+	if p, ok := peer.FromContext(stream.Context()); ok {
+		if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok {
+			if len(tlsInfo.State.PeerCertificates) > 0 {
+				peerName = tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0])
+			}
+		}
+	}
+
+	h.mu.RLock()
+	cfg := h.cfg
+	h.mu.RUnlock()
+
+	if !cfg.IsPeerAllowed(peerName) {
+		_ = h.auditL.Log(audit.Event{Event: audit.EventClientRejected, Peer: peerName})
+		h.log.Warn("federation: hub rejected subscribe connection", "peer", peerName)
+		return status.Errorf(codes.PermissionDenied, "not in allowlist")
+	}
+
+	subChannels := effectiveSubscribeChannels(req.Subscribe, peerName, cfg)
+	if len(subChannels) == 0 || h.dataDir == "" {
+		// No effective subscriptions: nothing to deliver, return immediately.
+		return nil
+	}
+
+	peerAddr := peerAddrFromContext(stream.Context())
+
+	// ackCh is written by the ack-reader goroutine (below) and read by the coordinator.
+	ackCh := make(chan struct{}, 4)
+
+	readers, err := h.buildChannelReaders(peerName, subChannels, ackCh, stream)
+	if err != nil {
+		h.log.Error("federation: hub build channel readers", "peer", peerName, "err", err)
+		return status.Errorf(codes.Internal, "build channel readers: %v", err)
+	}
+
+	coordinator := readers
+	coordinator.start()
+
+	// Register channelReaders into the notify registry.
+	h.notifyMu.Lock()
+	for _, r := range coordinator.readers {
+		h.notifyRegistry[r.channel] = append(h.notifyRegistry[r.channel], r)
+	}
+	h.notifyMu.Unlock()
+
+	_ = h.auditL.Log(audit.Event{
+		Event:    audit.EventClientConnected,
+		Peer:     peerName,
+		PeerAddr: peerAddr,
+		Detail:   connDetail(peerAddr, subChannels, nil),
+	})
+	if req.Ephemeral {
+		h.log.Info("federation: hub accepted ephemeral subscribe", "peer", peerName, "addr", peerAddr)
+	} else {
+		h.log.Info("federation: hub accepted subscribe connection", "peer", peerName, "addr", peerAddr)
+	}
+
+	connectedAt := time.Now()
+
+	// Ack-reader goroutine: owns all reads on the Subscribe server stream.
+	// Forwards acks to the coordinator; closes ackCh when the stream ends.
+	ackRecvDone := make(chan struct{})
+	go func() {
+		defer close(ackRecvDone)
+		defer close(ackCh)
+		for {
+			f, recvErr := stream.Recv()
+			if recvErr != nil {
+				return // stream ended (EOF, cancelled, or error)
+			}
+			if f.GetAck() != nil {
+				select {
+				case ackCh <- struct{}{}:
+				default:
 				}
 			}
-			h.notifyMu.Unlock()
-			coordinator.close()
 		}
-
-		h.mu.Lock()
-		delete(h.peers, peerName)
-		h.mu.Unlock()
-
-		duration := time.Since(connectedAt).Round(time.Millisecond)
-		detail := "duration=" + duration.String()
-		if err := receiver.Err(); err != nil {
-			detail += " err=" + err.Error()
-		}
-		_ = h.auditL.Log(audit.Event{
-			Event:    audit.EventPeerDisconnected,
-			Peer:     peerName,
-			PeerAddr: peerAddr,
-			Detail:   detail,
-		})
 	}()
+
+	// Block until the coordinator exits (connection lost or hub is stopping).
+	<-coordinator.done
+
+	// Deregister channelReaders from the notify registry.
+	h.notifyMu.Lock()
+	for _, r := range coordinator.readers {
+		readers := h.notifyRegistry[r.channel]
+		for i, rr := range readers {
+			if rr == r {
+				h.notifyRegistry[r.channel] = append(readers[:i], readers[i+1:]...)
+				break
+			}
+		}
+		if len(h.notifyRegistry[r.channel]) == 0 {
+			delete(h.notifyRegistry, r.channel)
+		}
+	}
+	h.notifyMu.Unlock()
+
+	coordinator.close()
+
+	duration := time.Since(connectedAt).Round(time.Millisecond)
+	_ = h.auditL.Log(audit.Event{
+		Event:    audit.EventPeerDisconnected,
+		Peer:     peerName,
+		PeerAddr: peerAddr,
+		Detail:   "duration=" + duration.String(),
+	})
+
+	// Wait for the ack-reader goroutine to exit before returning so that gRPC
+	// can cleanly terminate the stream without dangling goroutines.
+	<-ackRecvDone
+
+	return nil
 }
 
 // buildChannelReaders creates a clientCoordinator with one channelReader per
-// subscribed channel. The coordinator's requestCh is wired into all readers.
+// subscribed channel.
 func (h *Hub) buildChannelReaders(
 	peerName string,
 	subChannels []string,
-	ackCh <-chan AckMsg,
-	connWriteMu *sync.Mutex,
-	conn *websocket.Conn,
+	ackCh <-chan struct{},
+	stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch],
 ) (*clientCoordinator, error) {
 	var readers []*channelReader
 	for _, ch := range subChannels {
 		channelDir := filepath.Join(h.dataDir, "channels", ch)
 		offsetDir := filepath.Join(h.dataDir, "subscribers", ch)
 
-		// Placeholder requestCh; newClientCoordinator will replace it.
 		placeholder := make(chan sendReq, 1)
 		r, err := newChannelReader(peerName, ch, channelDir, offsetDir,
 			h.maxBatchBytes, placeholder, h.log)
@@ -386,16 +510,12 @@ func (h *Hub) buildChannelReaders(
 		readers = append(readers, r)
 	}
 
-	cc := newClientCoordinator(conn, connWriteMu, ackCh, h.maxBatchBytes, h.log, readers)
+	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers)
 	return cc, nil
 }
 
 // runTTLSweep periodically deletes fed-*.offset files whose mtime is older
-// than ttl. This prevents stale files from indefinitely blocking compaction
-// for peers that disconnect and never reconnect.
-//
-// The sweep runs hourly (or less if ttl < 1h). It logs each deletion at Info.
-// Exits when h.stop is closed.
+// than ttl. Exits when h.stop is closed.
 func (h *Hub) runTTLSweep(ttl time.Duration) {
 	interval := time.Hour
 	if ttl < interval {

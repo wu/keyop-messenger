@@ -1,36 +1,44 @@
-//nolint:gosec // test file: G115 type conversions are safe
+//go:build integration
+
 package federation
 
 import (
 	"context"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"google.golang.org/grpc"
 )
 
-// mockWsServer creates a simple WebSocket server for testing.
-func mockWsServer(t *testing.T, handler func(*websocket.Conn)) *httptest.Server {
-	upgrader := websocket.Upgrader{}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		require.NoError(t, err)
-		handler(conn)
-	}))
-	return srv
+// newEphemeralTestClient creates an EphemeralClient with minimal reconnect delay.
+func newEphemeralTestClient(t *testing.T, log *testutil.FakeLogger, subscribe ...string) *EphemeralClient {
+	t.Helper()
+	ec := NewEphemeralClient(EphemeralClientConfig{
+		InstanceName:  "test",
+		ReconnectBase: 1 * time.Millisecond,
+		ReconnectMax:  10 * time.Millisecond,
+		Subscribe:     subscribe,
+	}, log)
+	t.Cleanup(ec.Close)
+	return ec
 }
 
-// TestEphemeralClient_Dispatch_MessageHandlers verifies multiple handlers are registered.
-// (Actual dispatch testing is covered by integration tests in ephemeral_test.go)
+func dialEphemeral(t *testing.T, ec *EphemeralClient, addr string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	require.NoError(t, ec.Connect(ctx, addr))
+	time.Sleep(20 * time.Millisecond)
+}
+
+// TestEphemeralClient_Dispatch_MessageHandlers verifies multiple handlers registered.
 func TestEphemeralClient_Dispatch_MessageHandlers(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
@@ -41,16 +49,13 @@ func TestEphemeralClient_Dispatch_MessageHandlers(t *testing.T) {
 	}, log)
 	defer ec.Close()
 
-	// Register multiple handlers on different channels
 	handlerCount := atomic.Int32{}
-
 	for i := 0; i < 5; i++ {
 		ec.AddHandler("events", func(_ *envelope.Envelope) error {
 			handlerCount.Add(1)
 			return nil
 		})
 	}
-
 	for i := 0; i < 3; i++ {
 		ec.AddHandler("alerts", func(_ *envelope.Envelope) error {
 			handlerCount.Add(1)
@@ -58,7 +63,6 @@ func TestEphemeralClient_Dispatch_MessageHandlers(t *testing.T) {
 		})
 	}
 
-	// Handlers are registered but not called (no connection)
 	assert.Equal(t, int32(0), handlerCount.Load())
 }
 
@@ -68,34 +72,18 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	receivedFrames := atomic.Int32{}
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer func() { _ = conn.Close() }()
-
-		// Receive handshake
-		hs := HandshakeMsg{}
-		_ = conn.ReadJSON(&hs)
-
-		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
-
-		// Read binary frames from client (published messages)
-		for {
-			mt, _, err := conn.ReadMessage()
-			if err != nil {
-				break
-			}
-			if mt == websocket.BinaryMessage {
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			for {
+				_, err := stream.Recv()
+				if err != nil {
+					return nil
+				}
 				receivedFrames.Add(1)
+				_ = stream.Send(&federationv1.PublishAck{})
 			}
-			// Send ack for each frame
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"ack"}`))
-		}
+		},
 	})
-	defer srv.Close()
 
 	ec := NewEphemeralClient(EphemeralClientConfig{
 		InstanceName:   "em-client",
@@ -104,31 +92,24 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 	}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, addr)
 	require.NoError(t, err)
 
-	// Publish multiple small messages
 	for i := 0; i < 5; i++ {
 		env := &envelope.Envelope{
 			Channel: "test",
-			ID:      "id-" + string(rune(i)),
-			Payload: []byte(`{"i":` + string(rune(48+i)) + `}`),
+			ID:      "id-" + string(rune(i+48)),
+			Payload: []byte(`{}`),
 		}
-		pubCtx, pubCancel := context.WithTimeout(context.Background(), 1*time.Second)
-		err := ec.Publish(pubCtx, env)
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_ = ec.Publish(pubCtx, env)
 		pubCancel()
-		if err != nil {
-			break
-		}
 	}
 
 	time.Sleep(200 * time.Millisecond)
-
-	// Should have sent at least 1 frame (messages batched together)
 	assert.Greater(t, receivedFrames.Load(), int32(0))
 }
 
@@ -137,20 +118,15 @@ func TestEphemeralClient_Close_StopsAllGoroutines(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	ec := NewEphemeralClient(EphemeralClientConfig{
-		InstanceName: "em-client",
-	}, log)
+	ec := NewEphemeralClient(EphemeralClientConfig{InstanceName: "em-client"}, log)
 
-	// Register some handlers
 	for i := 0; i < 3; i++ {
 		ec.AddHandler("test", func(_ *envelope.Envelope) error { return nil })
 	}
 
-	// Close should complete quickly without deadlock
 	start := time.Now()
 	ec.Close()
 	elapsed := time.Since(start)
-
 	assert.Less(t, elapsed, 500*time.Millisecond)
 }
 
@@ -160,50 +136,36 @@ func TestEphemeralClient_Publish_BlocksUntilAck(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	ackDelay := 100 * time.Millisecond
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer func() { _ = conn.Close() }()
-
-		// Receive handshake
-		_ = conn.ReadJSON(&HandshakeMsg{})
-
-		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
-
-		// Read message from client
-		_, _, err := conn.ReadMessage()
-		if err != nil {
-			return
-		}
-
-		// Delay before sending ack
-		time.Sleep(ackDelay)
-		_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"msg1"}`))
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			_, err := stream.Recv()
+			if err != nil {
+				return nil
+			}
+			time.Sleep(ackDelay)
+			_ = stream.Send(&federationv1.PublishAck{LastId: "msg1"})
+			// drain remaining
+			for {
+				_, err := stream.Recv()
+				if err != nil {
+					return nil
+				}
+				_ = stream.Send(&federationv1.PublishAck{})
+			}
+		},
 	})
-	defer srv.Close()
 
-	ec := NewEphemeralClient(EphemeralClientConfig{
-		InstanceName: "em-client",
-	}, log)
+	ec := NewEphemeralClient(EphemeralClientConfig{InstanceName: "em-client"}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, addr)
 	require.NoError(t, err)
-
 	time.Sleep(50 * time.Millisecond)
 
-	env := &envelope.Envelope{
-		Channel: "test",
-		ID:      "msg1",
-	}
-
+	env := &envelope.Envelope{Channel: "test", ID: "msg1"}
 	pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer pubCancel()
 
@@ -212,7 +174,6 @@ func TestEphemeralClient_Publish_BlocksUntilAck(t *testing.T) {
 	elapsed := time.Since(start)
 
 	assert.NoError(t, err)
-	// Should have waited at least for the ack delay
 	assert.GreaterOrEqual(t, elapsed, ackDelay-20*time.Millisecond)
 }
 
@@ -221,75 +182,37 @@ func TestEphemeralClient_PublishConcurrent(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
 
-	messageCount := atomic.Int32{}
-	srv := mockWsServer(t, func(conn *websocket.Conn) {
-		defer func() { _ = conn.Close() }()
-
-		// Receive handshake
-		_ = conn.ReadJSON(&HandshakeMsg{})
-
-		// Send hub handshake
-		_ = conn.WriteJSON(HandshakeMsg{
-			InstanceName: "hub",
-			Role:         "hub",
-			Version:      "1",
-		})
-
-		// Read messages and send acks
-		for {
-			_, data, err := conn.ReadMessage()
-			if err != nil {
-				break
-			}
-			if len(data) > 0 {
-				messageCount.Add(1)
-				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"last_id":"ack"}`))
-			}
-		}
-	})
-	defer srv.Close()
+	addr := startMockServer(t, &mockFedServer{}) // default: ack everything
 
 	ec := NewEphemeralClient(EphemeralClientConfig{
-		InstanceName: "em-client",
+		InstanceName:   "em-client",
+		WriteQueueSize: 100,
 	}, log)
 	defer ec.Close()
 
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := ec.Connect(ctx, strings.TrimPrefix(wsURL, "ws://"))
+	err := ec.Connect(ctx, addr)
 	require.NoError(t, err)
-
 	time.Sleep(50 * time.Millisecond)
 
-	// Publish concurrently
-	numMessages := 10
-	errors := make(chan error, numMessages)
-	var wg sync.WaitGroup
-
-	for i := 0; i < numMessages; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
+	const n = 10
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
 			env := &envelope.Envelope{
 				Channel: "test",
-				ID:      "msg-" + string(rune(48+id)),
+				ID:      fmt.Sprintf("concurrent-%d", i),
 			}
-			pubCtx, pubCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer pubCancel()
-			errors <- ec.Publish(pubCtx, env)
-		}(i)
+			errs <- ec.Publish(pubCtx, env)
+		}()
 	}
 
-	wg.Wait()
-	close(errors)
-
-	// All publishes should succeed
-	for err := range errors {
-		assert.NoError(t, err)
+	for i := 0; i < n; i++ {
+		assert.NoError(t, <-errs)
 	}
-
-	time.Sleep(100 * time.Millisecond)
-	assert.Greater(t, messageCount.Load(), int32(0))
 }

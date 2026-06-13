@@ -98,14 +98,17 @@ func newClientMessenger(
 	return m
 }
 
-// hubLocalAddr returns "localhost:PORT" for a Messenger hub listener.
+// hubLocalAddr returns "127.0.0.1:PORT" for a Messenger hub listener.
+// Using the IP directly avoids a DNS lookup for "localhost" in gRPC's resolver.
+// Hub certs generated with GenerateInstance("localhost", ...) carry an IP SAN
+// for 127.0.0.1, so TLS verification still passes.
 func hubLocalAddr(t *testing.T, m *Messenger) string {
 	t.Helper()
 	addr := m.HubAddr()
 	require.NotEmpty(t, addr)
 	_, port, err := net.SplitHostPort(addr)
 	require.NoError(t, err)
-	return net.JoinHostPort("localhost", port)
+	return net.JoinHostPort("127.0.0.1", port)
 }
 
 // ---- TestIntegrationHubTwoClients -------------------------------------------
@@ -613,6 +616,95 @@ func TestIntegrationForwardingRespectSubscription(t *testing.T) {
 			msg.Channel, msg)
 	case <-time.After(500 * time.Millisecond):
 		// Correct: ClientB did not receive the message
+	}
+}
+
+// TestFederationEndToEnd publishes on a client Messenger and asserts that a
+// subscriber on the hub Messenger receives the message.
+func TestFederationEndToEnd(t *testing.T) {
+	dir := t.TempDir()
+
+	caCert, caKey, err := tlsutil.GenerateCA(90)
+	require.NoError(t, err)
+
+	hubCert, hubKey, err := tlsutil.GenerateInstance(caCert, caKey, "localhost", 90)
+	require.NoError(t, err)
+
+	clientCert, clientKey, err := tlsutil.GenerateInstance(caCert, caKey, "test-client", 90)
+	require.NoError(t, err)
+
+	writePEM := func(name string, data []byte) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, data, 0o600))
+		return p
+	}
+	caFile := writePEM("ca.crt", caCert)
+
+	hubCfg := &Config{
+		Name: "test-hub",
+		Storage: StorageConfig{
+			DataDir: filepath.Join(dir, "hub-data"),
+		},
+		Hub: HubConfig{
+			Enabled:      true,
+			ListenAddr:   "127.0.0.1:0",
+			AllowedPeers: []AllowedPeer{{Name: "test-client"}},
+		},
+		TLS: TLSConfig{
+			Cert: writePEM("hub.crt", hubCert),
+			Key:  writePEM("hub.key", hubKey),
+			CA:   caFile,
+		},
+	}
+	hubCfg.ApplyDefaults()
+
+	hubM, err := New(hubCfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = hubM.Close() })
+
+	boundAddr := hubM.HubAddr()
+	require.NotEmpty(t, boundAddr, "hub must be listening")
+	_, port, err := net.SplitHostPort(boundAddr)
+	require.NoError(t, err)
+	hubAddr := net.JoinHostPort("127.0.0.1", port)
+
+	clientCfg := &Config{
+		Name: "test-client",
+		Storage: StorageConfig{
+			DataDir: filepath.Join(dir, "client-data"),
+		},
+		Client: ClientConfig{
+			Enabled: true,
+			Hubs:    []ClientHubRef{{Addr: hubAddr, Publish: []string{"orders"}}},
+		},
+		TLS: TLSConfig{
+			Cert: writePEM("client.crt", clientCert),
+			Key:  writePEM("client.key", clientKey),
+			CA:   caFile,
+		},
+	}
+	clientCfg.ApplyDefaults()
+
+	clientM, err := New(clientCfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = clientM.Close() })
+
+	received := make(chan Message, 1)
+	require.NoError(t, hubM.Subscribe(context.Background(), "orders", "hub-sub",
+		func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		}))
+
+	require.NoError(t, clientM.Publish(context.Background(), "orders", "test.Order",
+		map[string]any{"id": "xyz"}))
+
+	select {
+	case msg := <-received:
+		assert.Equal(t, "orders", msg.Channel)
+		assert.Equal(t, "test-client", msg.Origin)
+	case <-time.After(2 * time.Second):
+		t.Fatal("hub subscriber did not receive message from client within 2s")
 	}
 }
 
