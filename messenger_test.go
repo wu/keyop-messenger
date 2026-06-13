@@ -324,12 +324,29 @@ func TestInstanceNameFromTestIdentity(t *testing.T) {
 	assert.Equal(t, "my-messenger-instance", m.InstanceName())
 }
 
-// TestInstanceName_RequiresTLSOrTestIdentity verifies that New rejects a
-// config that supplies neither TLS nor a test identity. Production code must
-// always go through the TLS path.
-func TestInstanceName_RequiresTLSOrTestIdentity(t *testing.T) {
+// TestInstanceName_LocalOnlyUsesHostname verifies that a local-only instance
+// (no hub, no client, no TLS, no test identity) successfully constructs and
+// derives its identity from the OS hostname.
+func TestInstanceName_LocalOnlyUsesHostname(t *testing.T) {
 	dir := t.TempDir()
-	_, err := New(testConfig(dir))
+	m, err := New(testConfig(dir))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	hostname, hostErr := os.Hostname()
+	require.NoError(t, hostErr)
+	assert.Equal(t, hostname, m.InstanceName())
+}
+
+// TestInstanceName_FederationRequiresTLS verifies that enabling federation
+// (hub or client) without configuring TLS fails fast at construction.
+func TestInstanceName_FederationRequiresTLS(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	cfg.Hub.Enabled = true
+	cfg.Hub.ListenAddr = "127.0.0.1:0"
+
+	_, err := New(cfg)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "TLS configuration required")
+	assert.Contains(t, err.Error(), "federation requires TLS")
 }

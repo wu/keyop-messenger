@@ -194,9 +194,11 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		}
 	}
 
-	// Resolve instance identity. In production this MUST come from the local
-	// TLS certificate's CN; the test-only WithTestIdentity option bypasses
-	// this for tests that exercise non-TLS code paths.
+	// Resolve instance identity. Federation (hub or client enabled) requires
+	// TLS, and identity is the local cert's CN. Local-only instances may
+	// omit TLS, in which case identity falls back to the OS hostname. The
+	// test-only WithTestIdentity option bypasses both for tests.
+	needFederation := cfg.Hub.Enabled || cfg.Client.Enabled
 	var name string
 	switch {
 	case o.testIdentity != "":
@@ -206,8 +208,14 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		if err != nil {
 			return nil, fmt.Errorf("derive instance identity: %w", err)
 		}
+	case needFederation:
+		return nil, errors.New("federation requires TLS configuration (set tls.cert/key/ca)")
 	default:
-		return nil, errors.New("TLS configuration required to determine instance identity")
+		// Local-only with no TLS: identity is the OS hostname.
+		name, err = os.Hostname()
+		if err != nil || name == "" {
+			return nil, errors.New("could not determine instance identity: no TLS configured and OS hostname unavailable")
+		}
 	}
 
 	m := &Messenger{

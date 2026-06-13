@@ -45,8 +45,11 @@ type Alert struct {
 }
 
 func main() {
+    // This is a local-only example — no federation, no TLS required.
+    // Instance identity falls back to the OS hostname. Federated deployments
+    // require TLS (see DESIGN.md §6 Federation); identity then comes from
+    // the local TLS cert's Common Name.
     cfg := &messenger.Config{
-        Name: "my-instance",
         Storage: messenger.StorageConfig{
             DataDir: "/var/keyop/my-instance",
         },

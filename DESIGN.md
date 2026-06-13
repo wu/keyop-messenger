@@ -19,7 +19,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 | Term                    | Definition                                                                                                                                |
 |-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | **Instance**            | A single running process embedding the messenger library                                                                                  |
-| **Instance name**       | Human-readable identifier for an instance; derived from the local TLS certificate's Common Name. Not configurable. If multiple instances share a host, issue separate certificates with distinct CNs (e.g. `hostname:7740`, `hostname:7741`). |
+| **Instance name**       | Human-readable identifier for an instance. Not configurable. When federation is enabled, derived from the local TLS certificate's Common Name (TLS is mandatory in that case). For local-only instances with no TLS, falls back to the OS hostname. If multiple federated instances share a host, issue separate certificates with distinct CNs (e.g. `hostname:7740`, `hostname:7741`). |
 | **Channel**             | A named, ordered stream of messages (analogous to a Kafka topic)                                                                          |
 | **Publisher**           | Code that appends a message to a channel                                                                                                  |
 | **Subscriber**          | Code that reads and processes messages from a channel                                                                                     |
@@ -233,9 +233,12 @@ Deregistering a subscriber removes its offset file and allows compaction to proc
 
 ### 6.1 Instance Identity
 
-Each instance is identified by a human-readable **instance name** derived from its TLS certificate's Common Name. The certificate CN is the authoritative identity source: when a TLS connection is established, the hub extracts the CN from the peer certificate and uses it for all allowlist checks and audit log entries. The config file has no identity field; identity is derived solely from the cert CN. Calling `New()` without a TLS configuration returns an error — TLS is mandatory in production.
+Each instance is identified by a human-readable **instance name**. The config file has no identity field; the source depends on what the instance is doing:
 
-Library tests that exercise non-TLS code paths use the test-only `WithTestIdentity(name)` option to bypass the cert requirement. Production code MUST NOT call it.
+- **Federation enabled** (`hub.enabled` or `client.enabled` is true): TLS is mandatory and the name is derived from the local TLS certificate's Common Name. The hub extracts the CN from each peer's certificate at connection time and uses it for all allowlist checks and audit log entries. `New()` returns an error if federation is enabled without TLS.
+- **Local-only** (neither hub nor client enabled): TLS is optional. If TLS is configured, the cert CN is still used. Otherwise the name falls back to `os.Hostname()`.
+
+Library tests that exercise non-TLS code paths may use the test-only `WithTestIdentity(name)` option to set a deterministic identity. Production code MUST NOT call it.
 
 If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `hostname:7740` and `hostname:7741`). The CLI `keygen instance --name hostname:port` generates a cert with the appropriate CN and DNS SAN.
 
@@ -590,8 +593,9 @@ m, err := messenger.New(cfg)
 
 ```yaml
 # Full configuration with all fields and defaults.
-# Note: instance identity is derived from the local TLS cert CN — there is
-# no `name` field. Issue distinct certs per instance to differentiate them.
+# Note: instance identity is not configurable. When federation is enabled,
+# it is derived from the local TLS cert's CN (TLS is mandatory in that case).
+# For local-only instances with no TLS, it falls back to the OS hostname.
 
 storage:
   data_dir: "/var/keyop"   # Required. Root directory for channel files, offset files, audit log.
