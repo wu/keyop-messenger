@@ -86,6 +86,13 @@ type Hub struct {
 	stop      chan struct{}
 	wg        sync.WaitGroup // Serve goroutine + TTL sweep
 	handlerWg sync.WaitGroup // active Publish/Subscribe RPC handler goroutines
+
+	// handlerGateMu protects handlerGateClosed. Set closed=true under the lock
+	// before calling handlerWg.Wait() so that any late-starting handler goroutine
+	// (created by gRPC but not yet scheduled when Stop() returns) sees the flag
+	// and skips Add(1), preventing the Add/Wait data race on the WaitGroup.
+	handlerGateMu     sync.Mutex
+	handlerGateClosed bool
 }
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
@@ -197,6 +204,23 @@ func (h *Hub) NotifyChannel(channel string) {
 	}
 }
 
+// handlerEnter increments the handler WaitGroup and returns true if the hub
+// is still open. Returns false when the hub is closing; callers must return
+// immediately without calling handlerExit.
+func (h *Hub) handlerEnter() bool {
+	h.handlerGateMu.Lock()
+	defer h.handlerGateMu.Unlock()
+	if h.handlerGateClosed {
+		return false
+	}
+	h.handlerWg.Add(1)
+	return true
+}
+
+// handlerExit must be called (via defer) by any goroutine that called
+// handlerEnter and received true.
+func (h *Hub) handlerExit() { h.handlerWg.Done() }
+
 // Close stops the listener and all active peer connections, then waits for
 // all in-flight handler goroutines to finish.
 func (h *Hub) Close() error {
@@ -206,7 +230,15 @@ func (h *Hub) Close() error {
 		h.grpcSrv.Stop()
 	}
 	h.mu.Unlock()
-	h.wg.Wait()        // Serve goroutine + TTL sweep
+	h.wg.Wait() // Serve goroutine + TTL sweep
+
+	// Close the handler gate before waiting. Any handler goroutine that gRPC
+	// spawned but that hasn't run yet will see the closed flag and skip Add(1),
+	// preventing the Add/Wait race on the WaitGroup.
+	h.handlerGateMu.Lock()
+	h.handlerGateClosed = true
+	h.handlerGateMu.Unlock()
+
 	h.handlerWg.Wait() // Publish + Subscribe handler goroutines
 	return nil
 }
@@ -247,8 +279,10 @@ func peerAddrFromContext(ctx context.Context) string {
 // a client, deduplicates, enforces the publish policy, writes to local storage,
 // and sends a PublishAck after each batch.
 func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
-	h.handlerWg.Add(1)
-	defer h.handlerWg.Done()
+	if !h.handlerEnter() {
+		return status.Error(codes.Unavailable, "hub is shutting down")
+	}
+	defer h.handlerExit()
 
 	peerName, err := h.peerNameFromContext(stream.Context())
 	if err != nil {
@@ -358,8 +392,10 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 // subscribed channel, and streams EnvelopeBatch messages to the client.
 // Acks from the client are routed to the clientCoordinator via an internal channel.
 func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
-	h.handlerWg.Add(1)
-	defer h.handlerWg.Done()
+	if !h.handlerEnter() {
+		return status.Error(codes.Unavailable, "hub is shutting down")
+	}
+	defer h.handlerExit()
 
 	// First frame must be a SubscribeRequest.
 	frame, err := stream.Recv()
