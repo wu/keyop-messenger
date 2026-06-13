@@ -1,4 +1,4 @@
-## [4.2.0](https://github.com/wu/keyop-messenger/compare/v4.1.0...v4.2.0) (2026-06-13)
+## [1.11.0](https://github.com/wu/keyop-messenger/compare/v1.10.0...v1.11.0) (2026-06-13)
 
 ### Features
 
@@ -6,26 +6,26 @@
 * tighten federation TLS verifier; mark BasicConstraints on leaves ([392582d](https://github.com/wu/keyop-messenger/commit/392582d706c75745538661cc88915d4ea30a8887))
 * verify federation TLS by CA chain only, not by DNS-SAN matching ([75b46a7](https://github.com/wu/keyop-messenger/commit/75b46a7ed652afada1f2c26ddc3a85e9b40d6efb))
 
-## [4.1.0](https://github.com/wu/keyop-messenger/compare/v4.0.0...v4.1.0) (2026-06-13)
+## [1.10.0](https://github.com/wu/keyop-messenger/compare/v1.9.0...v1.10.0) (2026-06-13)
 
 ### Features
 
 * require TLS only when federation is enabled ([56a8073](https://github.com/wu/keyop-messenger/commit/56a8073b3bf4554ec92bd3f1a41efd25d6300077))
 
-## [4.0.0](https://github.com/wu/keyop-messenger/compare/v3.0.1...v4.0.0) (2026-06-13)
+## [1.9.0](https://github.com/wu/keyop-messenger/compare/v1.8.1...v1.9.0) (2026-06-13)
 
 ### Features
 
 * derive instance identity from TLS cert CN; unify peer auth ([a558284](https://github.com/wu/keyop-messenger/commit/a558284d1ed7ad95386973810338737b441b7eff))
 
-## [3.0.1](https://github.com/wu/keyop-messenger/compare/v3.0.0...v3.0.1) (2026-06-13)
+## [1.8.1](https://github.com/wu/keyop-messenger/compare/v1.8.0...v1.8.1) (2026-06-13)
 
 ### Bug Fixes
 
 * honor ctx cancellation in ChannelWriter.Write after hand-off ([5d042f6](https://github.com/wu/keyop-messenger/commit/5d042f660fa59ed26bb6721142c7b54a9c0a340f))
 * wire subCtx to EphemeralClient Subscribe stream ([542415a](https://github.com/wu/keyop-messenger/commit/542415aad4144ea4b6135e69ae518f43ebeee78b))
 
-## [3.0.0](https://github.com/wu/keyop-messenger/compare/v2.0.0...v3.0.0) (2026-06-13)
+## [1.8.0](https://github.com/wu/keyop-messenger/compare/v1.7.0...v1.8.0) (2026-06-13)
 
 ### ⚠ BREAKING CHANGES
 
@@ -35,7 +35,7 @@
 
 * drive client-side federation publish from disk-pull readers ([94ccd5c](https://github.com/wu/keyop-messenger/commit/94ccd5c0c9a305a1853784bde67d91a0750afa60))
 
-## [2.0.0](https://github.com/wu/keyop-messenger/compare/v1.5.0...v2.0.0) (2026-06-13)
+## [1.7.0](https://github.com/wu/keyop-messenger/compare/v1.6.0...v1.7.0) (2026-06-13)
 
 ### ⚠ BREAKING CHANGES
 
@@ -226,7 +226,7 @@
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.7.0.html).
 
 ## [Unreleased]
 
