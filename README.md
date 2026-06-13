@@ -151,8 +151,8 @@ m.Publish(ctx, "heater", "com.example.SwitchEvent", &switchEvent)
 
 ```go
 em, err := messenger.NewEphemeralMessenger(messenger.EphemeralConfig{
-    HubAddr:      "hub.example.com:7740",
-    InstanceName: "transient-service",
+    HubAddr: "hub.example.com:7740",
+    // Instance identity is derived from the cert CN (here: "transient-service").
     TLS: messenger.TLSConfig{
         Cert: "transient-service.crt",
         Key:  "transient-service.key",
@@ -183,10 +183,10 @@ if errors.Is(err, messenger.ErrEphemeralConnLost) {
 
 ```go
 em, err := messenger.NewEphemeralMessenger(messenger.EphemeralConfig{
-    HubAddr:      "hub.example.com:7740",
-    InstanceName: "dashboard",
-    Subscribe:    []string{"metrics"},   // declare channels before Connect
-    TLS:          messenger.TLSConfig{Cert: "dashboard.crt", Key: "dashboard.key", CA: "ca.crt"},
+    HubAddr:       "hub.example.com:7740",
+    // Instance identity is derived from the cert CN (here: "dashboard").
+    Subscribe:     []string{"metrics"},   // declare channels before Connect
+    TLS:           messenger.TLSConfig{Cert: "dashboard.crt", Key: "dashboard.key", CA: "ca.crt"},
     AutoReconnect: true,
 })
 

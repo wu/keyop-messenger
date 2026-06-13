@@ -19,7 +19,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 | Term                    | Definition                                                                                                                                |
 |-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | **Instance**            | A single running process embedding the messenger library                                                                                  |
-| **Instance name**       | Human-readable identifier for an instance; defaults to OS hostname. If multiple instances share a host, append the port: `hostname:port`. |
+| **Instance name**       | Human-readable identifier for an instance; derived from the local TLS certificate's Common Name. Not configurable. If multiple instances share a host, issue separate certificates with distinct CNs (e.g. `hostname:7740`, `hostname:7741`). |
 | **Channel**             | A named, ordered stream of messages (analogous to a Kafka topic)                                                                          |
 | **Publisher**           | Code that appends a message to a channel                                                                                                  |
 | **Subscriber**          | Code that reads and processes messages from a channel                                                                                     |
@@ -233,9 +233,9 @@ Deregistering a subscriber removes its offset file and allows compaction to proc
 
 ### 6.1 Instance Identity
 
-Each instance is identified by a human-readable **instance name** derived from its TLS certificate's Common Name. The certificate CN is the authoritative identity source: when a TLS connection is established, the hub extracts the CN from the peer certificate and uses it for all allowlist checks and audit log entries. Configuring a name in the config file has no effect on the identity seen over the wire — only the cert CN matters.
+Each instance is identified by a human-readable **instance name** derived from its TLS certificate's Common Name. The certificate CN is the authoritative identity source: when a TLS connection is established, the hub extracts the CN from the peer certificate and uses it for all allowlist checks and audit log entries. The config file has no identity field; identity is derived solely from the cert CN. Calling `New()` without a TLS configuration returns an error — TLS is mandatory in production.
 
-For instances without TLS (plain connections used only in unit/integration tests), the instance name falls back to the OS hostname. Actual deployed instances must always use TLS.
+Library tests that exercise non-TLS code paths use the test-only `WithTestIdentity(name)` option to bypass the cert requirement. Production code MUST NOT call it.
 
 If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `hostname:7740` and `hostname:7741`). The CLI `keygen instance --name hostname:port` generates a cert with the appropriate CN and DNS SAN.
 
@@ -266,7 +266,7 @@ service FederationService {
 - The hub extracts the client's identity from the TLS peer certificate CN. For plain (test-only) connections, identity falls back to the `x-federation-instance` gRPC metadata key.
 
 **Subscribe RPC** — carries messages from hub to client:
-- The client sends a single `SubscribeRequest` as the first frame, declaring its identity and the channel list it wants to receive.
+- The client sends a single `SubscribeRequest` as the first frame, declaring the channel list it wants to receive. Client identity is carried in the `x-federation-instance` gRPC metadata header (same as Publish) and validated against the TLS cert CN; it is not part of the request body.
 - The hub then streams `HubBatch` frames containing envelope records.
 - The client acknowledges each batch by sending an `Ack` frame back on the same stream.
 - A `CloseNotice` frame from the hub signals an orderly shutdown.
@@ -589,10 +589,9 @@ m, err := messenger.New(cfg)
 ### 10.2 Configuration Reference
 
 ```yaml
-# Full configuration with all fields and defaults
-
-name: ""                   # Instance name. Defaults to OS hostname. Use "hostname:port"
-                           # if multiple instances share a host.
+# Full configuration with all fields and defaults.
+# Note: instance identity is derived from the local TLS cert CN — there is
+# no `name` field. Issue distinct certs per instance to differentiate them.
 
 storage:
   data_dir: "/var/keyop"   # Required. Root directory for channel files, offset files, audit log.
@@ -669,12 +668,13 @@ The ephemeral client sets `ephemeral: true` in the `SubscribeRequest` proto mess
 
 ```protobuf
 SubscribeRequest {
-  instance_name: "billing-service"
-  version:       "1"
-  subscribe:     ["alerts"]
-  ephemeral:     true
+  version:   "1"
+  subscribe: ["alerts"]
+  ephemeral: true
 }
 ```
+
+Client identity is carried in the `x-federation-instance` gRPC metadata header and validated against the TLS cert CN, exactly as for the durable client.
 
 If the client only publishes and opens no Subscribe stream, the flag is irrelevant — publish-only clients never receive messages regardless.
 
