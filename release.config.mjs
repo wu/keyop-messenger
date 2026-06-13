@@ -2,12 +2,27 @@
  * Semantic Release configuration for keyop-messenger.
  *
  * Convention → SemVer mapping:
- *   feat:              minor bump  (0.1.0 → 0.2.0)
- *   fix: / perf:       patch bump  (0.1.0 → 0.1.1)
- *   BREAKING CHANGE:   major bump  (0.1.0 → 1.0.0)
+ *   feat:              minor bump  (1.1.0 → 1.2.0)
+ *   fix: / perf:       patch bump  (1.1.0 → 1.1.1)
+ *   feat! / BREAKING:  minor bump  (1.1.0 → 1.2.0)  ← see below
  *
- * Tags are written WITHOUT a "v" prefix to match the existing scheme
- * (0.0.1, 0.0.2, …).
+ * Major bumps are intentionally disabled. Go's module system requires a
+ * versioned import path (/v2, /v3, …) for every major version ≥ 2, which
+ * means each major bump would force a rename of the module path in this
+ * repo AND in every consumer. Since keyop-messenger has a small set of
+ * known consumers (currently just keyop) and breaking changes are
+ * surfaced clearly in the changelog and commit messages, the rename cost
+ * outweighs the import-path safety signal. We stay on v1.x.x and use
+ * `feat!:` / `BREAKING CHANGE:` to signal API breaks in human-readable
+ * release notes only.
+ *
+ * If you genuinely need to publish a versioned import path (e.g. for
+ * external consumers who must pin against incompatible majors), remove
+ * the `{breaking: true, release: "minor"}` rule below and follow Go's
+ * module-versioning playbook (rename the module path in go.mod, update
+ * every internal import, regenerate proto code, update every consumer).
+ *
+ * Tags are written with a "v" prefix (v1.4.0, v1.4.1, …).
  *
  * Required GitHub Actions secret:  GITHUB_TOKEN  (provided automatically)
  */
@@ -25,6 +40,13 @@ export default {
       {
         preset: "conventionalcommits",
         releaseRules: [
+          // Force breaking-change markers (footer `BREAKING CHANGE:` or
+          // the `feat!:` / `fix!:` `!` suffix) to a MINOR bump instead of
+          // the conventionalcommits default (major). This must come first
+          // so it wins over any later rule that might match the same
+          // commit. See the file header for the rationale.
+          {breaking: true, release: "minor"},
+
           // Treat any "feat" as a minor bump (default), "fix"/"perf" as patch.
           // Explicitly map extra types used in this repo so they don't block a
           // release when they appear alongside a feat/fix commit.
