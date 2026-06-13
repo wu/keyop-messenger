@@ -1,3 +1,9 @@
+## [1.11.1](https://github.com/wu/keyop-messenger/compare/v1.11.0...v1.11.1) (2026-06-13)
+
+### Bug Fixes
+
+* **release:** renumber v2/v3/v4 changelog entries into v1 lineage ([48a5563](https://github.com/wu/keyop-messenger/commit/48a556340444737ef86b790658eaa6397ac6d210))
+
 ## [1.11.0](https://github.com/wu/keyop-messenger/compare/v1.10.0...v1.11.0) (2026-06-13)
 
 ### Features
