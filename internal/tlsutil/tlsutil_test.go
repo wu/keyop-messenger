@@ -3,9 +3,13 @@ package tlsutil_test
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,6 +22,20 @@ import (
 )
 
 // ---- helpers -----------------------------------------------------------------
+
+// randReader returns crypto/rand.Reader. Wrapped only so the test helpers
+// don't have to import crypto/rand directly in many places.
+func randReader() io.Reader { return rand.Reader }
+
+func mustSerial(t *testing.T) *big.Int {
+	t.Helper()
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	s, err := rand.Int(rand.Reader, limit)
+	require.NoError(t, err)
+	return s
+}
+
+func pkixName(cn string) pkix.Name { return pkix.Name{CommonName: cn} }
 
 func writePEM(t *testing.T, dir, name string, data []byte) string {
 	t.Helper()
@@ -73,6 +91,10 @@ func TestGenerateInstance(t *testing.T) {
 	assert.Equal(t, name, cert.Subject.CommonName)
 	assert.Contains(t, cert.DNSNames, name)
 	assert.False(t, cert.IsCA)
+	// BasicConstraints must be explicitly emitted so strict verifiers see
+	// "CA: FALSE" rather than an absent extension.
+	assert.True(t, cert.BasicConstraintsValid,
+		"instance cert must carry an explicit BasicConstraints extension")
 	assert.Equal(t, elliptic.P384(), key.Curve)
 
 	// Chain verification against the CA.
@@ -173,6 +195,101 @@ func TestBuildTLSConfig_VerifierRejectsForeignCA(t *testing.T) {
 
 	err = cfg.VerifyPeerCertificate([][]byte{foreignLeaf.Raw}, nil)
 	assert.Error(t, err, "peer cert from an untrusted CA must be rejected")
+}
+
+// signCustomCert issues a custom leaf cert signed by caCertPEM/caKeyPEM using
+// the supplied template. Only callers in this test file should use it — its
+// purpose is to construct certs that GenerateInstance would never legitimately
+// produce, so the verifier can be exercised against pathological inputs.
+func signCustomCert(t *testing.T, caCertPEM, caKeyPEM []byte, tmpl *x509.Certificate) []byte {
+	t.Helper()
+	caBlock, _ := pem.Decode(caCertPEM)
+	require.NotNil(t, caBlock)
+	caCert, err := x509.ParseCertificate(caBlock.Bytes)
+	require.NoError(t, err)
+	keyBlock, _ := pem.Decode(caKeyPEM)
+	require.NotNil(t, keyBlock)
+	caKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	require.NoError(t, err)
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P384(), randReader())
+	require.NoError(t, err)
+
+	der, err := x509.CreateCertificate(randReader(), tmpl, caCert, &leafKey.PublicKey, caKey)
+	require.NoError(t, err)
+	return der
+}
+
+// TestBuildTLSConfig_VerifierRejectsWrongEKU confirms that a cert legitimately
+// signed by the trusted CA but with an EKU outside {ClientAuth, ServerAuth}
+// (e.g. CodeSigning) is rejected. This prevents accidental cross-use of the
+// federation CA for other purposes.
+func TestBuildTLSConfig_VerifierRejectsWrongEKU(t *testing.T) {
+	dir := t.TempDir()
+	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+	localCertPEM, localKeyPEM, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "local", 90)
+	require.NoError(t, err)
+	certFile := writePEM(t, dir, "local.crt", localCertPEM)
+	keyFile := writePEM(t, dir, "local.key", localKeyPEM)
+	caFile := writePEM(t, dir, "ca.crt", caCertPEM)
+
+	cfg, err := tlsutil.BuildTLSConfig(certFile, keyFile, caFile, &testutil.FakeLogger{})
+	require.NoError(t, err)
+
+	// CodeSigning EKU only — legitimate CA signature, wrong purpose.
+	now := time.Now().UTC()
+	wrongEKU := &x509.Certificate{
+		SerialNumber:          mustSerial(t),
+		Subject:               pkixName("code-signer"),
+		NotBefore:             now,
+		NotAfter:              now.Add(90 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageCodeSigning},
+		BasicConstraintsValid: true,
+		IsCA:                  false,
+	}
+	der := signCustomCert(t, caCertPEM, caKeyPEM, wrongEKU)
+
+	err = cfg.VerifyPeerCertificate([][]byte{der}, nil)
+	assert.Error(t, err, "cert with non-federation EKU must be rejected")
+}
+
+// TestBuildTLSConfig_VerifierRejectsCALeaf confirms that a CA certificate
+// presented as a peer leaf is rejected even when it chains to the trusted
+// CA. Guards against a delegated sub-CA being able to authenticate as a peer
+// with whatever CN it carries.
+func TestBuildTLSConfig_VerifierRejectsCALeaf(t *testing.T) {
+	dir := t.TempDir()
+	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+	localCertPEM, localKeyPEM, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "local", 90)
+	require.NoError(t, err)
+	certFile := writePEM(t, dir, "local.crt", localCertPEM)
+	keyFile := writePEM(t, dir, "local.key", localKeyPEM)
+	caFile := writePEM(t, dir, "ca.crt", caCertPEM)
+
+	cfg, err := tlsutil.BuildTLSConfig(certFile, keyFile, caFile, &testutil.FakeLogger{})
+	require.NoError(t, err)
+
+	// Build a sub-CA: IsCA=true, signed by the trusted root, with EKUs that
+	// would otherwise pass the verifier.
+	now := time.Now().UTC()
+	subCA := &x509.Certificate{
+		SerialNumber:          mustSerial(t),
+		Subject:               pkixName("rogue-subca"),
+		NotBefore:             now,
+		NotAfter:              now.Add(90 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der := signCustomCert(t, caCertPEM, caKeyPEM, subCA)
+
+	err = cfg.VerifyPeerCertificate([][]byte{der}, nil)
+	require.Error(t, err, "CA certificate presented as a peer leaf must be rejected")
+	assert.Contains(t, err.Error(), "CA certificate")
 }
 
 func TestBuildTLSConfigMissingCert(t *testing.T) {

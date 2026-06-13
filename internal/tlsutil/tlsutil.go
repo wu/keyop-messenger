@@ -64,10 +64,17 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		if err != nil {
 			return fmt.Errorf("tlsutil: parse peer leaf cert: %w", err)
 		}
+		// Restrict accepted Extended Key Usages to the two relevant to
+		// federation (client and server auth). Without this, x509.Verify
+		// would accept any EKU the CA happened to sign, including
+		// CodeSigning, EmailProtection, etc.
 		opts := x509.VerifyOptions{
 			Roots:         caPool,
 			Intermediates: x509.NewCertPool(),
-			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+			KeyUsages: []x509.ExtKeyUsage{
+				x509.ExtKeyUsageClientAuth,
+				x509.ExtKeyUsageServerAuth,
+			},
 		}
 		for _, raw := range rawCerts[1:] {
 			c, err := x509.ParseCertificate(raw)
@@ -78,6 +85,13 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		}
 		if _, err := leaf.Verify(opts); err != nil {
 			return fmt.Errorf("tlsutil: peer cert chain verification failed: %w", err)
+		}
+		// Belt-and-braces: refuse a CA certificate presented as a peer leaf.
+		// x509.Verify checks IsCA on intermediates and the root but not on
+		// the leaf itself, so a delegated sub-CA could otherwise authenticate
+		// as a peer with whatever CN it carries.
+		if leaf.IsCA {
+			return fmt.Errorf("tlsutil: peer presented a CA certificate as its leaf")
 		}
 		return nil
 	}
