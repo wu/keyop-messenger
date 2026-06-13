@@ -69,11 +69,6 @@ func TestValidate_Errors(t *testing.T) {
 			wantMsg: "client.hubs[0].addr is required",
 		},
 		{
-			name:    "invalid tls min_version",
-			mutate:  func(c *Config) { c.TLS.MinVersion = "1.1" },
-			wantMsg: `tls.min_version "1.1" is invalid`,
-		},
-		{
 			name: "tls cert without key",
 			mutate: func(c *Config) {
 				c.TLS.Cert = "/etc/certs/host.crt"
@@ -127,17 +122,6 @@ func TestValidate_Errors(t *testing.T) {
 	}
 }
 
-// TestValidate_TLSMinVersion_Valid confirms that both accepted values pass.
-func TestValidate_TLSMinVersion_Valid(t *testing.T) {
-	for _, v := range []string{"1.2", "1.3"} {
-		t.Run(v, func(t *testing.T) {
-			c := minValidConfig()
-			c.TLS.MinVersion = v
-			assert.NoError(t, c.Validate())
-		})
-	}
-}
-
 // TestValidate_MultipleErrors confirms that all errors are returned together,
 // not just the first one encountered.
 func TestValidate_MultipleErrors(t *testing.T) {
@@ -164,7 +148,6 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 256, c.Storage.CompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 5, *c.Subscribers.MaxRetries)
-		assert.Equal(t, "1.3", c.TLS.MinVersion)
 		assert.Equal(t, 30, c.TLS.ExpiryWarnDays)
 		assert.Equal(t, 500, c.Federation.ReconnectBaseMS)
 		assert.Equal(t, 60_000, c.Federation.ReconnectMaxMS)
@@ -184,7 +167,7 @@ func TestApplyDefaults(t *testing.T) {
 				CompactionThresholdMB: 512,
 			},
 			Subscribers: SubscribersConfig{MaxRetries: intPtr(10)},
-			TLS:         TLSConfig{MinVersion: "1.2", ExpiryWarnDays: 60},
+			TLS:         TLSConfig{ExpiryWarnDays: 60},
 			Federation: FederationConfig{
 				ReconnectBaseMS:    1000,
 				ReconnectMaxMS:     30_000,
@@ -202,7 +185,6 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 512, c.Storage.CompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 10, *c.Subscribers.MaxRetries)
-		assert.Equal(t, "1.2", c.TLS.MinVersion)
 		assert.Equal(t, 60, c.TLS.ExpiryWarnDays)
 		assert.Equal(t, 1000, c.Federation.ReconnectBaseMS)
 		assert.Equal(t, 30_000, c.Federation.ReconnectMaxMS)
@@ -253,7 +235,6 @@ tls:
   cert: /etc/certs/host.crt
   key:  /etc/certs/host.key
   ca:   /etc/certs/ca.crt
-  min_version: "1.3"
   expiry_warn_days: 60
 federation:
   reconnect_base_ms: 1000
@@ -292,7 +273,6 @@ audit:
 	assert.Equal(t, "/etc/certs/host.crt", cfg.TLS.Cert)
 	assert.Equal(t, "/etc/certs/host.key", cfg.TLS.Key)
 	assert.Equal(t, "/etc/certs/ca.crt", cfg.TLS.CA)
-	assert.Equal(t, "1.3", cfg.TLS.MinVersion)
 	assert.Equal(t, 60, cfg.TLS.ExpiryWarnDays)
 	assert.Equal(t, 1000, cfg.Federation.ReconnectBaseMS)
 	assert.Equal(t, 30_000, cfg.Federation.ReconnectMaxMS)

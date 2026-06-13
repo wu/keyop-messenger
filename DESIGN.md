@@ -252,7 +252,7 @@ The message `id` field (UUID v7) is separate from the instance name. It is gener
 
 ### 6.2 gRPC Connection
 
-Federation uses gRPC over mutual TLS. Both sides present certificates; both sides verify the peer cert against the shared CA. The `tls.min_version` config field accepts only `"1.2"` or `"1.3"` and defaults to `"1.3"`; any other value is rejected at startup.
+Federation uses gRPC over mutual TLS. Both sides present certificates; both sides verify the peer cert against the shared CA. The minimum TLS version is hardcoded to 1.3 and is not configurable — this is a closed federation mesh, and there is no operational reason to allow downgrade to older TLS versions.
 
 The gRPC service exposes two bidirectional streaming RPCs:
 
@@ -633,8 +633,8 @@ tls:
   cert: ""                 # Path to instance certificate (PEM)
   key:  ""                 # Path to instance private key (PEM)
   ca:   ""                 # Path to CA certificate (PEM)
-  min_version: "1.3"       # Minimum TLS version
   expiry_warn_days: 30     # Log a warning this many days before cert expiry
+                           # Minimum TLS version is hardcoded to 1.3.
 
 federation:
   reconnect_base_ms: 500

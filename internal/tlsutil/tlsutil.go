@@ -38,8 +38,9 @@ type FileWatcher interface {
 // InsecureSkipVerify=true and supply a VerifyPeerCertificate callback that
 // builds the chain against caPool but never calls VerifyHostname.
 //
-// MinVersion is TLS 1.3; ClientAuth is RequireAndVerifyClientCert, which
-// here means "require a client cert and run our custom verifier on it".
+// MinVersion is hardcoded to TLS 1.3 and is not configurable. ClientAuth is
+// RequireAndVerifyClientCert, which here means "require a client cert and
+// run our custom verifier on it".
 func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {

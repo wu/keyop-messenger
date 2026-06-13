@@ -128,13 +128,15 @@ type TLSConfig struct {
 	// CA is the path to the PEM-encoded CA certificate used to verify peers.
 	CA string `yaml:"ca"`
 
-	// MinVersion is the minimum TLS version. Default: "1.3".
-	MinVersion string `yaml:"min_version"`
-
 	// ExpiryWarnDays triggers a warning log when the instance cert or CA cert expires
 	// within this many days. Default: 30.
 	ExpiryWarnDays int `yaml:"expiry_warn_days"`
 }
+
+// TLS 1.3 is hardcoded as the minimum protocol version for federation
+// connections (see tlsutil.BuildTLSConfig). It is not configurable: this is a
+// closed federation mesh, and there is no operational reason to allow
+// downgrade to older TLS versions.
 
 // FederationConfig controls WebSocket reconnection and message batching.
 type FederationConfig struct {
@@ -228,9 +230,6 @@ func (c *Config) ApplyDefaults() {
 		c.Subscribers.MaxRetries = &n
 	}
 
-	if c.TLS.MinVersion == "" {
-		c.TLS.MinVersion = "1.3"
-	}
 	if c.TLS.ExpiryWarnDays == 0 {
 		c.TLS.ExpiryWarnDays = 30
 	}
@@ -312,16 +311,6 @@ func (c *Config) Validate() error {
 				errs = append(errs, fmt.Errorf("client.hubs[%d].addr is required", i))
 			}
 		}
-	}
-
-	switch c.TLS.MinVersion {
-	case "1.2", "1.3":
-		// valid
-	default:
-		errs = append(errs, fmt.Errorf(
-			"tls.min_version %q is invalid: must be \"1.2\" or \"1.3\"",
-			c.TLS.MinVersion,
-		))
 	}
 
 	if c.TLS.Cert != "" && c.TLS.Key == "" {

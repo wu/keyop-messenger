@@ -105,7 +105,9 @@ func TestBuildTLSConfig(t *testing.T) {
 	cfg, err := tlsutil.BuildTLSConfig(certFile, keyFile, caFile, logger)
 	require.NoError(t, err)
 
-	assert.Equal(t, uint16(tls.VersionTLS13), cfg.MinVersion)
+	// MinVersion is hardcoded to TLS 1.3 and must not regress.
+	assert.Equal(t, uint16(tls.VersionTLS13), cfg.MinVersion,
+		"TLS 1.3 is the minimum protocol version for federation; do not weaken")
 	assert.Equal(t, tls.RequireAndVerifyClientCert, cfg.ClientAuth)
 	assert.NotNil(t, cfg.ClientCAs)
 	assert.Len(t, cfg.Certificates, 1)
