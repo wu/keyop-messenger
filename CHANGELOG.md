@@ -1,3 +1,13 @@
+## [3.0.0](https://github.com/wu/keyop-messenger/compare/v2.0.0...v3.0.0) (2026-06-13)
+
+### ⚠ BREAKING CHANGES
+
+* drive client-side federation publish from disk-pull readers
+
+### Features
+
+* drive client-side federation publish from disk-pull readers ([94ccd5c](https://github.com/wu/keyop-messenger/commit/94ccd5c0c9a305a1853784bde67d91a0750afa60))
+
 ## [2.0.0](https://github.com/wu/keyop-messenger/compare/v1.5.0...v2.0.0) (2026-06-13)
 
 ### ⚠ BREAKING CHANGES
