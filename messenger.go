@@ -122,6 +122,7 @@ func (cs *channelState) broadcastNotify() {
 // Messenger is the top-level pub-sub instance. Construct with New.
 type Messenger struct {
 	cfg     *Config
+	name    string // derived from local TLS cert CN (or test override)
 	log     Logger
 	dataDir string
 
@@ -184,8 +185,34 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		return nil, fmt.Errorf("create audit writer: %w", err)
 	}
 
+	// Build TLS config and check certificate expiry when certs are configured.
+	var tlsCfg *tls.Config
+	if cfg.TLS.Cert != "" {
+		tlsCfg, err = tlsutil.BuildTLSConfig(cfg.TLS.Cert, cfg.TLS.Key, cfg.TLS.CA, log)
+		if err != nil {
+			return nil, fmt.Errorf("build TLS config: %w", err)
+		}
+	}
+
+	// Resolve instance identity. In production this MUST come from the local
+	// TLS certificate's CN; the test-only WithTestIdentity option bypasses
+	// this for tests that exercise non-TLS code paths.
+	var name string
+	switch {
+	case o.testIdentity != "":
+		name = o.testIdentity
+	case tlsCfg != nil:
+		name, err = tlsutil.ExtractLocalCN(tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("derive instance identity: %w", err)
+		}
+	default:
+		return nil, errors.New("TLS configuration required to determine instance identity")
+	}
+
 	m := &Messenger{
 		cfg:      cfg,
+		name:     name,
 		log:      log,
 		dataDir:  cfg.Storage.DataDir,
 		reg:      reg,
@@ -195,13 +222,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		stop:     make(chan struct{}),
 	}
 
-	// Build TLS config and check certificate expiry when certs are configured.
-	var tlsCfg *tls.Config
-	if cfg.TLS.Cert != "" {
-		tlsCfg, err = tlsutil.BuildTLSConfig(cfg.TLS.Cert, cfg.TLS.Key, cfg.TLS.CA, log)
-		if err != nil {
-			return nil, fmt.Errorf("build TLS config: %w", err)
-		}
+	if tlsCfg != nil {
 		m.checkCertExpiry(tlsCfg, cfg)
 	}
 
@@ -209,7 +230,6 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 	if cfg.Hub.Enabled {
 		hubCfg := toFedHubConfig(cfg.Hub)
 		m.hub = federation.NewHub(
-			cfg.Name,
 			hubCfg,
 			tlsCfg,
 			m.writeLocalEnvelope,
@@ -233,7 +253,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				Receive: ref.Subscribe, // channels client may receive from hub (checked by PeerReceiver)
 			})
 			c := federation.NewClient(
-				cfg.Name,
+				m.name,
 				tlsCfg,
 				policy,
 				m.writeLocalEnvelope,
@@ -283,9 +303,10 @@ func (m *Messenger) HubAddr() string {
 	return m.hub.Addr()
 }
 
-// InstanceName returns the configured instance name for this messenger.
+// InstanceName returns the instance identity for this messenger, derived from
+// the local TLS certificate's Common Name.
 func (m *Messenger) InstanceName() string {
-	return m.cfg.Name
+	return m.name
 }
 
 // RegisterPayloadType associates typeStr with the Go type of prototype for
@@ -323,7 +344,7 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 		return fmt.Errorf("publish %q: %w", channel, err)
 	}
 
-	env, err := envelope.NewEnvelope(channel, m.cfg.Name, payloadType, payload)
+	env, err := envelope.NewEnvelope(channel, m.name, payloadType, payload)
 	if err != nil {
 		return fmt.Errorf("publish %q: create envelope: %w", channel, err)
 	}

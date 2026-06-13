@@ -28,7 +28,6 @@ func BenchmarkPublishThroughput(b *testing.B) {
 		b.Run(tt.name, func(b *testing.B) {
 			dir := b.TempDir()
 			cfg := &Config{
-				Name: "bench",
 				Storage: StorageConfig{
 					DataDir:               dir,
 					SyncIntervalMS:        tt.syncIntervalMS,
@@ -36,7 +35,7 @@ func BenchmarkPublishThroughput(b *testing.B) {
 				},
 			}
 			cfg.ApplyDefaults()
-			m, err := New(cfg)
+			m, err := New(cfg, WithTestIdentity("test-instance"))
 			require.NoError(b, err)
 			b.Cleanup(func() { _ = m.Close() })
 
@@ -70,7 +69,6 @@ func BenchmarkSubscribeLatency(b *testing.B) {
 		b.Run(tt.name, func(b *testing.B) {
 			dir := b.TempDir()
 			cfg := &Config{
-				Name: "bench",
 				Storage: StorageConfig{
 					DataDir:               dir,
 					SyncIntervalMS:        tt.syncIntervalMS,
@@ -78,7 +76,7 @@ func BenchmarkSubscribeLatency(b *testing.B) {
 				},
 			}
 			cfg.ApplyDefaults()
-			m, err := New(cfg)
+			m, err := New(cfg, WithTestIdentity("test-instance"))
 			require.NoError(b, err)
 			b.Cleanup(func() { _ = m.Close() })
 
@@ -140,7 +138,6 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 			caFile := writePEM("ca.crt", caCert)
 
 			hubCfg := &Config{
-				Name: "bench-hub",
 				Storage: StorageConfig{
 					DataDir:               filepath.Join(dir, "hub"),
 					SyncIntervalMS:        tt.syncIntervalMS,
@@ -166,7 +163,6 @@ func BenchmarkFederationRoundTrip(b *testing.B) {
 			require.NoError(b, err)
 
 			clientCfg := &Config{
-				Name: "bench-client",
 				Storage: StorageConfig{
 					DataDir:               filepath.Join(dir, "client"),
 					SyncIntervalMS:        tt.syncIntervalMS,

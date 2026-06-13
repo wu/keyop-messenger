@@ -18,7 +18,6 @@ func host2(ctx context.Context, logger *slog.Logger, baseDir string) {
 
 	// connect to the hub on 'localhost' and subscribe to the 'alerts' channel.
 	cfg := &messenger.Config{
-		Name: "host2",
 		Storage: messenger.StorageConfig{
 			DataDir: tmpDir,
 		},

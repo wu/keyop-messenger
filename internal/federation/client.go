@@ -165,9 +165,8 @@ func (c *Client) dial(hubAddr string) error {
 		if sErr := subStream.Send(&federationv1.SubscribeFrame{
 			Payload: &federationv1.SubscribeFrame_Request{
 				Request: &federationv1.SubscribeRequest{
-					InstanceName: c.instanceName,
-					Version:      wireVersion,
-					Subscribe:    c.subscribeChannels,
+					Version:   wireVersion,
+					Subscribe: c.subscribeChannels,
 				},
 			},
 		}); sErr != nil {

@@ -15,13 +15,14 @@ import (
 // newEphemeralMessenger constructs an EphemeralMessenger for testing.
 // hubAddr should be obtained from hubLocalAddr(t, hub) so TLS hostname
 // verification passes (hub cert CN is "localhost").
-func newEphemeralMessenger(t *testing.T, name, hubAddr, caFile, certFile, keyFile string, subscribe []string) *EphemeralMessenger {
+func newEphemeralMessenger(t *testing.T, _ /* name */, hubAddr, caFile, certFile, keyFile string, subscribe []string) *EphemeralMessenger {
 	t.Helper()
+	// Identity is derived from the cert CN; the name parameter is kept in the
+	// signature for callers that document their expected CN inline.
 	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      hubAddr,
-		InstanceName: name,
-		Subscribe:    subscribe,
-		TLS:          TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
+		HubAddr:   hubAddr,
+		Subscribe: subscribe,
+		TLS:       TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -227,7 +228,6 @@ func TestEphemeralMessenger_AutoReconnect(t *testing.T) {
 
 	em, err := NewEphemeralMessenger(EphemeralConfig{
 		HubAddr:       hubLocalAddr(t, hub),
-		InstanceName:  "em-client",
 		TLS:           TLSConfig{Cert: certFor("em-client"), Key: keyFor("em-client"), CA: caFile},
 		AutoReconnect: true,
 		ReconnectBase: 50 * time.Millisecond,

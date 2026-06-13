@@ -58,6 +58,29 @@ func ExtractCN(cert *x509.Certificate) string {
 	return cert.Subject.CommonName
 }
 
+// ExtractLocalCN returns the Common Name from the leaf certificate of the first
+// entry in tlsCfg.Certificates — i.e. the local identity of this peer. Returns
+// an error if tlsCfg has no certificates, the entry has no DER bytes, the bytes
+// fail to parse, or the CN is empty.
+func ExtractLocalCN(tlsCfg *tls.Config) (string, error) {
+	if tlsCfg == nil || len(tlsCfg.Certificates) == 0 {
+		return "", fmt.Errorf("tlsutil: tls config has no local certificate")
+	}
+	cert := tlsCfg.Certificates[0]
+	if len(cert.Certificate) == 0 {
+		return "", fmt.Errorf("tlsutil: local certificate has no DER bytes")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return "", fmt.Errorf("tlsutil: parse local certificate: %w", err)
+	}
+	cn := ExtractCN(leaf)
+	if cn == "" {
+		return "", fmt.Errorf("tlsutil: local certificate has empty CN")
+	}
+	return cn, nil
+}
+
 // CheckExpiry logs a warning via logger if cert expires within warnDays.
 func CheckExpiry(cert *x509.Certificate, warnDays int, logger Logger) {
 	deadline := time.Now().UTC().Add(time.Duration(warnDays) * 24 * time.Hour)

@@ -85,10 +85,9 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	})
 
 	var received atomic.Int32
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      addr,
-		InstanceName: "test-client",
-		Subscribe:    []string{"events"},
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   addr,
+		Subscribe: []string{"events"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -137,10 +136,9 @@ func TestEphemeralMessenger_Subscribe_PayloadDecoded(t *testing.T) {
 	var gotPayload any
 	var received atomic.Bool
 
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      addr,
-		InstanceName: "test-client",
-		Subscribe:    []string{"typed"},
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   addr,
+		Subscribe: []string{"typed"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -165,9 +163,8 @@ func TestEphemeralMessenger_Subscribe_PayloadDecoded(t *testing.T) {
 // TestEphemeralMessenger_Publish_EnvelopeCreateError exercises the error path
 // when an unmarshalable payload is passed to Publish.
 func TestEphemeralMessenger_Publish_EnvelopeCreateError(t *testing.T) {
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -200,9 +197,8 @@ func TestEphemeralMessenger_Publish_WithCorrelationAndService(t *testing.T) {
 		},
 	})
 
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      addr,
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: addr,
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })

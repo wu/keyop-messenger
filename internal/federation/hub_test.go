@@ -59,7 +59,7 @@ func newHub(t *testing.T, cfg federation.HubConfig, cw *countingWriter, auditL a
 	dd, err := dedup.NewLRUDedup(10000)
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
-	return federation.NewHub("hub", cfg, nil, cw.write, dd, auditL, log, 1000, 65536, "")
+	return federation.NewHub(cfg, nil, cw.write, dd, auditL, log, 1000, 65536, "")
 }
 
 // startHub starts hub on ":0" and returns a connected grpc.ClientConn.
@@ -268,7 +268,7 @@ func TestMTLSRejection(t *testing.T) {
 	dd, _ := dedup.NewLRUDedup(100)
 	auditL := &fakeAuditLog{}
 	log := &testutil.FakeLogger{}
-	hub := federation.NewHub("hub", federation.HubConfig{}, hubTLS,
+	hub := federation.NewHub(federation.HubConfig{}, hubTLS,
 		func(*envelope.Envelope) error { return nil }, dd, auditL, log, 100, 65536, "")
 	require.NoError(t, hub.Listen("127.0.0.1:0"))
 	defer func() { _ = hub.Close() }()
@@ -354,7 +354,7 @@ func TestHubListenError(t *testing.T) {
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub("hub", federation.HubConfig{}, nil, func(*envelope.Envelope) error { return nil },
+	hub := federation.NewHub(federation.HubConfig{}, nil, func(*envelope.Envelope) error { return nil },
 		dd, auditL, log, 16, 65536, "")
 
 	err = hub.Listen("127.0.0.1:notaport")

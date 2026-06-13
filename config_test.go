@@ -16,14 +16,10 @@ import (
 func intPtr(n int) *int { return &n }
 
 // minValidConfig returns the smallest Config that passes Validate after ApplyDefaults.
-// Name is set explicitly as a fallback in case os.Hostname() fails on the test machine.
 func minValidConfig() Config {
 	var c Config
 	c.Storage.DataDir = "/var/keyop"
 	c.ApplyDefaults()
-	if c.Name == "" {
-		c.Name = "test-host"
-	}
 	return c
 }
 
@@ -41,11 +37,6 @@ func TestValidate_Errors(t *testing.T) {
 		mutate  func(*Config)
 		wantMsg string
 	}{
-		{
-			name:    "empty name",
-			mutate:  func(c *Config) { c.Name = "" },
-			wantMsg: "name is required",
-		},
 		{
 			name:    "missing data_dir",
 			mutate:  func(c *Config) { c.Storage.DataDir = "" },
@@ -230,26 +221,12 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 0, *c.Subscribers.MaxRetries)
 	})
 
-	t.Run("name defaults to hostname", func(t *testing.T) {
-		var c Config
-		c.ApplyDefaults()
-		hostname, err := os.Hostname()
-		require.NoError(t, err)
-		assert.Equal(t, hostname, c.Name)
-	})
-
-	t.Run("explicit name not overwritten", func(t *testing.T) {
-		c := Config{Name: "my-custom-host"}
-		c.ApplyDefaults()
-		assert.Equal(t, "my-custom-host", c.Name)
-	})
 }
 
 // TestLoadConfig_RoundTrip writes a fully-populated config YAML to a temp file,
 // loads it via LoadConfig, and asserts every field matches the original.
 func TestLoadConfig_RoundTrip(t *testing.T) {
 	const yaml = `
-name: billing-host
 storage:
   data_dir: /var/keyop
   sync_interval_ms: 500
@@ -296,7 +273,6 @@ audit:
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
 
-	assert.Equal(t, "billing-host", cfg.Name)
 	assert.Equal(t, "/var/keyop", cfg.Storage.DataDir)
 	assert.Equal(t, 500, cfg.Storage.SyncIntervalMS)
 	assert.Equal(t, 1024, cfg.Storage.MaxSubscriberLagMB)

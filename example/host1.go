@@ -17,7 +17,6 @@ func host1(ctx context.Context, logger *slog.Logger, baseDir string) {
 
 	// listen on port (7740) and waits for clients to connect
 	cfg := &messenger.Config{
-		Name: "host1",
 		Storage: messenger.StorageConfig{
 			DataDir: tmpDir,
 		},

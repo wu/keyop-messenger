@@ -40,10 +40,11 @@ message HubBatch {
 }
 
 message SubscribeRequest {
-  string          instance_name = 1;
-  string          version       = 2;
-  repeated string subscribe     = 3; // channels to receive from hub
-  bool            ephemeral     = 4; // no replay on reconnect
+  // Client identity is passed via the "x-federation-instance" metadata key
+  // (same as Publish), so it is not carried in the request body.
+  string          version   = 1;
+  repeated string subscribe = 2; // channels to receive from hub
+  bool            ephemeral = 3; // no replay on reconnect
 }
 
 message EnvelopeBatch {

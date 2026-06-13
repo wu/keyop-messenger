@@ -16,7 +16,6 @@ import (
 // testConfig returns a minimal valid Config for a temporary data directory.
 func testConfig(dataDir string) *Config {
 	cfg := &Config{
-		Name: "test-instance",
 		Storage: StorageConfig{
 			DataDir: dataDir,
 		},
@@ -25,10 +24,26 @@ func testConfig(dataDir string) *Config {
 	return cfg
 }
 
+// newForTest constructs a Messenger with a stable test identity. Tests should
+// prefer this over calling New directly so they exercise the same TLS-bypass
+// path that production code never uses.
+func newForTest(dataDir string, opts ...Option) (*Messenger, error) {
+	opts = append(opts, WithTestIdentity("test-instance"))
+	return New(testConfig(dataDir), opts...)
+}
+
+// newEphemeralForTest constructs an EphemeralMessenger with a stable test
+// identity. Like newForTest, this is the right helper for tests that don't
+// provision real TLS certificates.
+func newEphemeralForTest(cfg EphemeralConfig, opts ...Option) (*EphemeralMessenger, error) {
+	opts = append(opts, WithTestIdentity("test-client"))
+	return NewEphemeralMessenger(cfg, opts...)
+}
+
 // TestEndToEnd verifies the full Publish → handler path in a single instance.
 func TestEndToEnd(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -67,7 +82,7 @@ func TestAtLeastOnce(t *testing.T) {
 	dir := t.TempDir()
 
 	// First instance: subscribe, publish, verify delivery, then close.
-	m1, err := New(testConfig(dir))
+	m1, err := newForTest(dir)
 	require.NoError(t, err)
 
 	delivered := make(chan struct{}, 10)
@@ -88,7 +103,7 @@ func TestAtLeastOnce(t *testing.T) {
 	require.NoError(t, m1.Close())
 
 	// Second instance: same subscriberID, no new publishes — expect no deliveries.
-	m2, err := New(testConfig(dir))
+	m2, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m2.Close() })
 
@@ -109,7 +124,7 @@ func TestMultipleSubscribers(t *testing.T) {
 	const numMsgs = 5
 
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -147,7 +162,7 @@ func TestMultipleSubscribers(t *testing.T) {
 // TestCloseIdempotent verifies that Close can be called more than once safely.
 func TestCloseIdempotent(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 
 	assert.NoError(t, m.Close())
@@ -157,7 +172,7 @@ func TestCloseIdempotent(t *testing.T) {
 // TestPublishAfterClose verifies that Publish returns ErrMessengerClosed.
 func TestPublishAfterClose(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	require.NoError(t, m.Close())
 
@@ -168,7 +183,7 @@ func TestPublishAfterClose(t *testing.T) {
 // TestInvalidChannelName verifies that invalid channel names are rejected.
 func TestInvalidChannelName(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -195,7 +210,7 @@ func TestInvalidChannelName(t *testing.T) {
 // subscriber goroutine and allows Close to return promptly.
 func TestCtxCancellation(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -222,7 +237,7 @@ func TestCtxCancellation(t *testing.T) {
 // the offset file.
 func TestUnsubscribe(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	defer func() { _ = m.Close() }()
 
@@ -287,7 +302,7 @@ func TestValidateChannelName(t *testing.T) {
 // TestRegisterPayloadTypeDuplicate verifies the duplicate-registration error.
 func TestRegisterPayloadTypeDuplicate(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -298,33 +313,23 @@ func TestRegisterPayloadTypeDuplicate(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPayloadTypeAlreadyRegistered)
 }
 
-// TestInstanceName verifies that InstanceName returns the configured instance name.
-func TestInstanceName(t *testing.T) {
+// TestInstanceNameFromTestIdentity verifies that WithTestIdentity sets the
+// identity returned by InstanceName when no TLS config is present.
+func TestInstanceNameFromTestIdentity(t *testing.T) {
 	dir := t.TempDir()
-	cfg := testConfig(dir)
-	cfg.Name = "my-messenger-instance"
-
-	m, err := New(cfg)
+	m, err := New(testConfig(dir), WithTestIdentity("my-messenger-instance"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
 	assert.Equal(t, "my-messenger-instance", m.InstanceName())
 }
 
-// TestInstanceNameDefault verifies that InstanceName returns the default name when not explicitly set.
-func TestInstanceNameDefault(t *testing.T) {
+// TestInstanceName_RequiresTLSOrTestIdentity verifies that New rejects a
+// config that supplies neither TLS nor a test identity. Production code must
+// always go through the TLS path.
+func TestInstanceName_RequiresTLSOrTestIdentity(t *testing.T) {
 	dir := t.TempDir()
-	cfg := &Config{
-		Storage: StorageConfig{
-			DataDir: dir,
-		},
-	}
-	cfg.ApplyDefaults()
-
-	m, err := New(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = m.Close() })
-
-	// After ApplyDefaults, Name should be set to the hostname
-	assert.NotEmpty(t, m.InstanceName())
+	_, err := New(testConfig(dir))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "TLS configuration required")
 }

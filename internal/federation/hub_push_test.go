@@ -34,7 +34,7 @@ func newHubWithData(t *testing.T, cfg federation.HubConfig, dataDir string) (*fe
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub("hub", cfg, nil,
+	hub := federation.NewHub(cfg, nil,
 		func(*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 65536, dataDir)
 	return hub, auditL
@@ -71,9 +71,8 @@ func openSubscribeReceiver(t *testing.T, stub federationv1.FederationServiceClie
 	require.NoError(t, stream.Send(&federationv1.SubscribeFrame{
 		Payload: &federationv1.SubscribeFrame_Request{
 			Request: &federationv1.SubscribeRequest{
-				InstanceName: peerName,
-				Version:      "1",
-				Subscribe:    subscribe,
+				Version:   "1",
+				Subscribe: subscribe,
 			},
 		},
 	}))
@@ -254,7 +253,7 @@ func TestHubPushBatchSizeLimit(t *testing.T) {
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub("hub", cfg, nil,
+	hub := federation.NewHub(cfg, nil,
 		func(*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 512, dataDir)
 
@@ -416,7 +415,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 	cfg := federation.HubConfig{
 		AllowedPeers: []federation.AllowedPeer{{Name: "audit-peer", Subscribe: []string{"ch"}}},
 	}
-	hub := federation.NewHub("hub", cfg, nil,
+	hub := federation.NewHub(cfg, nil,
 		func(*envelope.Envelope) error { return nil },
 		dd, auditL, &testutil.FakeLogger{}, 1000, 65536, dataDir)
 
@@ -430,9 +429,8 @@ func TestHubPushAuditEvents(t *testing.T) {
 	require.NoError(t, subStream.Send(&federationv1.SubscribeFrame{
 		Payload: &federationv1.SubscribeFrame_Request{
 			Request: &federationv1.SubscribeRequest{
-				InstanceName: "audit-peer",
-				Version:      "1",
-				Subscribe:    []string{"ch"},
+				Version:   "1",
+				Subscribe: []string{"ch"},
 			},
 		},
 	}))

@@ -60,7 +60,6 @@ func newHubMessenger(
 		hubCfg.ListenAddr = "127.0.0.1:0"
 	}
 	cfg := &Config{
-		Name: name,
 		Storage: StorageConfig{
 			DataDir: dir,
 		},
@@ -81,7 +80,6 @@ func newClientMessenger(
 ) *Messenger {
 	t.Helper()
 	cfg := &Config{
-		Name: name,
 		Storage: StorageConfig{
 			DataDir: filepath.Join(dir, name),
 		},
@@ -199,7 +197,6 @@ func TestIntegrationRingDedup(t *testing.T) {
 
 	// Hub1: client with TWO connections to Hub2 — creates dual forwarding paths.
 	hub1Cfg := &Config{
-		Name: "hub1",
 		Storage: StorageConfig{
 			DataDir: filepath.Join(dir, "hub1"),
 		},
@@ -269,7 +266,6 @@ func TestIntegrationBackpressure(t *testing.T) {
 	// Hub2 uses SyncIntervalMS: 0 to slow down local writes (simulates a slow disk).
 	hub2Dir := filepath.Join(dir, "hub2")
 	hub2Cfg := &Config{
-		Name: "hub2",
 		Storage: StorageConfig{
 			DataDir:        hub2Dir,
 			SyncIntervalMS: 0,
@@ -344,14 +340,13 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 	dir := t.TempDir()
 	// Very low compaction threshold so the compactor will delete sealed segments.
 	cfg := &Config{
-		Name: "compact-test",
 		Storage: StorageConfig{
 			DataDir:               dir,
 			CompactionThresholdMB: 1, // 1 MB; in practice will never trigger automatically but lets MaybeCompact run
 		},
 	}
 	cfg.ApplyDefaults()
-	m, err := New(cfg)
+	m, err := New(cfg, WithTestIdentity("compact-test"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -415,7 +410,6 @@ func newClientMessengerWithPolicy(
 ) *Messenger {
 	t.Helper()
 	cfg := &Config{
-		Name: name,
 		Storage: StorageConfig{
 			DataDir: filepath.Join(dir, name),
 		},
@@ -641,7 +635,6 @@ func TestFederationEndToEnd(t *testing.T) {
 	caFile := writePEM("ca.crt", caCert)
 
 	hubCfg := &Config{
-		Name: "test-hub",
 		Storage: StorageConfig{
 			DataDir: filepath.Join(dir, "hub-data"),
 		},
@@ -669,7 +662,6 @@ func TestFederationEndToEnd(t *testing.T) {
 	hubAddr := net.JoinHostPort("127.0.0.1", port)
 
 	clientCfg := &Config{
-		Name: "test-client",
 		Storage: StorageConfig{
 			DataDir: filepath.Join(dir, "client-data"),
 		},

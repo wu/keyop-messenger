@@ -16,7 +16,7 @@ import (
 func TestMessenger_ServiceName_PublishAndSubscribe(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -54,7 +54,7 @@ func TestMessenger_ServiceName_PublishAndSubscribe(t *testing.T) {
 func TestMessenger_ServiceName_Empty(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -90,7 +90,7 @@ func TestMessenger_ServiceName_Empty(t *testing.T) {
 func TestMessenger_ServiceName_MultipleMessages(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -140,7 +140,7 @@ func TestMessenger_ServiceName_MultipleMessages(t *testing.T) {
 func TestMessenger_ServiceNameAndCorrelationID(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 

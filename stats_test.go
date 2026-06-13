@@ -12,7 +12,7 @@ import (
 
 func TestStats_Empty(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -23,7 +23,7 @@ func TestStats_Empty(t *testing.T) {
 
 func TestStats_ChannelStreamBytes(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -39,7 +39,7 @@ func TestStats_ChannelStreamBytes(t *testing.T) {
 
 func TestStats_SubscriberLagAfterDelivery(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -74,7 +74,7 @@ func TestStats_SubscriberLagAfterDelivery(t *testing.T) {
 
 func TestStats_MultipleChannels(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -95,7 +95,7 @@ func TestStats_MultipleChannels(t *testing.T) {
 
 func TestStats_StreamBytesGrowsWithPublish(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -114,7 +114,7 @@ func TestStats_StreamBytesGrowsWithPublish(t *testing.T) {
 
 func TestStats_MessageCountIncludesFederated(t *testing.T) {
 	dir := t.TempDir()
-	m, err := New(testConfig(dir))
+	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 

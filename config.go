@@ -175,11 +175,10 @@ type AuditConfig struct {
 
 // Config is the top-level configuration for a Messenger instance.
 // Load it from YAML with [LoadConfig] or construct it programmatically.
+//
+// Instance identity is not configurable: it is derived from the local TLS
+// certificate's Common Name. See [New] and [tlsutil.ExtractLocalCN].
 type Config struct {
-	// Name is the human-readable identifier for this instance.
-	// Defaults to the OS hostname. Use "hostname:port" when multiple instances share a host.
-	Name string `yaml:"name"`
-
 	Storage     StorageConfig     `yaml:"storage"`
 	Subscribers SubscribersConfig `yaml:"subscribers"`
 	Hub         HubConfig         `yaml:"hub"`
@@ -217,12 +216,6 @@ func LoadConfig(path string) (*Config, error) {
 // It is called automatically by [LoadConfig]. When constructing a Config
 // programmatically, call ApplyDefaults before passing it to [New].
 func (c *Config) ApplyDefaults() {
-	if c.Name == "" {
-		if h, err := os.Hostname(); err == nil {
-			c.Name = h
-		}
-	}
-
 	if c.Storage.MaxSubscriberLagMB == 0 {
 		c.Storage.MaxSubscriberLagMB = 512
 	}
@@ -296,10 +289,6 @@ func EnsureDirectories(cfg *Config) error {
 // It expects [ApplyDefaults] to have been called first.
 func (c *Config) Validate() error {
 	var errs []error
-
-	if c.Name == "" {
-		errs = append(errs, errors.New("name is required (set explicitly or ensure os.Hostname() succeeds)"))
-	}
 
 	if c.Storage.DataDir == "" {
 		errs = append(errs, errors.New("storage.data_dir is required"))

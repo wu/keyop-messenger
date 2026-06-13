@@ -2,9 +2,10 @@ package messenger
 
 // messengerOptions holds construction-time settings that are not part of Config.
 type messengerOptions struct {
-	logger  Logger
-	dataDir string // overrides Config.Storage.DataDir when non-empty
-	cfg     *Config
+	logger       Logger
+	dataDir      string // overrides Config.Storage.DataDir when non-empty
+	cfg          *Config
+	testIdentity string // test-only override for the TLS-derived instance name
 }
 
 func defaultOptions() messengerOptions {

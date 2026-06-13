@@ -249,10 +249,9 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 			subErr = subStream.Send(&federationv1.SubscribeFrame{
 				Payload: &federationv1.SubscribeFrame_Request{
 					Request: &federationv1.SubscribeRequest{
-						InstanceName: c.instanceName,
-						Version:      wireVersion,
-						Subscribe:    c.subscribe,
-						Ephemeral:    true,
+						Version:   wireVersion,
+						Subscribe: c.subscribe,
+						Ephemeral: true,
 					},
 				},
 			})

@@ -14,9 +14,8 @@ import (
 // with a valid config and verifies it succeeds.
 func TestNewEphemeralMessenger_ValidConfig(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	assert.NotNil(t, em)
@@ -27,33 +26,31 @@ func TestNewEphemeralMessenger_ValidConfig(t *testing.T) {
 // returns a validation error.
 func TestNewEphemeralMessenger_MissingHubAddr(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		InstanceName: "test-client",
-	})
+	em, err := newEphemeralForTest(EphemeralConfig{})
 	assert.Error(t, err)
 	assert.Nil(t, em)
 	assert.ErrorContains(t, err, "HubAddr")
 }
 
-// TestNewEphemeralMessenger_MissingInstanceName verifies that missing
-// InstanceName returns a validation error.
-func TestNewEphemeralMessenger_MissingInstanceName(t *testing.T) {
+// TestNewEphemeralMessenger_RequiresTLSOrTestIdentity verifies that without
+// a TLS config (and without the test-only override) NewEphemeralMessenger
+// refuses to construct, since instance identity has no defined source.
+func TestNewEphemeralMessenger_RequiresTLSOrTestIdentity(t *testing.T) {
 	t.Parallel()
 	em, err := NewEphemeralMessenger(EphemeralConfig{
 		HubAddr: "hub.example.com:7740",
 	})
 	assert.Error(t, err)
 	assert.Nil(t, em)
-	assert.ErrorContains(t, err, "InstanceName")
+	assert.ErrorContains(t, err, "TLS configuration required")
 }
 
 // TestNewEphemeralMessenger_WithTLS constructs an EphemeralMessenger with
 // TLS config. TLS cert files don't exist, so this should fail at TLS build time.
 func TestNewEphemeralMessenger_WithTLS_MissingCert(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 		TLS: TLSConfig{
 			Cert: "/nonexistent/cert.pem",
 			Key:  "/nonexistent/key.pem",
@@ -71,10 +68,9 @@ func TestNewEphemeralMessenger_WithLogger(t *testing.T) {
 	// Use a custom logger via WithLogger option
 	loggerCalls := 0
 	customLogger := &testLogger{calls: &loggerCalls}
-	em, err := NewEphemeralMessenger(
+	em, err := newEphemeralForTest(
 		EphemeralConfig{
-			HubAddr:      "hub.example.com:7740",
-			InstanceName: "test-client",
+			HubAddr: "hub.example.com:7740",
 		},
 		WithLogger(customLogger),
 	)
@@ -87,9 +83,8 @@ func TestNewEphemeralMessenger_WithLogger(t *testing.T) {
 // and verifies it succeeds.
 func TestEphemeralMessenger_RegisterPayloadType_Valid(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -106,9 +101,8 @@ func TestEphemeralMessenger_RegisterPayloadType_Valid(t *testing.T) {
 // registering the same payload type twice returns an error.
 func TestEphemeralMessenger_RegisterPayloadType_Duplicate(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -129,10 +123,9 @@ func TestEphemeralMessenger_RegisterPayloadType_Duplicate(t *testing.T) {
 // a valid channel and verifies it succeeds.
 func TestEphemeralMessenger_Subscribe_ValidChannel(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
-		Subscribe:    []string{"events", "metrics"},
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   "hub.example.com:7740",
+		Subscribe: []string{"events", "metrics"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -145,9 +138,8 @@ func TestEphemeralMessenger_Subscribe_ValidChannel(t *testing.T) {
 // channel names are rejected.
 func TestEphemeralMessenger_Subscribe_InvalidChannel(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -168,10 +160,9 @@ func TestEphemeralMessenger_Subscribe_InvalidChannel(t *testing.T) {
 // handlers on the same channel and verifies they are all stored.
 func TestEphemeralMessenger_Subscribe_MultipleHandlers(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
-		Subscribe:    []string{"events"},
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   "hub.example.com:7740",
+		Subscribe: []string{"events"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -190,9 +181,8 @@ func TestEphemeralMessenger_Subscribe_MultipleHandlers(t *testing.T) {
 // rejects invalid channel names.
 func TestEphemeralMessenger_Publish_InvalidChannel(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -207,9 +197,8 @@ func TestEphemeralMessenger_Publish_InvalidChannel(t *testing.T) {
 // validates the payload can be marshalled.
 func TestEphemeralMessenger_Publish_InvalidPayloadType(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -228,9 +217,8 @@ func TestEphemeralMessenger_Publish_InvalidPayloadType(t *testing.T) {
 // context is already cancelled.
 func TestEphemeralMessenger_Connect_ContextCancelled(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -247,9 +235,8 @@ func TestEphemeralMessenger_Connect_ContextCancelled(t *testing.T) {
 // multiple times without error.
 func TestEphemeralMessenger_Close_Idempotent(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 
@@ -263,11 +250,10 @@ func TestEphemeralMessenger_Close_Idempotent(t *testing.T) {
 func TestEphemeralMessenger_ConfigDefaults(t *testing.T) {
 	t.Parallel()
 	cfg := EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+		HubAddr: "hub.example.com:7740",
 		// All optional fields left zero
 	}
-	em, err := NewEphemeralMessenger(cfg)
+	em, err := newEphemeralForTest(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
 
@@ -279,10 +265,9 @@ func TestEphemeralMessenger_ConfigDefaults(t *testing.T) {
 // both before and after Close, verifying behavior is consistent.
 func TestEphemeralMessenger_Subscribe_BeforeClose(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
-		Subscribe:    []string{"events"},
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   "hub.example.com:7740",
+		Subscribe: []string{"events"},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -302,9 +287,8 @@ func TestEphemeralMessenger_Subscribe_BeforeClose(t *testing.T) {
 // multiple different payload types and verifies they all succeed.
 func TestEphemeralMessenger_RegisterPayloadType_Multiple(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
@@ -322,9 +306,8 @@ func TestEphemeralMessenger_RegisterPayloadType_Multiple(t *testing.T) {
 // non-duplicate error path in RegisterPayloadType (prototype == nil).
 func TestEphemeralMessenger_RegisterPayloadType_NilPrototype(t *testing.T) {
 	t.Parallel()
-	em, err := NewEphemeralMessenger(EphemeralConfig{
-		HubAddr:      "hub.example.com:7740",
-		InstanceName: "test-client",
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr: "hub.example.com:7740",
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })

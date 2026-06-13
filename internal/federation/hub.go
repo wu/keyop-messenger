@@ -62,7 +62,6 @@ const wireVersion = "1"
 type Hub struct {
 	federationv1.UnimplementedFederationServiceServer
 
-	instanceName       string
 	tlsCfg             *tls.Config
 	localWriter        func(*envelope.Envelope) error
 	dedup              Deduplicator
@@ -97,7 +96,6 @@ type Hub struct {
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
 func NewHub(
-	instanceName string,
 	cfg HubConfig,
 	tlsCfg *tls.Config,
 	localWriter func(*envelope.Envelope) error,
@@ -108,7 +106,6 @@ func NewHub(
 	dataDir string,
 ) *Hub {
 	return &Hub{
-		instanceName:   instanceName,
 		cfg:            cfg,
 		tlsCfg:         tlsCfg,
 		localWriter:    localWriter,
@@ -243,9 +240,24 @@ func (h *Hub) Close() error {
 	return nil
 }
 
-// peerNameFromContext extracts the peer instance name from gRPC metadata,
-// overriding with the TLS certificate CN when mTLS is in use.
-func (h *Hub) peerNameFromContext(ctx context.Context) (string, error) {
+// authenticatePeer returns the peer's identity for a Publish or Subscribe
+// stream. On a TLS connection the certificate CN is the only acceptable
+// identity (tamper-proof); a TLS connection with no peer certificate or an
+// empty CN is rejected. The x-federation-instance metadata header is only
+// honored on non-TLS connections.
+func (h *Hub) authenticatePeer(ctx context.Context) (string, error) {
+	if p, ok := peer.FromContext(ctx); ok {
+		if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok {
+			if len(tlsInfo.State.PeerCertificates) == 0 {
+				return "", errors.New("TLS connection has no peer certificate")
+			}
+			cn := tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0])
+			if cn == "" {
+				return "", errors.New("TLS peer certificate has empty CN")
+			}
+			return cn, nil
+		}
+	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return "", errors.New("missing gRPC metadata")
@@ -254,17 +266,7 @@ func (h *Hub) peerNameFromContext(ctx context.Context) (string, error) {
 	if len(vals) == 0 {
 		return "", errors.New("missing x-federation-instance metadata")
 	}
-	peerName := vals[0]
-
-	// Override with TLS cert CN when mTLS is in use (tamper-proof).
-	if p, ok := peer.FromContext(ctx); ok {
-		if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok {
-			if len(tlsInfo.State.PeerCertificates) > 0 {
-				peerName = tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0])
-			}
-		}
-	}
-	return peerName, nil
+	return vals[0], nil
 }
 
 // peerAddrFromContext extracts the remote address string from gRPC peer info.
@@ -284,7 +286,7 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 	}
 	defer h.handlerExit()
 
-	peerName, err := h.peerNameFromContext(stream.Context())
+	peerName, err := h.authenticatePeer(stream.Context())
 	if err != nil {
 		return status.Errorf(codes.InvalidArgument, "federation: %v", err)
 	}
@@ -397,6 +399,11 @@ func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFr
 	}
 	defer h.handlerExit()
 
+	peerName, err := h.authenticatePeer(stream.Context())
+	if err != nil {
+		return status.Errorf(codes.InvalidArgument, "federation: %v", err)
+	}
+
 	// First frame must be a SubscribeRequest.
 	frame, err := stream.Recv()
 	if err != nil {
@@ -405,16 +412,6 @@ func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFr
 	req := frame.GetRequest()
 	if req == nil {
 		return status.Error(codes.InvalidArgument, "first frame must be SubscribeRequest")
-	}
-
-	peerName := req.InstanceName
-	// Override with TLS cert CN when mTLS is in use.
-	if p, ok := peer.FromContext(stream.Context()); ok {
-		if tlsInfo, ok := p.AuthInfo.(credentials.TLSInfo); ok {
-			if len(tlsInfo.State.PeerCertificates) > 0 {
-				peerName = tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0])
-			}
-		}
 	}
 
 	h.mu.RLock()

@@ -18,12 +18,12 @@ import (
 var ErrEphemeralConnLost = federation.ErrEphemeralConnLost
 
 // EphemeralConfig configures an EphemeralMessenger.
+//
+// Instance identity is not configurable: it is derived from the local TLS
+// certificate's Common Name. See [NewEphemeralMessenger].
 type EphemeralConfig struct {
 	// HubAddr is the host:port of the hub to connect to. Required.
 	HubAddr string
-	// InstanceName identifies this client in the hub's allowlist.
-	// Must match the CN of the TLS certificate. Required.
-	InstanceName string
 	// Subscribe lists the channels to receive messages from the hub.
 	// These are declared in the handshake; the hub may deliver a subset
 	// based on its access control policy. Fixed at connect time.
@@ -59,6 +59,7 @@ type EphemeralConfig struct {
 // Construct with NewEphemeralMessenger; call Subscribe before Connect.
 type EphemeralMessenger struct {
 	cfg    EphemeralConfig
+	name   string // derived from local TLS cert CN (or test override)
 	client *federation.EphemeralClient
 	reg    registry.PayloadRegistry
 }
@@ -68,9 +69,6 @@ type EphemeralMessenger struct {
 func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMessenger, error) {
 	if cfg.HubAddr == "" {
 		return nil, errors.New("ephemeral messenger: HubAddr is required")
-	}
-	if cfg.InstanceName == "" {
-		return nil, errors.New("ephemeral messenger: InstanceName is required")
 	}
 
 	o := defaultOptions()
@@ -87,8 +85,25 @@ func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMesse
 		}
 	}
 
+	// Resolve instance identity. See [New] for the rationale; the rule is the
+	// same here: production code derives the name from the local cert CN, and
+	// tests may override with WithTestIdentity.
+	var name string
+	switch {
+	case o.testIdentity != "":
+		name = o.testIdentity
+	case tlsCfg != nil:
+		var err error
+		name, err = tlsutil.ExtractLocalCN(tlsCfg)
+		if err != nil {
+			return nil, fmt.Errorf("ephemeral messenger: derive instance identity: %w", err)
+		}
+	default:
+		return nil, errors.New("ephemeral messenger: TLS configuration required to determine instance identity")
+	}
+
 	fedCfg := federation.EphemeralClientConfig{
-		InstanceName:    cfg.InstanceName,
+		InstanceName:    name,
 		TLSConfig:       tlsCfg,
 		Subscribe:       cfg.Subscribe,
 		MaxBatchBytes:   cfg.MaxBatchBytes,
@@ -100,6 +115,7 @@ func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMesse
 
 	return &EphemeralMessenger{
 		cfg:    cfg,
+		name:   name,
 		client: federation.NewEphemeralClient(fedCfg, o.logger),
 		reg:    registry.New(o.logger),
 	}, nil
@@ -165,7 +181,7 @@ func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType s
 	if err := ValidateChannelName(channel); err != nil {
 		return err
 	}
-	env, err := envelope.NewEnvelope(channel, m.cfg.InstanceName, payloadType, payload)
+	env, err := envelope.NewEnvelope(channel, m.name, payloadType, payload)
 	if err != nil {
 		return fmt.Errorf("ephemeral publish: create envelope: %w", err)
 	}

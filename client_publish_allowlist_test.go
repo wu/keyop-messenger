@@ -51,7 +51,6 @@ func TestMessenger_Client_PublishAllowlist(t *testing.T) {
 
 	// Create client with restricted publish allowlist
 	clientCfg := &Config{
-		Name: "restricted-client",
 		Storage: StorageConfig{
 			DataDir: filepath.Join(tmpDir, "restricted-client"),
 		},
@@ -165,7 +164,6 @@ func TestMessenger_Client_ReceiveAllowlist(t *testing.T) {
 
 	// Create client that subscribes to specific channels (but also publishes on different ones)
 	clientCfg := &Config{
-		Name: "restricted-client",
 		Storage: StorageConfig{
 			DataDir: filepath.Join(tmpDir, "restricted-client"),
 		},

@@ -16,9 +16,8 @@ import (
 func TestWithConfigNilPositional(t *testing.T) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
-	cfg.Name = "via-option"
 
-	m, err := New(nil, WithConfig(cfg))
+	m, err := New(nil, WithConfig(cfg), WithTestIdentity("via-option"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -27,20 +26,19 @@ func TestWithConfigNilPositional(t *testing.T) {
 
 // TestWithConfigPositionalTakesPrecedence verifies that when both the
 // positional Config and WithConfig are provided, the positional arg wins.
+// (Identity is supplied independently via WithTestIdentity; the precedence
+// being tested here is the Config object, not the identity.)
 func TestWithConfigPositionalTakesPrecedence(t *testing.T) {
 	dir := t.TempDir()
-
 	positional := testConfig(dir)
-	positional.Name = "positional"
+	optionCfg := testConfig(t.TempDir()) // distinct dir to detect which won
 
-	optionCfg := testConfig(dir)
-	optionCfg.Name = "from-option"
-
-	m, err := New(positional, WithConfig(optionCfg))
+	m, err := New(positional, WithConfig(optionCfg), WithTestIdentity("positional"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
 	assert.Equal(t, "positional", m.InstanceName())
+	assert.Equal(t, dir, m.cfg.Storage.DataDir, "positional config must win over WithConfig")
 }
 
 // TestWithConfigBothNilErrors verifies that New returns an error when no
@@ -57,7 +55,7 @@ func TestWithDataDirOverridesConfig(t *testing.T) {
 	overrideDir := t.TempDir()
 
 	cfg := testConfig(configDir)
-	m, err := New(cfg, WithDataDir(overrideDir))
+	m, err := New(cfg, WithDataDir(overrideDir), WithTestIdentity("test-instance"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
@@ -80,9 +78,8 @@ func TestWithDataDirWithNilConfig(t *testing.T) {
 	overrideDir := t.TempDir()
 
 	cfg := testConfig(configDir)
-	cfg.Name = "combo"
 
-	m, err := New(nil, WithConfig(cfg), WithDataDir(overrideDir))
+	m, err := New(nil, WithConfig(cfg), WithDataDir(overrideDir), WithTestIdentity("combo"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 
