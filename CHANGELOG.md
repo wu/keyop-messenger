@@ -1,3 +1,14 @@
+## [1.5.0](https://github.com/wu/keyop-messenger/compare/v1.4.1...v1.5.0) (2026-06-13)
+
+### Features
+
+* migrate federation layer from HTTP/1.1 WebSocket to gRPC ([e78ce9c](https://github.com/wu/keyop-messenger/commit/e78ce9c75f4f9ec9c4e6436048b403f1ea4f3d83))
+
+### Bug Fixes
+
+* drain PeerSender buf into unacked on stream close ([4c9c6c2](https://github.com/wu/keyop-messenger/commit/4c9c6c28c46abb9fd8e24dfaf2eff38cbed69f1f))
+* eliminate Add/Wait data race on Hub.handlerWg ([7e9bc74](https://github.com/wu/keyop-messenger/commit/7e9bc7451a66185e50f305b60a6f53db76eace3a))
+
 ## [1.4.1](https://github.com/wu/keyop-messenger/compare/v1.4.0...v1.4.1) (2026-06-12)
 
 ### Bug Fixes
