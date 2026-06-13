@@ -27,7 +27,7 @@ type Envelope struct {
 	// this build. Readers must tolerate unknown versions gracefully.
 	V int `json:"v"`
 
-	// ID is a UUID v4 that uniquely identifies this message. Used for
+	// ID is a UUID v7 that uniquely identifies this message. Used for
 	// deduplication across hubs; it is not the instance identifier.
 	ID string `json:"id"`
 
@@ -122,7 +122,7 @@ func Unmarshal(data []byte) (Envelope, error) {
 	return env, nil
 }
 
-// NewEnvelope constructs a ready-to-publish Envelope. It generates a UUID v4
+// NewEnvelope constructs a ready-to-publish Envelope. It generates a UUID v7
 // message ID, stamps the current UTC time, and marshals payload into JSON.
 //
 // channel is the destination channel name.

@@ -63,7 +63,7 @@ func ValidateChannelName(name string) error {
 // Message is the decoded representation of a stored envelope delivered to a
 // subscriber handler.
 type Message struct {
-	// ID is the UUID v4 that uniquely identifies this message.
+	// ID is the UUID v7 that uniquely identifies this message.
 	ID string
 	// Channel is the channel the message was published to.
 	Channel string

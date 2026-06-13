@@ -80,7 +80,7 @@ func TestUnmarshal_MalformedJSON(t *testing.T) {
 }
 
 // TestNewEnvelope verifies the generated fields satisfy the spec:
-// UUID v4 ID, UTC timestamp with no monotonic clock, and correct field values.
+// UUID v7 ID, UTC timestamp with no monotonic clock, and correct field values.
 func TestNewEnvelope(t *testing.T) {
 	before := time.Now().UTC()
 

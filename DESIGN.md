@@ -74,15 +74,15 @@ Every message written to a `.jsonl` file is a single JSON object on one line:
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `v` | int | Envelope schema version. Currently `1`. |
-| `id` | string | UUID v4 assigned by the publisher. Globally unique. Used for deduplication only — not the instance identifier. |
-| `ts` | string | RFC3339Nano timestamp at time of publish, in UTC. |
-| `channel` | string | The channel this message was published to. |
-| `origin` | string | Instance name of the original publisher. Preserved across hub forwarding. |
-| `payload_type` | string | Fully-qualified type discriminator for the payload. Reverse-DNS format recommended. |
-| `payload` | object | Arbitrary JSON object. Shape is defined by the payload type. |
+| Field | Type | Description                                                                                                    |
+|---|---|----------------------------------------------------------------------------------------------------------------|
+| `v` | int | Envelope schema version. Currently `1`.                                                                        |
+| `id` | string | UUID v7 assigned by the publisher. Globally unique. Used for deduplication only — not the instance identifier. |
+| `ts` | string | RFC3339Nano timestamp at time of publish, in UTC.                                                              |
+| `channel` | string | The channel this message was published to.                                                                     |
+| `origin` | string | Instance name of the original publisher. Preserved across hub forwarding.                                      |
+| `payload_type` | string | Fully-qualified type discriminator for the payload. Reverse-DNS format recommended.                            |
+| `payload` | object | Arbitrary JSON object. Shape is defined by the payload type.                                                   |
 
 The envelope is intentionally minimal. Infrastructure fields live in the envelope; all application semantics live in `payload`.
 
@@ -244,7 +244,7 @@ The instance name is used for:
 - Audit log entries
 - Human-readable log messages
 
-The message `id` field (UUID v4) is separate from the instance name. It is generated per-message and used exclusively for deduplication. It is not an instance identifier.
+The message `id` field (UUID v7) is separate from the instance name. It is generated per-message and used exclusively for deduplication. It is not an instance identifier.
 
 ### 6.2 gRPC Connection
 
