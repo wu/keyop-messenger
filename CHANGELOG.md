@@ -1,3 +1,9 @@
+## [4.0.0](https://github.com/wu/keyop-messenger/compare/v3.0.1...v4.0.0) (2026-06-13)
+
+### Features
+
+* derive instance identity from TLS cert CN; unify peer auth ([a558284](https://github.com/wu/keyop-messenger/commit/a558284d1ed7ad95386973810338737b441b7eff))
+
 ## [3.0.1](https://github.com/wu/keyop-messenger/compare/v3.0.0...v3.0.1) (2026-06-13)
 
 ### Bug Fixes
