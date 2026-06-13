@@ -6,7 +6,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 
 - **Reliable at-least-once delivery** backed by append-only `.jsonl` log files
 - **Fan-out isolation** — slow subscribers do not affect other subscribers or publishers
-- **Federated messaging** — instances connect via WebSocket with mutual TLS; hubs forward select channels to peer hubs under explicit policy
+- **Federated messaging** — instances connect via gRPC with mutual TLS; hubs forward select channels to peer hubs under explicit policy
 - **Subscription-based routing** — clients declare which channels they want; hubs enforce per-client allowlists that are statically configured
 - **Dead letter queue** — messages that exceed the retry limit are moved to a dead-letter channel rather than blocking delivery
 - **Audit logging** — all cross-hub message forwarding is recorded with automatic rotation
@@ -22,9 +22,9 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 | **Channel**             | A named, ordered stream of messages (analogous to a Kafka topic)                                                                          |
 | **Publisher**           | Code that appends a message to a channel                                                                                                  |
 | **Subscriber**          | Code that reads and processes messages from a channel                                                                                     |
-| **Hub**                 | An instance that accepts inbound WebSocket connections from clients and/or peer hubs                                                      |
+| **Hub**                 | An instance that accepts inbound gRPC connections from clients and/or peer hubs                                                           |
 | **Client**              | An instance that dials outbound to one or more hubs                                                                                       |
-| **Peer hub**            | A hub-to-hub WebSocket connection carrying forwarded messages                                                                             |
+| **Peer hub**            | A hub-to-hub gRPC connection carrying forwarded messages                                                                                  |
 | **Dead-letter channel** | A channel named `{channel}.dead-letter` that receives messages the subscriber has failed to process after the maximum retry count         |
 
 An instance may be a hub, a client, or both simultaneously.
@@ -157,7 +157,7 @@ If the channel writer goroutine encounters a write error (disk full, I/O error),
 
 1. The write is retried every 10ms until it succeeds.
 2. Because the writer goroutine is busy in the retry loop, it is not reading from the (unbuffered) rendezvous channel. Any concurrent `Publish()` call blocks immediately when it tries to hand its request to the writer.
-3. For federated messages arriving over WebSocket: the hub's per-peer receiver goroutine blocks on `Publish()`, which stops it from reading further WebSocket frames. TCP flow control propagates this backpressure to the sending peer's OS send buffer, which in turn blocks the sending goroutine on the remote hub.
+3. For federated messages arriving over gRPC: the hub's per-peer receiver goroutine blocks on `Publish()`, which stops it from reading further gRPC stream frames. HTTP/2 flow control propagates this backpressure to the sending peer's connection window, which in turn blocks the sending goroutine on the remote client.
 
 This guarantees that a full disk causes the entire affected write path to stall rather than silently lose messages. The operator must resolve the disk condition; no messages are dropped.
 
@@ -232,62 +232,61 @@ Deregistering a subscriber removes its offset file and allows compaction to proc
 
 ### 6.1 Instance Identity
 
-Each instance is identified by a human-readable **instance name**, which defaults to the OS hostname. If multiple instances run on the same physical host (e.g., on different ports), the name should be set explicitly in config to `hostname:port` to ensure uniqueness. If the name is empty after applying defaults (e.g., `os.Hostname()` fails), startup is rejected with a validation error.
+Each instance is identified by a human-readable **instance name** derived from its TLS certificate's Common Name. The certificate CN is the authoritative identity source: when a TLS connection is established, the hub extracts the CN from the peer certificate and uses it for all allowlist checks and audit log entries. Configuring a name in the config file has no effect on the identity seen over the wire — only the cert CN matters.
 
-The instance name is embedded in the TLS certificate as the Common Name and as a DNS Subject Alternative Name. It is used for:
-- Allowlist authorization (hub checks connecting instance name against its config)
+For instances without TLS (plain connections used only in unit/integration tests), the instance name falls back to the OS hostname. Actual deployed instances must always use TLS.
+
+If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `hostname:7740` and `hostname:7741`). The CLI `keygen instance --name hostname:port` generates a cert with the appropriate CN and DNS SAN.
+
+The instance name is used for:
+- Allowlist authorization (hub verifies the cert CN against its `allowed_peers` config)
 - The `origin` field in message envelopes
 - Audit log entries
 - Human-readable log messages
 
 The message `id` field (UUID v4) is separate from the instance name. It is generated per-message and used exclusively for deduplication. It is not an instance identifier.
 
-### 6.2 WebSocket Connection
+### 6.2 gRPC Connection
 
-Federation uses WebSocket over TLS (`wss://`). Both sides present certificates; both sides verify the peer cert against the shared CA. The `tls.min_version` config field accepts only `"1.2"` or `"1.3"` and defaults to `"1.3"`; any other value is rejected at startup.
+Federation uses gRPC over mutual TLS. Both sides present certificates; both sides verify the peer cert against the shared CA. The `tls.min_version` config field accepts only `"1.2"` or `"1.3"` and defaults to `"1.3"`; any other value is rejected at startup.
 
-After the TLS handshake, the application-level handshake exchanges a JSON text frame. The connecting side sends first:
+The gRPC service exposes two bidirectional streaming RPCs:
 
-```json
-{
-  "instance_name": "billing-host",
-  "role":          "client",
-  "version":       "1",
-  "subscribe":     ["alerts", "metrics"]
+```protobuf
+service FederationService {
+  rpc Publish(stream PublishBatch)   returns (stream PublishAck);
+  rpc Subscribe(stream SubscribeFrame) returns (stream HubBatch);
 }
 ```
 
-The hub responds with its own handshake (without a `subscribe` field):
+**Publish RPC** — carries messages from client to hub:
+- Client streams `PublishBatch` frames (one or more serialised envelopes per frame).
+- Hub streams `PublishAck` frames back, one per received batch.
+- The hub extracts the client's identity from the TLS peer certificate CN. For plain (test-only) connections, identity falls back to the `x-federation-instance` gRPC metadata key.
 
-```json
-{
-  "instance_name": "hub1",
-  "role":          "hub",
-  "version":       "1"
-}
-```
+**Subscribe RPC** — carries messages from hub to client:
+- The client sends a single `SubscribeRequest` as the first frame, declaring its identity and the channel list it wants to receive.
+- The hub then streams `HubBatch` frames containing envelope records.
+- The client acknowledges each batch by sending an `Ack` frame back on the same stream.
+- A `CloseNotice` frame from the hub signals an orderly shutdown.
 
-The `role` field is informational. Authorization (see §6.4) determines whether the connection is accepted regardless of the declared role. `subscribe` is omitted when the client only publishes and does not want to receive any channels.
-
-The `last_id` field is present in the `HandshakeMsg` struct for wire compatibility with older peers but is not sent by clients and is ignored by hubs. The hub tracks delivery progress server-side via per-peer byte offset files (see §6.8).
+A client that only publishes and does not want to receive any messages opens only the Publish stream. A client that only subscribes opens only the Subscribe stream. Full-duplex clients open both.
 
 ### 6.3 Message Wire Format
 
-Messages are sent as binary WebSocket frames. Each frame carries one or more envelope records, length-prefixed, to allow batching:
+Each `PublishBatch` or `HubBatch` record list carries one or more serialised envelope records. Individual records use the same `envelope.Marshal` format written to `.jsonl` files on disk — a single JSON line per envelope. gRPC's own HTTP/2 framing handles record delimitation; no additional length-prefix is applied by the application layer.
 
-```
-[4 bytes: record length][record bytes][4 bytes: record length][record bytes]...
-```
+Batching is applied when messages are queued faster than the network can drain them. The sender flushes the current batch immediately if the queue is empty (no artificial delay). Maximum batch size is configurable (default: 4 MiB).
 
-Batching is applied when messages are queued faster than the network can drain them. The sender flushes the current batch immediately if the queue is empty (no artificial delay). Maximum batch size is configurable (default: 64 KB per frame).
-
-An acknowledgment frame is sent by the receiver after writing a batch to its local `.jsonl` file. The sender buffers unacknowledged messages and retransmits on reconnect.
+The receiver sends an acknowledgment (`PublishAck` or `Ack`) after writing a batch to its local `.jsonl` file. The sender buffers unacknowledged messages and retransmits on reconnect.
 
 ### 6.4 Authorization: Two Layers
 
 **Layer 1 — mTLS:** The TLS handshake verifies the peer holds a certificate signed by the configured CA. A peer with no valid cert or a cert from an unknown CA is rejected at the TLS layer before any application code runs.
 
-**Layer 2 — Allowlist:** After the handshake, the hub extracts the instance name from the peer cert's CN and checks it against its configured `allowed_peers` list. A peer with a valid cert but an unrecognized name is rejected with a close frame (code 4403) and the connection is recorded in the audit log.
+**Layer 2 — Allowlist:** After the TLS handshake, the hub extracts the peer's instance name from the TLS peer certificate CN. If TLS is active but the peer presents no certificate, or the certificate has no CN, the connection is rejected immediately. The extracted name is checked against the hub's configured `allowed_peers` list. A peer with a valid cert but an unrecognized CN is rejected with gRPC status `PermissionDenied` and the connection is recorded in the audit log.
+
+For plain (non-TLS) connections — used only in unit/integration tests — the hub falls back to the `x-federation-instance` gRPC metadata key for identity. Plain connections from peers not in the allowlist are rejected with the same `PermissionDenied` status.
 
 Clients never perform allowlist checks — a client accepts any hub it is configured to dial (trust is established by the cert).
 
@@ -531,7 +530,7 @@ JSON is used throughout for debuggability. The standard library `encoding/json` 
 - Subscriber reads use `bufio.Scanner` which reuses its internal buffer across lines.
 - The payload registry stores a prototype value per type string; `json.Unmarshal` decodes into a fresh copy of that prototype on each message delivery.
 
-The wire format between hubs uses the same JSON envelope, length-prefixed within a binary WebSocket frame.
+The wire format between hubs uses the same JSON envelope bytes, carried as records within gRPC `PublishBatch` or `HubBatch` protobuf messages. No additional length-prefix is applied at the application layer; gRPC's HTTP/2 framing handles delimitation.
 
 ### 9.4 Concurrency Model
 
@@ -539,8 +538,8 @@ The wire format between hubs uses the same JSON envelope, length-prefixed within
 |---|---|
 | Per-channel file writer | 1 goroutine per channel, owns the file descriptor |
 | Per-subscriber reader | 1 goroutine per subscriber, independent cursor |
-| Per-peer-hub sender | 1 goroutine per peer connection, owns the send queue |
-| Per-peer-hub receiver | 1 goroutine per peer connection |
+| Per-peer Publish stream sender | 1 goroutine per peer connection, owns all writes on the Publish gRPC stream |
+| Per-peer Subscribe stream receiver | 1 goroutine per peer connection, owns all reads on the Subscribe gRPC stream |
 | Policy watcher | 1 goroutine, shared |
 | Audit writer | 1 goroutine, shared |
 
@@ -636,7 +635,7 @@ federation:
   reconnect_max_ms: 60000
   reconnect_jitter: 0.2
   send_buffer_messages: 10000   # Max buffered messages per peer during disconnect
-  max_batch_bytes: 65536        # Max WebSocket frame payload size
+  max_batch_bytes: 4194304      # Max gRPC message payload size (default 4 MiB)
 
 dedup:
   seen_id_lru_size: 100000
@@ -659,21 +658,20 @@ An **ephemeral client** is a process that connects to a hub without maintaining 
 
 The public API is `EphemeralMessenger`; the internal implementation is `EphemeralClient` in `internal/federation`.
 
-### 11.2 Handshake Flag
+### 11.2 Ephemeral Flag
 
-The ephemeral client sets `"ephemeral": true` in its handshake frame:
+The ephemeral client sets `ephemeral: true` in the `SubscribeRequest` proto message sent as the first frame on the Subscribe stream:
 
-```json
-{
-  "instance_name": "billing-service",
-  "role":          "client",
-  "version":       "1",
-  "subscribe":     ["alerts"],
-  "ephemeral":     true
+```protobuf
+SubscribeRequest {
+  instance_name: "billing-service"
+  version:       "1"
+  subscribe:     ["alerts"]
+  ephemeral:     true
 }
 ```
 
-The `ephemeral` field is `omitempty`; it is absent from non-ephemeral connections and from the hub's response. This ensures backward compatibility with hubs that do not yet understand the field.
+If the client only publishes and opens no Subscribe stream, the flag is irrelevant — publish-only clients never receive messages regardless.
 
 When the hub sees `ephemeral: true`, it does not create per-channel offset files for that peer — messages published before the connection are not delivered, and no offset file is written to disk. The hub logs ephemeral connections at a distinct info message so operators can distinguish them from durable client connections.
 
@@ -683,14 +681,14 @@ When the hub sees `ephemeral: true`, it does not create per-channel offset files
 
 | Outcome | Return value |
 |---|---|
-| Hub writes the message and sends an ack text frame | `nil` |
+| Hub writes the message and sends a `PublishAck` | `nil` |
 | Connection drops before the ack arrives | `ErrEphemeralConnLost` |
 | `ctx` is cancelled or deadline exceeded | wrapped `ctx.Err()` |
 | `Close()` was called | `ErrEphemeralClosed` |
 
 On `ErrEphemeralConnLost`, the message **may or may not** have been received by the hub — the caller must decide whether to retry. There is no automatic retransmission; that is the caller's responsibility.
 
-Multiple `Publish` calls may be batched into a single binary WebSocket frame when they arrive concurrently. The hub acks the entire batch with one text frame; all callers in the batch are unblocked simultaneously. The hub uses the standard `PeerReceiver` ack path, so all deduplication, policy enforcement, and local storage semantics are identical to regular federation.
+Multiple `Publish` calls may be batched into a single `PublishBatch` gRPC message when they arrive concurrently. The hub acks the entire batch with one `PublishAck`; all callers in the batch are unblocked simultaneously. The hub uses the standard `Publish` stream handler, so all deduplication, policy enforcement, and local storage semantics are identical to regular federation.
 
 ### 11.4 Subscribe Semantics
 
@@ -710,23 +708,29 @@ With `AutoReconnect: true`, `EphemeralMessenger.Connect` (which delegates to `Ep
 delay = min(reconnect_base * 2^attempt, reconnect_max) ± jitter
 ```
 
-The `writeQ` channel (depth 256 by default) persists across reconnects. Items enqueued by `Publish` while disconnected wait in `writeQ` until a new connection is established. If the queue fills, new `Publish` calls block until space is available (no drops).
+The outbound buffer (depth 256 by default) persists across reconnects. Items enqueued by `Publish` while disconnected wait until a new connection is established. If the buffer fills, the message is dropped with a warning logged; callers are not blocked (fire-and-forget behaviour for ephemeral publishers).
 
 With `AutoReconnect: false`, `Connect` dials once. After disconnect, subsequent `Publish` calls return `ErrEphemeralConnLost` until `Connect` is called again.
 
 ### 11.6 Goroutine Model
 
-Each call to `startConn` (internal) starts three goroutines per connection:
+Each connection opens up to two gRPC streams on a single shared `grpc.ClientConn`. The `ClientConn` is created once at construction time and reused across reconnects.
+
+**Publish stream** (always opened):
 
 | Goroutine | Role |
 |---|---|
-| `PeerReceiver` | Owns all reads on the WebSocket conn; dispatches inbound binary frames to in-memory handlers; routes text-frame acks to `ackCh` |
-| Watcher | Waits for `PeerReceiver.Done()` or `stop`; closes `connDead`, closes `conn`, then waits for `PeerReceiver` to fully exit |
-| Write loop | Drains `writeQ`, writes batched binary frames, blocks waiting for an ack on `ackCh`; exits on `connDead` or `stop` |
+| `PeerSender.run` | Drains the outbound buffer, sends `PublishBatch` frames, blocks for `PublishAck` before sending the next batch; exits on stream error or `Close()` |
 
-With `AutoReconnect: true`, a fourth goroutine (`reconnectLoop`) runs for the lifetime of the client.
+**Subscribe stream** (opened only when subscribe channels are configured):
 
-All goroutines are tracked in `EphemeralClient.wg`; `Close()` closes the `stop` channel and calls `wg.Wait()`, ensuring clean shutdown with no dangling goroutines.
+| Goroutine | Role |
+|---|---|
+| `PeerReceiver.run` | Owns all reads on the Subscribe stream; dispatches `HubBatch` records to in-memory handlers; sends `Ack` frames after each batch |
+
+With `AutoReconnect: true`, an additional reconnect goroutine runs for the lifetime of the client. On disconnect it waits for the current `PeerSender` to exit, captures unacknowledged messages from its buffer, dials a new pair of streams, and re-enqueues the unacknowledged messages onto the new sender.
+
+All goroutines are tracked in `EphemeralClient.wg`; `Close()` cancels all stream contexts and calls `wg.Wait()`, ensuring clean shutdown with no dangling goroutines.
 
 ### 11.7 No Audit Log
 
@@ -737,8 +741,8 @@ All goroutines are tracked in `EphemeralClient.wg`; `Close()` closes the `stop` 
 | Aspect | Regular `Client` | `EphemeralClient` |
 |---|---|---|
 | Local storage | Writes received messages to `.jsonl` | None — in-memory handlers only |
-| Replay on reconnect | Sends `last_id`; hub replays missed messages | Never replays; `ephemeral: true` in handshake |
-| Publish ack | Ack tracked per batch, unacked messages replayed on reconnect | Ack unblocks callers; on loss caller receives `ErrEphemeralConnLost` |
+| Replay on reconnect | Hub resumes from stored per-peer offset file | Never replays; `ephemeral: true` in `SubscribeRequest` |
+| Publish ack | Unacknowledged messages are buffered and replayed on reconnect | Ack unblocks callers; on loss caller receives `ErrEphemeralConnLost` |
 | Subscriber offset | Durable offset file per subscriber | No offset file |
 | Audit log | Full hub events | No audit log on client side |
 | Dedup | Shared instance-wide LRU (100k IDs) | Small per-connection LRU (1024 IDs, defense-in-depth) |
