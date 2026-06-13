@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"net"
 	"time"
 )
 
@@ -51,7 +50,10 @@ func GenerateCA(validityDays int) (certPEM, keyPEM []byte, err error) {
 }
 
 // GenerateInstance generates a P-384 instance certificate signed by the given CA.
-// The certificate carries CN=name and a DNS SAN for name.
+// The certificate carries CN=name and a DNS SAN for name. The DNS SAN is
+// included for human readability and tooling compatibility; the federation
+// TLS verifier (see tlsutil.BuildTLSConfig) checks the CA chain only and
+// does not match the SAN against the network address.
 // Both outputs are PEM-encoded.
 func GenerateInstance(caCertPEM, caKeyPEM []byte, name string, validityDays int) (certPEM, keyPEM []byte, err error) {
 	caCert, caKey, err := decodeCACreds(caCertPEM, caKeyPEM)
@@ -79,12 +81,6 @@ func GenerateInstance(caCertPEM, caKeyPEM []byte, name string, validityDays int)
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 	}
-	// localhost certs also need IP SANs so callers can dial 127.0.0.1 directly
-	// without triggering a DNS lookup.
-	if name == "localhost" {
-		tmpl.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
-	}
-
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &key.PublicKey, caKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("tlsutil: create instance cert: %w", err)

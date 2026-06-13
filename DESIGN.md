@@ -19,7 +19,7 @@ Keyop Messenger is a pub-sub messaging library for distributed Go applications. 
 | Term                    | Definition                                                                                                                                |
 |-------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|
 | **Instance**            | A single running process embedding the messenger library                                                                                  |
-| **Instance name**       | Human-readable identifier for an instance. Not configurable. When federation is enabled, derived from the local TLS certificate's Common Name (TLS is mandatory in that case). For local-only instances with no TLS, falls back to the OS hostname. If multiple federated instances share a host, issue separate certificates with distinct CNs (e.g. `hostname:7740`, `hostname:7741`). |
+| **Instance name**       | Human-readable identifier for an instance. Not configurable. When federation is enabled, derived from the local TLS certificate's Common Name (TLS is mandatory in that case). For local-only instances with no TLS, falls back to the OS hostname. Identity is independent of network location: certificates are validated by CA chain only, not by DNS-name / SAN matching, so any cert may be presented at any reachable address. Distinct instances simply need distinct CNs (e.g. `billing-host`, `orders-host`). |
 | **Channel**             | A named, ordered stream of messages (analogous to a Kafka topic)                                                                          |
 | **Publisher**           | Code that appends a message to a channel                                                                                                  |
 | **Subscriber**          | Code that reads and processes messages from a channel                                                                                     |
@@ -240,7 +240,7 @@ Each instance is identified by a human-readable **instance name**. The config fi
 
 Library tests that exercise non-TLS code paths may use the test-only `WithTestIdentity(name)` option to set a deterministic identity. Production code MUST NOT call it.
 
-If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `hostname:7740` and `hostname:7741`). The CLI `keygen instance --name hostname:port` generates a cert with the appropriate CN and DNS SAN.
+If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `billing-host` and `orders-host`). The CN is identity only; it is not used for network addressing. Because the federation TLS verifier checks the CA chain only (see §6.4), the cert's DNS SAN does not need to match the address callers use to reach the instance — operators are free to choose CNs that describe the instance's role rather than its hostname or port.
 
 The instance name is used for:
 - Allowlist authorization (hub verifies the cert CN against its `allowed_peers` config)
@@ -286,7 +286,7 @@ The receiver sends an acknowledgment (`PublishAck` or `Ack`) after writing a bat
 
 ### 6.4 Authorization: Two Layers
 
-**Layer 1 — mTLS:** The TLS handshake verifies the peer holds a certificate signed by the configured CA. A peer with no valid cert or a cert from an unknown CA is rejected at the TLS layer before any application code runs.
+**Layer 1 — mTLS:** The TLS handshake verifies the peer holds a certificate signed by the configured CA. A peer with no valid cert or a cert from an unknown CA is rejected at the TLS layer before any application code runs. Verification is **CA-chain only**: hostname / DNS-SAN matching is deliberately disabled (`tlsutil.BuildTLSConfig` sets `InsecureSkipVerify` and supplies a `VerifyPeerCertificate` callback that runs `x509.Certificate.Verify` against the configured CA pool but never calls `VerifyHostname`). This means a cert is valid regardless of which address it is presented at; identity is decoupled from network location and carried entirely by the cert CN (see §6.1).
 
 **Layer 2 — Allowlist:** After the TLS handshake, the hub extracts the peer's instance name from the TLS peer certificate CN. If TLS is active but the peer presents no certificate, or the certificate has no CN, the connection is rejected immediately. The extracted name is checked against the hub's configured `allowed_peers` list. A peer with a valid cert but an unrecognized CN is rejected with gRPC status `PermissionDenied` and the connection is recorded in the audit log.
 

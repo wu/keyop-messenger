@@ -109,6 +109,68 @@ func TestBuildTLSConfig(t *testing.T) {
 	assert.Equal(t, tls.RequireAndVerifyClientCert, cfg.ClientAuth)
 	assert.NotNil(t, cfg.ClientCAs)
 	assert.Len(t, cfg.Certificates, 1)
+	// Hostname matching is intentionally disabled; the chain check is delegated
+	// to VerifyPeerCertificate so that callers may dial any address regardless
+	// of what's in the cert's SAN.
+	assert.True(t, cfg.InsecureSkipVerify,
+		"InsecureSkipVerify must be set so Go's default hostname check is bypassed")
+	assert.NotNil(t, cfg.VerifyPeerCertificate,
+		"VerifyPeerCertificate must be set to perform CA-chain verification")
+}
+
+// TestBuildTLSConfig_VerifierAcceptsAnyCASignedCert confirms the central rule:
+// a peer cert signed by the trusted CA is accepted regardless of its DNS SAN.
+// This guards against accidentally re-enabling hostname matching.
+func TestBuildTLSConfig_VerifierAcceptsAnyCASignedCert(t *testing.T) {
+	dir := t.TempDir()
+	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+
+	// Local cert is for "local-host"; peer cert below uses a completely
+	// unrelated CN/SAN. Under the federation trust model both are valid as
+	// long as both are signed by the same CA.
+	localCertPEM, localKeyPEM, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "local-host", 90)
+	require.NoError(t, err)
+	certFile := writePEM(t, dir, "local.crt", localCertPEM)
+	keyFile := writePEM(t, dir, "local.key", localKeyPEM)
+	caFile := writePEM(t, dir, "ca.crt", caCertPEM)
+
+	cfg, err := tlsutil.BuildTLSConfig(certFile, keyFile, caFile, &testutil.FakeLogger{})
+	require.NoError(t, err)
+
+	peerCertPEM, _, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "some-peer-with-no-matching-dns", 90)
+	require.NoError(t, err)
+	peerLeaf := parseCertPEM(t, peerCertPEM)
+
+	err = cfg.VerifyPeerCertificate([][]byte{peerLeaf.Raw}, nil)
+	assert.NoError(t, err, "peer cert signed by the trusted CA must be accepted regardless of SAN")
+}
+
+// TestBuildTLSConfig_VerifierRejectsForeignCA confirms that a cert from a
+// different CA is rejected — the chain check is still in effect.
+func TestBuildTLSConfig_VerifierRejectsForeignCA(t *testing.T) {
+	dir := t.TempDir()
+	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+
+	localCertPEM, localKeyPEM, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "local", 90)
+	require.NoError(t, err)
+	certFile := writePEM(t, dir, "local.crt", localCertPEM)
+	keyFile := writePEM(t, dir, "local.key", localKeyPEM)
+	caFile := writePEM(t, dir, "ca.crt", caCertPEM)
+
+	cfg, err := tlsutil.BuildTLSConfig(certFile, keyFile, caFile, &testutil.FakeLogger{})
+	require.NoError(t, err)
+
+	// Cert from a different CA.
+	otherCAPEM, otherCAKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+	foreignCertPEM, _, err := tlsutil.GenerateInstance(otherCAPEM, otherCAKeyPEM, "attacker", 90)
+	require.NoError(t, err)
+	foreignLeaf := parseCertPEM(t, foreignCertPEM)
+
+	err = cfg.VerifyPeerCertificate([][]byte{foreignLeaf.Raw}, nil)
+	assert.Error(t, err, "peer cert from an untrusted CA must be rejected")
 }
 
 func TestBuildTLSConfigMissingCert(t *testing.T) {

@@ -28,7 +28,18 @@ type FileWatcher interface {
 
 // BuildTLSConfig loads a certificate key-pair and CA pool from disk and returns
 // a *tls.Config suitable for mTLS federation connections.
-// MinVersion is TLS 1.3; ClientAuth is RequireAndVerifyClientCert.
+//
+// The config performs CA-chain verification only. DNS-name / IP-SAN matching
+// is deliberately disabled: in this federation model the CA is the trust
+// anchor, identity comes from the cert's Common Name (see authenticatePeer
+// in internal/federation/hub.go), and a cert may legitimately be presented
+// at any network address its operator chooses. To turn off Go's built-in
+// hostname check while still verifying the chain, we set
+// InsecureSkipVerify=true and supply a VerifyPeerCertificate callback that
+// builds the chain against caPool but never calls VerifyHostname.
+//
+// MinVersion is TLS 1.3; ClientAuth is RequireAndVerifyClientCert, which
+// here means "require a client cert and run our custom verifier on it".
 func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
@@ -44,12 +55,40 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		return nil, fmt.Errorf("tlsutil: no valid certificates in CA file %s", caFile)
 	}
 
+	verifyChainOnly := func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if len(rawCerts) == 0 {
+			return fmt.Errorf("tlsutil: peer presented no certificate")
+		}
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("tlsutil: parse peer leaf cert: %w", err)
+		}
+		opts := x509.VerifyOptions{
+			Roots:         caPool,
+			Intermediates: x509.NewCertPool(),
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+		}
+		for _, raw := range rawCerts[1:] {
+			c, err := x509.ParseCertificate(raw)
+			if err != nil {
+				return fmt.Errorf("tlsutil: parse peer intermediate cert: %w", err)
+			}
+			opts.Intermediates.AddCert(c)
+		}
+		if _, err := leaf.Verify(opts); err != nil {
+			return fmt.Errorf("tlsutil: peer cert chain verification failed: %w", err)
+		}
+		return nil
+	}
+
 	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientCAs:    caPool,
-		RootCAs:      caPool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		MinVersion:   tls.VersionTLS13,
+		Certificates:          []tls.Certificate{cert},
+		ClientCAs:             caPool,
+		RootCAs:               caPool,
+		ClientAuth:            tls.RequireAndVerifyClientCert,
+		MinVersion:            tls.VersionTLS13,
+		InsecureSkipVerify:    true, //nolint:gosec // chain is verified by VerifyPeerCertificate; hostname matching is intentionally disabled
+		VerifyPeerCertificate: verifyChainOnly,
 	}, nil
 }
 
