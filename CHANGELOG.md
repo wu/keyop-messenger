@@ -1,3 +1,10 @@
+## [3.0.1](https://github.com/wu/keyop-messenger/compare/v3.0.0...v3.0.1) (2026-06-13)
+
+### Bug Fixes
+
+* honor ctx cancellation in ChannelWriter.Write after hand-off ([5d042f6](https://github.com/wu/keyop-messenger/commit/5d042f660fa59ed26bb6721142c7b54a9c0a340f))
+* wire subCtx to EphemeralClient Subscribe stream ([542415a](https://github.com/wu/keyop-messenger/commit/542415aad4144ea4b6135e69ae518f43ebeee78b))
+
 ## [3.0.0](https://github.com/wu/keyop-messenger/compare/v2.0.0...v3.0.0) (2026-06-13)
 
 ### ⚠ BREAKING CHANGES
