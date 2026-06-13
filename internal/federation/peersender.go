@@ -99,6 +99,22 @@ func (ps *PeerSender) Close() {
 	<-ps.done
 }
 
+// drainBufToUnacked moves any messages sitting in buf into the unacked list so
+// they are not silently dropped when the run goroutine exits due to a stream
+// error. The caller must NOT hold ps.mu.
+func (ps *PeerSender) drainBufToUnacked() {
+	ps.mu.Lock()
+	for {
+		select {
+		case env := <-ps.buf:
+			ps.unacked = append(ps.unacked, env)
+		default:
+			ps.mu.Unlock()
+			return
+		}
+	}
+}
+
 func (ps *PeerSender) run() {
 	defer close(ps.done)
 
@@ -109,6 +125,10 @@ func (ps *PeerSender) run() {
 		case <-ps.stop:
 			return
 		case <-ps.stream.Context().Done():
+			// Stream closed by the remote before the next message was sent.
+			// Drain any pending messages into unacked so the reconnect loop
+			// can replay them rather than losing them.
+			ps.drainBufToUnacked()
 			return
 		case first = <-ps.buf:
 		}
@@ -144,6 +164,12 @@ func (ps *PeerSender) run() {
 		// Send one batch containing all records.
 		if err := ps.stream.Send(&federationv1.PublishBatch{Records: records}); err != nil {
 			ps.log.Error("federation: sender send batch", "err", err)
+			// These messages were collected but never delivered; add them to
+			// unacked so the reconnect loop can replay them.
+			ps.mu.Lock()
+			ps.unacked = append(ps.unacked, envs...)
+			ps.mu.Unlock()
+			ps.drainBufToUnacked()
 			return
 		}
 
@@ -158,6 +184,7 @@ func (ps *PeerSender) run() {
 			if !errors.Is(err, io.EOF) && status.Code(err) != codes.Canceled {
 				ps.log.Error("federation: sender receive ack", "err", err)
 			}
+			ps.drainBufToUnacked()
 			return
 		}
 
