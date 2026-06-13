@@ -19,6 +19,9 @@ func throughputRun(t *testing.T, count int, flushIntervalMS int) {
 	dir := t.TempDir()
 	cfg := testConfig(dir)
 	cfg.Storage.OffsetFlushIntervalMS = flushIntervalMS
+	// Batch fsyncs so CI doesn't hit the timeout. These tests measure delivery
+	// correctness and offset-flush behaviour, not write durability.
+	cfg.Storage.SyncIntervalMS = 100
 	m, err := New(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
