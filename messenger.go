@@ -336,7 +336,7 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	// recognised as already seen and not re-delivered locally.
 	m.dedup.SeenOrAdd(env.ID)
 
-	if err := cs.writer.Write(&env); err != nil {
+	if err := cs.writer.Write(ctx, &env); err != nil {
 		return fmt.Errorf("publish %q: write: %w", channel, err)
 	}
 	cs.publishCount.Add(1)
@@ -665,7 +665,7 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	if err != nil {
 		return err
 	}
-	if err := cs.writer.Write(env); err != nil {
+	if err := cs.writer.Write(context.Background(), env); err != nil {
 		return err
 	}
 	cs.publishCount.Add(1)

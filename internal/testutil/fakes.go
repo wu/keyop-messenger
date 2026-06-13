@@ -3,6 +3,7 @@
 package testutil
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -102,7 +103,7 @@ type FakeChannelWriter struct {
 }
 
 // Write appends a copy of env to the recorded list, or returns writeErr if set.
-func (f *FakeChannelWriter) Write(env *envelope.Envelope) error {
+func (f *FakeChannelWriter) Write(_ context.Context, env *envelope.Envelope) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.writeErr != nil {

@@ -2,6 +2,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -14,9 +15,22 @@ import (
 )
 
 // ChannelWriter appends envelopes to a channel's segment files.
-// Write blocks until confirmed (rendezvous — no in-memory queue).
+//
+// Write blocks until the write is confirmed or aborted. The return value is a
+// definitive signal:
+//
+//   - nil: the record was successfully written. With sync_interval_ms=0 it
+//     was also fsync'd; otherwise it is in the OS buffer cache and will be
+//     fsync'd on the next tick.
+//   - non-nil: the record was NOT written. The caller may safely retry.
+//
+// If ctx is cancelled while the writer is in its disk-full retry loop, the
+// retry is abandoned and ctx.Err() is returned without a write. ctx is not
+// checked once the record has been handed to the OS — once write(2) returns
+// success the data is in the kernel and the writer will see it through to
+// fsync regardless of caller cancellation.
 type ChannelWriter interface {
-	Write(env *envelope.Envelope) error
+	Write(ctx context.Context, env *envelope.Envelope) error
 	Close() error
 }
 
@@ -56,6 +70,10 @@ func (osSegmentFactory) createSegment(path string) (fileWriter, error) {
 type writeRequest struct {
 	data []byte
 	done chan<- error
+	// ctx is the caller's context. The writer goroutine watches it during the
+	// disk-full retry loop and abandons the write (signalling done with
+	// ctx.Err()) if the caller gives up.
+	ctx context.Context
 }
 
 type channelWriter struct {
@@ -103,8 +121,11 @@ func newChannelWriterWithFactory(channelDir string, maxSegmentBytes int64, sf se
 }
 
 // Write marshals env and hands it to the writer goroutine, blocking until the
-// write is confirmed or the writer is closed.
-func (w *channelWriter) Write(env *envelope.Envelope) error {
+// write completes or is abandoned. The writer goroutine watches the same ctx
+// during its disk-full retry loop and signals done with ctx.Err() if the
+// caller gives up — so the return value is a definitive written/not-written
+// signal (see the ChannelWriter docs).
+func (w *channelWriter) Write(ctx context.Context, env *envelope.Envelope) error {
 	data, err := envelope.Marshal(*env)
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
@@ -113,11 +134,15 @@ func (w *channelWriter) Write(env *envelope.Envelope) error {
 
 	done := make(chan error, 1)
 	select {
-	case w.requests <- writeRequest{data: data, done: done}:
-		return <-done
+	case w.requests <- writeRequest{data: data, done: done, ctx: ctx}:
 	case <-w.stopCh:
 		return ErrWriterClosed
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+	// The writer goroutine owns the request and is responsible for signalling
+	// done exactly once — including ctx.Err() if it abandons the write.
+	return <-done
 }
 
 // Close signals the writer goroutine to stop and waits for it to exit.
@@ -228,11 +253,18 @@ func (w *channelWriter) doWrite(f fileWriter, req writeRequest, segSize *int64, 
 			break
 		}
 		// Retry on write error (disk full, transient I/O). Honour Close() to
-		// avoid spinning forever on shutdown.
+		// avoid spinning forever on shutdown, and honour the caller's ctx so
+		// a deadline-bound publisher can give up. Abandoning here means no
+		// data was written — write(2) returned an error this attempt and we
+		// never retried successfully — so the caller's "not written" contract
+		// holds.
 		select {
 		case <-time.After(10 * time.Millisecond):
 		case <-w.stopCh:
 			req.done <- fmt.Errorf("write aborted: writer closed during retry")
+			return
+		case <-req.ctx.Done():
+			req.done <- req.ctx.Err()
 			return
 		}
 	}

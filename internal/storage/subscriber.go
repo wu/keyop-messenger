@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -330,7 +331,7 @@ func (s *Subscriber) sendToDeadLetter(orig *envelope.Envelope, lastErr error) {
 		s.log.Error("build dead-letter envelope", "err", err)
 		return
 	}
-	if err := s.dlWriter.Write(&dlEnv); err != nil {
+	if err := s.dlWriter.Write(context.Background(), &dlEnv); err != nil {
 		s.log.Error("write dead-letter", "err", err)
 	}
 }

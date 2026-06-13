@@ -3,6 +3,7 @@ package storage
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -120,7 +121,7 @@ func TestWriter_Sequential(t *testing.T) {
 	w, f, _ := newFakeWriter(1000000, nil)
 	const n = 1000
 	for i := 0; i < n; i++ {
-		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+		require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	}
 	require.NoError(t, w.Close())
 
@@ -140,7 +141,7 @@ func TestWriter_Concurrent(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+			require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 		}()
 	}
 	wg.Wait()
@@ -158,7 +159,7 @@ func TestWriter_SyncAlwaysWhenZero(t *testing.T) {
 	w, f, _ := newFakeWriter(0, nil)
 	const n = 10
 	for i := 0; i < n; i++ {
-		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+		require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	}
 	require.NoError(t, w.Close())
 	assert.Equal(t, int64(n), f.syncCount.Load(), "syncIntervalMS=0 must Sync once per write")
@@ -167,7 +168,7 @@ func TestWriter_SyncAlwaysWhenZero(t *testing.T) {
 func TestWriter_SyncPeriodic(t *testing.T) {
 	const intervalMS = 50
 	w, f, _ := newFakeWriter(intervalMS, nil)
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	assert.Zero(t, f.syncCount.Load(), "syncIntervalMS>0 must not Sync on each write")
 	time.Sleep(3 * time.Duration(intervalMS) * time.Millisecond)
 	assert.GreaterOrEqual(t, f.syncCount.Load(), int64(1), "syncIntervalMS>0 must Sync on tick")
@@ -176,7 +177,7 @@ func TestWriter_SyncPeriodic(t *testing.T) {
 
 func TestWriter_PeriodicNoSyncWithoutInterval(t *testing.T) {
 	w, f, _ := newFakeWriter(1000000, nil)
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	require.NoError(t, w.Close())
 	assert.Zero(t, f.syncCount.Load(), "periodic sync without waiting for interval must not Sync")
 }
@@ -186,7 +187,7 @@ func TestWriter_Backpressure(t *testing.T) {
 	ff := &fakeFile{failFirst: failFirst}
 	sf := &fakeSegmentFactory{f: ff}
 	w := newChannelWriterWithFactory("", 0, sf, 1000000, nil, nil)
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord-1")))
 	require.NoError(t, w.Close())
 
 	lines := ff.Lines()
@@ -199,8 +200,8 @@ func TestWriter_Backpressure(t *testing.T) {
 func TestWriter_NotifyFn(t *testing.T) {
 	var calls atomic.Int64
 	w, _, _ := newFakeWriter(1000000, func() { calls.Add(1) })
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	require.NoError(t, w.Close())
 	assert.Equal(t, int64(2), calls.Load(), "notifyFn must be called once per write")
 }
@@ -208,7 +209,7 @@ func TestWriter_NotifyFn(t *testing.T) {
 func TestWriter_Close_SubsequentWriteErrors(t *testing.T) {
 	w, _, _ := newFakeWriter(1000000, nil)
 	require.NoError(t, w.Close())
-	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
+	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
 }
 
 func TestWriter_Close_Idempotent(t *testing.T) {
@@ -224,7 +225,7 @@ func TestWriter_RealFile(t *testing.T) {
 
 	const n = 100
 	for i := 0; i < n; i++ {
-		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+		require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	}
 	require.NoError(t, w.Close())
 
@@ -247,7 +248,7 @@ func TestWriter_RealFile_Concurrent(t *testing.T) {
 	for i := 0; i < goroutines; i++ {
 		go func() {
 			defer wg.Done()
-			require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+			require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 		}()
 	}
 	wg.Wait()
@@ -273,7 +274,7 @@ func TestWriter_SegmentRolling(t *testing.T) {
 
 	const n = 20
 	for i := 0; i < n; i++ {
-		require.NoError(t, w.Write(makeTestEnvelope(t, "ord")))
+		require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")))
 	}
 	require.NoError(t, w.Close())
 
@@ -295,6 +296,36 @@ func TestWriter_SegmentRolling(t *testing.T) {
 }
 
 // ---- additional fake types for doWrite / openActive error-path tests --------
+
+// recoverableFailWriteFile is a fileWriter whose Write returns ENOSPC for the
+// first `failures` calls and succeeds thereafter, used to simulate a disk
+// recovering. Call heal() to drop the remaining failure count.
+type recoverableFailWriteFile struct {
+	mu       sync.Mutex
+	failures int
+	writes   atomic.Int64
+	data     []byte
+}
+
+func (f *recoverableFailWriteFile) Write(b []byte) (int, error) {
+	f.writes.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failures > 0 {
+		f.failures--
+		return 0, syscall.ENOSPC
+	}
+	f.data = append(f.data, b...)
+	return len(b), nil
+}
+func (f *recoverableFailWriteFile) Sync() error  { return nil }
+func (f *recoverableFailWriteFile) Close() error { return nil }
+func (f *recoverableFailWriteFile) Fd() uintptr  { return 0 }
+func (f *recoverableFailWriteFile) heal() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failures = 0
+}
 
 // alwaysFailWriteFile is a fileWriter whose Write always returns ENOSPC.
 // The write count is tracked atomically for test synchronisation.
@@ -371,7 +402,7 @@ func TestWriter_AbortOnCloseWhileRetrying(t *testing.T) {
 	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: nf}, 1000000, nil, nil)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- w.Write(makeTestEnvelope(t, "ord")) }()
+	go func() { errCh <- w.Write(context.Background(), makeTestEnvelope(t, "ord")) }()
 
 	// Wait until the retry loop has made at least one attempt.
 	require.Eventually(t, func() bool { return nf.writes.Load() > 0 }, time.Second, time.Millisecond)
@@ -383,11 +414,67 @@ func TestWriter_AbortOnCloseWhileRetrying(t *testing.T) {
 	assert.Contains(t, err.Error(), "write aborted")
 }
 
+// TestWriter_CtxCancelDuringRetry verifies that Write returns ctx.Err() when
+// the caller's context is cancelled while the writer is spinning in the
+// disk-full retry loop, without waiting for the retry to succeed.
+func TestWriter_CtxCancelDuringRetry(t *testing.T) {
+	nf := &alwaysFailWriteFile{}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: nf}, 1000000, nil, nil)
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Write(ctx, makeTestEnvelope(t, "ord")) }()
+
+	// Wait until the retry loop has made at least one attempt, then cancel.
+	require.Eventually(t, func() bool { return nf.writes.Load() > 0 }, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("Write did not return after ctx cancellation")
+	}
+}
+
+// TestWriter_CtxCancelAbandonsAndAcceptsNextWrite verifies the post-fix
+// contract: after Write returns ctx.Err() during a retry loop, the writer
+// goroutine has fully released the request and is ready to process subsequent
+// writes. A second Write with a healthy context succeeds once the simulated
+// disk recovers.
+func TestWriter_CtxCancelAbandonsAndAcceptsNextWrite(t *testing.T) {
+	nf := &recoverableFailWriteFile{failures: 1000}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: nf}, 1000000, nil, nil)
+	defer func() { _ = w.Close() }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() { errCh <- w.Write(ctx, makeTestEnvelope(t, "ord-1")) }()
+
+	require.Eventually(t, func() bool { return nf.writes.Load() > 0 }, time.Second, time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("first Write did not return after ctx cancellation")
+	}
+
+	// Heal the "disk" and issue a second write. It must succeed promptly —
+	// proving the writer goroutine processed the abandon and returned to its
+	// main select, rather than leaking the first request.
+	nf.heal()
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord-2")))
+}
+
 // TestWriter_SyncError verifies that a Sync() failure propagates to the caller.
 func TestWriter_SyncError(t *testing.T) {
 	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: &syncFailFile{}}, 0 /* sync every write */, nil, nil)
 
-	err := w.Write(makeTestEnvelope(t, "ord"))
+	err := w.Write(context.Background(), makeTestEnvelope(t, "ord"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "fsync channel file")
 
@@ -406,10 +493,10 @@ func TestWriter_SegmentRollCreateError(t *testing.T) {
 
 	// First write succeeds: segSize starts at 0, so the rolling condition
 	// (segSize > 0) is false and rolling is skipped.
-	require.NoError(t, w.Write(makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord-1")))
 
 	// Second write triggers rolling; the second createSegment call fails.
-	err := w.Write(makeTestEnvelope(t, "ord-2"))
+	err := w.Write(context.Background(), makeTestEnvelope(t, "ord-2"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "create new segment")
 
@@ -426,12 +513,12 @@ func TestWriter_OpenActive_ExistingSegments(t *testing.T) {
 
 	w1, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
 	require.NoError(t, err)
-	require.NoError(t, w1.Write(makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w1.Write(context.Background(), makeTestEnvelope(t, "ord-1")))
 	require.NoError(t, w1.Close())
 
 	w2, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
 	require.NoError(t, err)
-	require.NoError(t, w2.Write(makeTestEnvelope(t, "ord-2")))
+	require.NoError(t, w2.Write(context.Background(), makeTestEnvelope(t, "ord-2")))
 	require.NoError(t, w2.Close())
 
 	lines := readAllSegments(t, channelDir)
@@ -453,7 +540,7 @@ func TestWriter_OpenActive_CreateError(t *testing.T) {
 	assert.True(t, log.HasError("open active segment on startup"))
 
 	// stopCh is closed; subsequent writes must return ErrWriterClosed.
-	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
+	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
 }
 
 // TestWriter_OpenActive_OpenError verifies that an openSegment failure on an
@@ -470,5 +557,5 @@ func TestWriter_OpenActive_OpenError(t *testing.T) {
 	require.NoError(t, w.Close())
 	assert.True(t, log.HasError("open active segment on startup"))
 
-	require.ErrorIs(t, w.Write(makeTestEnvelope(t, "ord")), ErrWriterClosed)
+	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
 }

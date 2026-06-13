@@ -3,6 +3,7 @@
 package federation
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 
@@ -38,6 +39,6 @@ func newChannelFeeder(t *testing.T, dataDir, channel string, client *Client) *ch
 // publish writes env to the channel file and wakes the client reader.
 func (f *channelFeeder) publish(t *testing.T, env *envelope.Envelope) {
 	t.Helper()
-	require.NoError(t, f.writer.Write(env))
+	require.NoError(t, f.writer.Write(context.Background(), env))
 	f.client.NotifyChannel(f.channel)
 }

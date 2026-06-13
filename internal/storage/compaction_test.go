@@ -2,6 +2,7 @@
 package storage
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -196,7 +197,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	for i := 0; i < 15; i++ {
 		env, err := envelope.NewEnvelope("orders", "host", "com.test.T", map[string]int{"i": i})
 		require.NoError(t, err)
-		require.NoError(t, writer.Write(&env))
+		require.NoError(t, writer.Write(context.Background(), &env))
 	}
 
 	segs, err := listSegments(channelDir)
@@ -215,7 +216,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	// Writer must still work after compaction.
 	env, err := envelope.NewEnvelope("orders", "host", "com.test.T", map[string]int{"i": 99})
 	require.NoError(t, err)
-	require.NoError(t, writer.Write(&env))
+	require.NoError(t, writer.Write(context.Background(), &env))
 	require.NoError(t, writer.Close())
 
 	// Active segment must still exist and contain data.
