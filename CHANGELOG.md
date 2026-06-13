@@ -1,3 +1,9 @@
+## [1.6.0](https://github.com/wu/keyop-messenger/compare/v1.5.0...v1.6.0) (2026-06-13)
+
+### Features
+
+* bumping version for incompatible change ([ae56819](https://github.com/wu/keyop-messenger/commit/ae568194dcf5c880101ccd4b3c17b2ebca247e42))
+
 ## [1.5.0](https://github.com/wu/keyop-messenger/compare/v1.4.1...v1.5.0) (2026-06-13)
 
 ### Features
