@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -56,7 +57,32 @@ func keygenCmd() *cobra.Command {
 	}
 	cmd.AddCommand(keygenCACmd())
 	cmd.AddCommand(keygenInstanceCmd())
+	cmd.AddCommand(keygenInspectCmd())
 	return cmd
+}
+
+func keygenInspectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "inspect <cert-file>",
+		Short: "Show CN, validity period, and other details of an existing certificate",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			certPEM, err := os.ReadFile(args[0])
+			if err != nil {
+				return fmt.Errorf("read cert file: %w", err)
+			}
+			block, _ := pem.Decode(certPEM)
+			if block == nil {
+				return fmt.Errorf("no PEM block found in %s", args[0])
+			}
+			cert, err := x509.ParseCertificate(block.Bytes)
+			if err != nil {
+				return fmt.Errorf("parse cert: %w", err)
+			}
+			printDetailedCertInfo(cmd, cert)
+			return nil
+		},
+	}
 }
 
 func keygenCACmd() *cobra.Command {
@@ -174,7 +200,8 @@ func writePEM(path string, data []byte) error {
 }
 
 // printCertInfo writes the subject, validity period, and SHA-256 fingerprint of
-// the first certificate in certPEM to cmd's output writer.
+// the first certificate in certPEM to cmd's output writer. Used by the
+// keygen ca / keygen instance commands as a confirmation of what was issued.
 func printCertInfo(cmd *cobra.Command, certPEM []byte) {
 	block, _ := pem.Decode(certPEM)
 	if block == nil {
@@ -189,4 +216,84 @@ func printCertInfo(cmd *cobra.Command, certPEM []byte) {
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Valid from:  %s\n", cert.NotBefore.Format(time.RFC3339))
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Valid until: %s\n", cert.NotAfter.Format(time.RFC3339))
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Fingerprint: SHA-256:%s\n", hex.EncodeToString(sum[:]))
+}
+
+// printDetailedCertInfo writes a richer summary of a parsed certificate, used
+// by the keygen inspect command. Surfaces the CN explicitly (the field most
+// load-bearing for federation identity) and includes a relative
+// expiry-countdown so an operator can spot a soon-to-expire cert at a glance.
+func printDetailedCertInfo(cmd *cobra.Command, cert *x509.Certificate) {
+	w := cmd.OutOrStdout()
+	sum := sha256.Sum256(cert.Raw)
+
+	_, _ = fmt.Fprintf(w, "Subject CN:    %s\n", cert.Subject.CommonName)
+	_, _ = fmt.Fprintf(w, "Subject:       %s\n", cert.Subject)
+	_, _ = fmt.Fprintf(w, "Issuer CN:     %s\n", cert.Issuer.CommonName)
+	if len(cert.DNSNames) > 0 {
+		_, _ = fmt.Fprintf(w, "DNS SANs:      %s\n", strings.Join(cert.DNSNames, ", "))
+	}
+	if len(cert.IPAddresses) > 0 {
+		ips := make([]string, len(cert.IPAddresses))
+		for i, ip := range cert.IPAddresses {
+			ips[i] = ip.String()
+		}
+		_, _ = fmt.Fprintf(w, "IP SANs:       %s\n", strings.Join(ips, ", "))
+	}
+	_, _ = fmt.Fprintf(w, "Valid from:    %s\n", cert.NotBefore.Format(time.RFC3339))
+	_, _ = fmt.Fprintf(w, "Valid until:   %s  (%s)\n",
+		cert.NotAfter.Format(time.RFC3339), describeExpiry(cert.NotAfter))
+	_, _ = fmt.Fprintf(w, "Is CA:         %v\n", cert.IsCA)
+	if len(cert.ExtKeyUsage) > 0 {
+		labels := make([]string, 0, len(cert.ExtKeyUsage))
+		for _, u := range cert.ExtKeyUsage {
+			labels = append(labels, extKeyUsageLabel(u))
+		}
+		_, _ = fmt.Fprintf(w, "Ext key usage: %s\n", strings.Join(labels, ", "))
+	}
+	_, _ = fmt.Fprintf(w, "Serial:        %s\n", cert.SerialNumber.String())
+	_, _ = fmt.Fprintf(w, "Fingerprint:   SHA-256:%s\n", hex.EncodeToString(sum[:]))
+}
+
+// describeExpiry returns a short human-readable "expires in N days" or
+// "EXPIRED N days ago" relative to now, suitable for inline display.
+func describeExpiry(notAfter time.Time) string {
+	d := time.Until(notAfter)
+	switch {
+	case d < 0:
+		days := int(-d.Hours() / 24)
+		if days == 0 {
+			return fmt.Sprintf("EXPIRED %s ago", (-d).Round(time.Minute))
+		}
+		return fmt.Sprintf("EXPIRED %d day(s) ago", days)
+	case d < 24*time.Hour:
+		return fmt.Sprintf("expires in %s", d.Round(time.Minute))
+	default:
+		return fmt.Sprintf("expires in %d day(s)", int(d.Hours()/24))
+	}
+}
+
+// extKeyUsageLabel maps an x509.ExtKeyUsage value to a short human-readable
+// name. EKUs relevant to a federation cert are listed explicitly; the niche
+// values (IPSEC, Microsoft/Netscape proprietary) fall through to the
+// default-rendered "eku(N)" form. This is a display helper, not a security
+// gate, so the default case is intentional rather than a TODO.
+func extKeyUsageLabel(u x509.ExtKeyUsage) string {
+	switch u { //nolint:exhaustive // niche EKUs handled by the default case
+	case x509.ExtKeyUsageAny:
+		return "any"
+	case x509.ExtKeyUsageServerAuth:
+		return "serverAuth"
+	case x509.ExtKeyUsageClientAuth:
+		return "clientAuth"
+	case x509.ExtKeyUsageCodeSigning:
+		return "codeSigning"
+	case x509.ExtKeyUsageEmailProtection:
+		return "emailProtection"
+	case x509.ExtKeyUsageTimeStamping:
+		return "timeStamping"
+	case x509.ExtKeyUsageOCSPSigning:
+		return "ocspSigning"
+	default:
+		return fmt.Sprintf("eku(%d)", u)
+	}
 }

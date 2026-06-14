@@ -178,3 +178,81 @@ func TestVersionCmd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "version:")
 }
+
+// TestKeygenInspect_CACert generates a CA cert via the CLI and then inspects
+// it, asserting the inspect output surfaces CN, expiry, IsCA, and fingerprint.
+func TestKeygenInspect_CACert(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.crt")
+	keyPath := filepath.Join(dir, "ca.key")
+	_, err := runCmd("keygen", "ca",
+		"--out-cert", certPath,
+		"--out-key", keyPath,
+		"--days", "30",
+	)
+	require.NoError(t, err)
+
+	out, err := runCmd("keygen", "inspect", certPath)
+	require.NoError(t, err)
+
+	assert.Contains(t, out, "Subject CN:    keyop-ca")
+	assert.Contains(t, out, "Issuer CN:     keyop-ca")
+	assert.Contains(t, out, "Is CA:         true")
+	assert.Contains(t, out, "Valid from:")
+	assert.Contains(t, out, "Valid until:")
+	assert.Contains(t, out, "expires in")
+	assert.Contains(t, out, "Fingerprint:   SHA-256:")
+	assert.Contains(t, out, "Serial:")
+}
+
+// TestKeygenInspect_InstanceCert exercises the inspect output for an instance
+// cert — checks that DNS SAN, Ext key usage, and IsCA=false render correctly.
+func TestKeygenInspect_InstanceCert(t *testing.T) {
+	dir := t.TempDir()
+	caCert := filepath.Join(dir, "ca.crt")
+	caKey := filepath.Join(dir, "ca.key")
+	_, err := runCmd("keygen", "ca", "--out-cert", caCert, "--out-key", caKey, "--days", "365")
+	require.NoError(t, err)
+
+	instanceCert := filepath.Join(dir, "billing.crt")
+	instanceKey := filepath.Join(dir, "billing.key")
+	_, err = runCmd("keygen", "instance",
+		"--ca", caCert, "--ca-key", caKey,
+		"--name", "billing-host",
+		"--out-cert", instanceCert,
+		"--out-key", instanceKey,
+		"--days", "90",
+	)
+	require.NoError(t, err)
+
+	out, err := runCmd("keygen", "inspect", instanceCert)
+	require.NoError(t, err)
+
+	assert.Contains(t, out, "Subject CN:    billing-host")
+	assert.Contains(t, out, "Issuer CN:     keyop-ca")
+	assert.Contains(t, out, "DNS SANs:      billing-host")
+	assert.Contains(t, out, "Is CA:         false")
+	assert.Contains(t, out, "Ext key usage:")
+	assert.Contains(t, out, "clientAuth")
+	assert.Contains(t, out, "serverAuth")
+}
+
+// TestKeygenInspect_MissingFile asserts that pointing inspect at a
+// nonexistent file produces a clear error rather than a panic.
+func TestKeygenInspect_MissingFile(t *testing.T) {
+	out, err := runCmd("keygen", "inspect", "/nonexistent/cert.pem")
+	require.Error(t, err)
+	assert.Contains(t, out+err.Error(), "read cert file")
+}
+
+// TestKeygenInspect_NotPEM asserts that a file that doesn't contain a PEM
+// block produces a clear error.
+func TestKeygenInspect_NotPEM(t *testing.T) {
+	dir := t.TempDir()
+	junk := filepath.Join(dir, "junk.txt")
+	require.NoError(t, os.WriteFile(junk, []byte("this is not a PEM file"), 0o600))
+
+	out, err := runCmd("keygen", "inspect", junk)
+	require.Error(t, err)
+	assert.Contains(t, out+err.Error(), "no PEM block")
+}
