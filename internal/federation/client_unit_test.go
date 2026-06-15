@@ -106,7 +106,7 @@ func TestClient_Config_WithTLS(t *testing.T) {
 	auditL := &fakeAuditLogger{}
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{})
-	tlsCfg := &tls.Config{} // Minimal TLS config
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 
 	client := NewClient(
 		"test-client",

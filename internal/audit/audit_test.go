@@ -319,6 +319,9 @@ func TestLogReturnsNilAlways(t *testing.T) {
 // TestOpenFileFailureAbortsWrite verifies that if the initial file open fails,
 // the run goroutine gracefully drains the channel and exits without panicking.
 func TestOpenFileFailureAbortsWrite(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("test relies on DAC permission denial; root bypasses permission checks")
+	}
 	// Use a read-only parent directory so file creation will fail.
 	tempDir := t.TempDir()
 	readOnlyDir := filepath.Join(tempDir, "readonly")

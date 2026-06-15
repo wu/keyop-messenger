@@ -4,12 +4,23 @@ package audit
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// stderr is the destination for immediate drop notifications written when
+// the audit channel is full. Tests may swap this via SetStderr to keep
+// test output clean. Defaults to os.Stderr.
+var stderr io.Writer = os.Stderr
+
+// SetStderr replaces the destination for the immediate drop notifications
+// emitted by Log. Intended for use in tests (e.g. SetStderr(io.Discard) in
+// a TestMain). Not safe for concurrent use with Log.
+func SetStderr(w io.Writer) { stderr = w }
 
 // Event name constants for all audited federation events.
 const (
@@ -94,7 +105,8 @@ func NewAuditWriter(dir string, maxSizeMB, maxFiles int, logger Logger) (*AuditW
 
 // Log enqueues an event for writing. If the channel is full the event is
 // dropped — audit must not block callers. Drops are counted and reported
-// periodically via the structured logger and immediately to stderr.
+// periodically via the structured logger and immediately to the package
+// stderr writer (see SetStderr).
 func (aw *AuditWriter) Log(event Event) error {
 	if event.Ts.IsZero() {
 		event.Ts = time.Now().UTC()
@@ -103,7 +115,7 @@ func (aw *AuditWriter) Log(event Event) error {
 	case aw.ch <- event:
 	default:
 		aw.dropCount.Add(1)
-		_, _ = fmt.Fprintf(os.Stderr, "audit: channel full, dropping event %q\n", event.Event)
+		_, _ = fmt.Fprintf(stderr, "audit: channel full, dropping event %q\n", event.Event)
 	}
 	return nil
 }

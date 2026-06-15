@@ -175,7 +175,7 @@ func TestEphemeralClient_ConnectWithReconnect_ContextCancelled(t *testing.T) {
 func TestEphemeralClient_Config_WithTLS(t *testing.T) {
 	t.Parallel()
 	log := &testutil.FakeLogger{}
-	tlsCfg := &tls.Config{} // Minimal TLS config
+	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 	cfg := EphemeralClientConfig{
 		InstanceName: "test",
 		TLSConfig:    tlsCfg,

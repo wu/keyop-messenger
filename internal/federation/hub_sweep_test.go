@@ -181,6 +181,9 @@ func TestSweepStaleOffsets_NonDirInSubsDir(t *testing.T) {
 // TestSweepStaleOffsets_RemoveFailure verifies that an os.Remove failure is
 // logged at Error level and does not abort the rest of the sweep.
 func TestSweepStaleOffsets_RemoveFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("test relies on DAC permission denial; root bypasses permission checks")
+	}
 	dataDir := t.TempDir()
 	chDir := filepath.Join(subsDir(dataDir), "orders")
 	require.NoError(t, os.MkdirAll(chDir, 0o750))
@@ -199,6 +202,9 @@ func TestSweepStaleOffsets_RemoveFailure(t *testing.T) {
 // TestSweepStaleOffsets_UnreadableChannelDir verifies that a channel directory
 // that cannot be listed is silently skipped while other channels are swept.
 func TestSweepStaleOffsets_UnreadableChannelDir(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("test relies on DAC permission denial; root bypasses permission checks")
+	}
 	dataDir := t.TempDir()
 
 	// good: readable channel with a stale file that must be deleted.

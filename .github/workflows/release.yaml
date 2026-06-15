@@ -24,6 +24,9 @@ jobs:
 
   test:
     name: Test
+    # Skip on non-GitHub forges (e.g. Forgejo mirrors this file via
+    # .github/workflows/ compatibility). semantic-release is GitHub-specific.
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
 
     steps:
@@ -46,6 +49,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────────
   semantic-release:
     name: Semantic Release
+    if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     needs: test
 
