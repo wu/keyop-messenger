@@ -26,7 +26,7 @@ func host1(ctx context.Context, logger *slog.Logger, baseDir string) {
 			// no channels are specified for 'localhost', so it can publish and subscribe to any channels it specifies
 			AllowedPeers: []messenger.AllowedPeer{
 				{
-					Name: "localhost",
+					Name: "host2",
 				},
 			},
 		},

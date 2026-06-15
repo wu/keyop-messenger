@@ -15,7 +15,7 @@ for host in host1 host2; do
   echo "Generating $host keys"
   keyop-messenger keygen instance \
     --ca ca.crt --ca-key ca.key \
-    --name localhost \
+    --name $host \
     --out-cert $KEYOP_MESSENGER_TMPDIR/$host/cert/$host.crt \
     --out-key  $KEYOP_MESSENGER_TMPDIR/$host/cert/$host.key
 
