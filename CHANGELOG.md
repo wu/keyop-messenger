@@ -1,3 +1,10 @@
+## [1.12.0](https://github.com/wu/keyop-messenger/compare/v1.11.1...v1.12.0) (2026-06-16)
+
+### Features
+
+* add 'inspect' command to keygen for detailed certificate information ([86f4e20](https://github.com/wu/keyop-messenger/commit/86f4e207ab4dc02721107a66a6e577e61f8f0f85))
+* add Forgejo Actions workflow for private dev ([#1](https://github.com/wu/keyop-messenger/issues/1)) ([31fa405](https://github.com/wu/keyop-messenger/commit/31fa405d65461b524cee7ca9851e34def93304a4))
+
 ## [1.11.1](https://github.com/wu/keyop-messenger/compare/v1.11.0...v1.11.1) (2026-06-13)
 
 ### Bug Fixes
