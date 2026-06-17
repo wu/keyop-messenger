@@ -161,10 +161,23 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	// On clean shutdown flush any in-memory offset that hasn't reached disk yet,
 	// so a restart doesn't needlessly replay already-delivered messages.
 	defer s.flushOnStop()
+
+	// Periodic poll guards against lost-wakeup races: notifyC has capacity 1, so
+	// if multiple writes happen while the subscriber is inside processAvailable,
+	// only one notification survives. If the subscriber's scanner observes EOF
+	// before those writes are visible, it could otherwise sleep forever despite
+	// pending data. processAvailable is idempotent (offset tracking skips
+	// already-delivered messages), so a periodic re-check is safe and cheap.
+	const pollInterval = 100 * time.Millisecond
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
 	s.processAvailable(handler)
 	for {
 		select {
 		case <-notifyC:
+			s.processAvailable(handler)
+		case <-ticker.C:
 			s.processAvailable(handler)
 		case <-s.stopCh:
 			return
