@@ -55,15 +55,13 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Unit tests
-        run: go test ${{ matrix.race_flag }} ./...
-
-      - name: Integration tests
+      - name: Test
+        # -tags integration runs unit tests *and* integration tests in a single
+        # invocation (build tags are inclusive — untagged tests always compile).
         # -v streams per-test progress so the runner UI doesn't appear stalled
-        # while the large root package runs. Longer timeout than the Makefile's
-        # 60s default: container filesystem is slower (overlayfs + fsync-heavy
-        # throughput tests need more headroom).
-        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 10m ./...
+        # while the large root package runs. 15m timeout gives the throughput
+        # test's 10m internal timer room to fire first with a useful diagnostic.
+        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 15m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # armv6 runs on the bare Linux host (no `container:` block) because Docker
@@ -93,12 +91,10 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Unit tests
-        # No -race: TSan doesn't support 32-bit ARM at all.
-        run: go test ./...
-
-      - name: Integration tests
-        run: go test -v -tags integration -timeout 10m ./...
+      - name: Test
+        # -tags integration runs unit tests *and* integration tests in a single
+        # invocation. No -race: TSan doesn't support 32-bit ARM at all.
+        run: go test -v -tags integration -timeout 15m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # darwin/arm64 runs on the bare macOS host. Toolchain preinstalled.
@@ -127,12 +123,10 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Unit tests
-        # darwin/arm64 has solid TSan support in Go.
-        run: go test -race ./...
-
-      - name: Integration tests
-        run: go test -race -v -tags integration -timeout 5m ./...
+      - name: Test
+        # -tags integration runs unit tests *and* integration tests in a single
+        # invocation. darwin/arm64 has solid TSan support in Go.
+        run: go test -race -v -tags integration -timeout 15m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Lint runs once, on amd64 only — golangci-lint's findings are

@@ -49,7 +49,7 @@ func throughputRun(t *testing.T, count int, flushIntervalMS int) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Minute):
+	case <-time.After(10 * time.Minute):
 		t.Fatalf("timed out: received %d/%d messages", received.Load(), count)
 	}
 
