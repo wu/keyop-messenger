@@ -2,6 +2,7 @@
 package storage
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -585,4 +586,159 @@ func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	// Offset write failures must have been logged as errors.
 	assert.True(t, log.HasError("persist offset"),
 		"offset write failures must be logged")
+}
+
+// ---- scanCompleteLines ------------------------------------------------------
+
+// TestScanCompleteLines verifies the SplitFunc that backs the subscriber's
+// scanner. The critical difference from bufio.ScanLines is the EOF-with-partial
+// behaviour: instead of returning the partial bytes as a final token (which
+// would cause the subscriber to advance past in-flight writes and lose data),
+// scanCompleteLines stalls and waits for the writer to complete the line.
+func TestScanCompleteLines(t *testing.T) {
+	tests := []struct {
+		name        string
+		data        string
+		atEOF       bool
+		wantAdvance int
+		wantToken   string
+		wantNilTok  bool // distinguishes empty string from nil
+		wantErr     bool
+	}{
+		{
+			name:        "complete line not at EOF",
+			data:        "hello\n",
+			atEOF:       false,
+			wantAdvance: 6,
+			wantToken:   "hello",
+		},
+		{
+			name:        "complete line at EOF",
+			data:        "hello\n",
+			atEOF:       true,
+			wantAdvance: 6,
+			wantToken:   "hello",
+		},
+		{
+			name:        "two complete lines: returns first only",
+			data:        "first\nsecond\n",
+			atEOF:       false,
+			wantAdvance: 6,
+			wantToken:   "first",
+		},
+		{
+			name:       "partial bytes not at EOF: requests more data",
+			data:       "incomplete",
+			atEOF:      false,
+			wantNilTok: true,
+		},
+		{
+			// The critical case: bufio.ScanLines would return the partial bytes
+			// as a final token here. scanCompleteLines must NOT — those bytes
+			// belong to an in-flight write the subscriber must not consume.
+			name:       "partial bytes AT EOF: still does not emit token",
+			data:       "in-flight-write-no-newline-yet",
+			atEOF:      true,
+			wantNilTok: true,
+		},
+		{
+			name:       "empty input not at EOF: requests more data",
+			data:       "",
+			atEOF:      false,
+			wantNilTok: true,
+		},
+		{
+			name:       "empty input at EOF: terminating signal",
+			data:       "",
+			atEOF:      true,
+			wantNilTok: true,
+		},
+		{
+			// A bare \n is a zero-length line — legal and distinct from "no token".
+			name:        "bare newline returns empty line token",
+			data:        "\n",
+			atEOF:       false,
+			wantAdvance: 1,
+			wantToken:   "",
+		},
+		{
+			name:        "complete line followed by partial: returns the complete one",
+			data:        "ready\nstill-being-written",
+			atEOF:       false,
+			wantAdvance: 6,
+			wantToken:   "ready",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			advance, token, err := scanCompleteLines([]byte(tc.data), tc.atEOF)
+			if tc.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantAdvance, advance, "advance")
+			if tc.wantNilTok {
+				assert.Nil(t, token, "expected nil token (request-more or no-data signal)")
+			} else {
+				require.NotNil(t, token)
+				assert.Equal(t, tc.wantToken, string(token), "token")
+			}
+		})
+	}
+}
+
+// TestScanCompleteLines_ScannerStallsOnPartialAtEOF locks in the end-to-end
+// contract that the subscriber depends on: when a bufio.Scanner using
+// scanCompleteLines reads a stream that ends with an unterminated trailing
+// line, the scanner returns false from Scan() after emitting the complete
+// lines — instead of emitting the partial as a final token (the bufio.ScanLines
+// default that caused the production bug).
+func TestScanCompleteLines_ScannerStallsOnPartialAtEOF(t *testing.T) {
+	// "line1\nline2\nlin" — two complete lines, then an in-flight partial.
+	input := strings.NewReader("line1\nline2\nlin")
+
+	scanner := bufio.NewScanner(input)
+	scanner.Split(scanCompleteLines)
+
+	require.True(t, scanner.Scan(), "should emit first complete line")
+	assert.Equal(t, "line1", scanner.Text())
+
+	require.True(t, scanner.Scan(), "should emit second complete line")
+	assert.Equal(t, "line2", scanner.Text())
+
+	// Critical: the partial "lin" must NOT be returned. With default ScanLines,
+	// scanner.Scan() would return true here with Text() = "lin".
+	require.False(t, scanner.Scan(),
+		"partial trailing bytes at EOF must not be emitted as a token")
+	require.NoError(t, scanner.Err(), "scanner must not report an error")
+}
+
+// TestScanCompleteLines_ScannerResumesAfterMoreData verifies the recovery
+// semantic the subscriber relies on: once the in-flight write completes (the
+// next call to processAvailable sees the now-terminated line), a fresh scanner
+// over the same data picks up the previously-stalled line.
+func TestScanCompleteLines_ScannerResumesAfterMoreData(t *testing.T) {
+	// First read: partial trailing line.
+	first := strings.NewReader("line1\nlin")
+	s1 := bufio.NewScanner(first)
+	s1.Split(scanCompleteLines)
+
+	require.True(t, s1.Scan())
+	assert.Equal(t, "line1", s1.Text())
+	require.False(t, s1.Scan(), "partial line should not be emitted")
+
+	// Second read (simulating the next processAvailable after the writer
+	// completed the line): same data plus the rest of the line.
+	second := strings.NewReader("line1\nline2-completed\n")
+	s2 := bufio.NewScanner(second)
+	s2.Split(scanCompleteLines)
+
+	var got []string
+	for s2.Scan() {
+		got = append(got, s2.Text())
+	}
+	require.NoError(t, s2.Err())
+	assert.Equal(t, []string{"line1", "line2-completed"}, got)
 }

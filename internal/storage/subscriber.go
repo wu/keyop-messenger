@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -15,6 +16,30 @@ import (
 
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
+
+// scanCompleteLines is like bufio.ScanLines but never returns a partial line
+// at EOF. ScanLines's behaviour of emitting an unterminated final token is a
+// feature for text-file consumers and a bug for a streaming append-only log:
+// when the subscriber races a concurrent writer, Linux's regular-file read
+// can observe an extended i_size before the page cache is fully populated,
+// yielding bytes that lack the trailing newline. With ScanLines, those bytes
+// get dispatched as a "line", fail unmarshal, and the subscriber advances
+// past them — losing the real message that the writer is mid-flight on.
+// scanCompleteLines instead stalls until the newline arrives, which the next
+// poll or notify will surface.
+func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[0:i], nil
+	}
+	// No newline. Wait for more data even at EOF — partial bytes here are an
+	// in-flight write, not a truly unterminated final line. The subscriber's
+	// next processAvailable will re-read from the same offset and pick up the
+	// complete line.
+	return 0, nil, nil
+}
 
 // defaultRetryDelay returns exponential backoff delay for retry attempt n (1-based).
 // Starts at 100ms, doubles each attempt, capped at 5s.
@@ -294,6 +319,7 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+		scanner.Split(scanCompleteLines)
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			nextOffset := offset + int64(len(line)) + 1 // +1 for '\n'
