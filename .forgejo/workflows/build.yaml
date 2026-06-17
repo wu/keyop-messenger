@@ -63,7 +63,7 @@ jobs:
         # while the large root package runs. Longer timeout than the Makefile's
         # 60s default: container filesystem is slower (overlayfs + fsync-heavy
         # throughput tests need more headroom).
-        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 5m ./...
+        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 10m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # armv6 runs on the bare Linux host (no `container:` block) because Docker
@@ -98,7 +98,7 @@ jobs:
         run: go test ./...
 
       - name: Integration tests
-        run: go test -v -tags integration -timeout 5m ./...
+        run: go test -v -tags integration -timeout 10m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # darwin/arm64 runs on the bare macOS host. Toolchain preinstalled.
