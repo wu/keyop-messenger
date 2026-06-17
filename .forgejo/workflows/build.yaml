@@ -7,11 +7,31 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build
-    runs-on: docker
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Container-based arches: amd64 (Docker on x86_64 host) and arm64 (Docker on
+  # an aarch64 host). Both run the same steps inside the official golang image.
+  # ─────────────────────────────────────────────────────────────────────────────
+  ci:
+    name: Build & Test ${{ matrix.arch }}
+    strategy:
+      # Don't cancel other arches when one fails — each is independent.
+      fail-fast: false
+      matrix:
+        include:
+          # race_flag: enable Go's race detector where TSan's VMA assumptions
+          # are satisfied. Some arm64 Linux kernels error with
+          # "FATAL: ThreadSanitizer: unsupported VMA range" — drop -race there.
+          - { arch: amd64, runner: docker,       race_flag: "-race" }
+          - { arch: arm64, runner: linux-arm64,  race_flag: "" }
+    runs-on: ${{ matrix.runner }}
     container:
       image: golang:1.25
+      # --init: tini as PID 1 reaps zombies so child processes are cleaned up.
+      # --tmpfs /tmp:exec,size=2g: RAM-backed /tmp for fast fsync (messenger has
+      # throughput tests that fsync on every message). exec is required because
+      # Docker's --tmpfs defaults to noexec, which blocks Go from running
+      # compiled test binaries under /tmp/go-build*.
+      options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Install Node.js (required by JS-based actions)
         run: apt-get update && apt-get install -y --no-install-recommends nodejs
@@ -25,9 +45,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-go-
+            ${{ runner.os }}-${{ matrix.arch }}-go-
 
       - name: Download dependencies
         run: go mod download
@@ -35,44 +55,95 @@ jobs:
       - name: Build
         run: go build ./...
 
-  test:
-    name: Test
-    runs-on: docker
-    container:
-      image: golang:1.25
-    needs: build
-    steps:
-      - name: Install Node.js (required by JS-based actions)
-        run: apt-get update && apt-get install -y --no-install-recommends nodejs
-
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
       - name: Unit tests
-        run: go test -race ./...
+        run: go test ${{ matrix.race_flag }} ./...
 
       - name: Integration tests
         # -v streams per-test progress so the runner UI doesn't appear stalled
         # while the large root package runs. Longer timeout than the Makefile's
         # 60s default: container filesystem is slower (overlayfs + fsync-heavy
         # throughput tests need more headroom).
+        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 5m ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # armv6 runs on the bare Linux host (no `container:` block) because Docker
+  # images for armv6 are unreliable. Toolchain (Go, nodejs, git) must be
+  # preinstalled. Runner label must map to `linux-armv6:host` in config.yml.
+  # ─────────────────────────────────────────────────────────────────────────────
+  ci-armv6:
+    name: Build & Test arm6
+    runs-on: linux-armv6
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-arm6-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-arm6-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        # No -race: TSan doesn't support 32-bit ARM at all.
+        run: go test ./...
+
+      - name: Integration tests
+        run: go test -v -tags integration -timeout 5m ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # darwin/arm64 runs on the bare macOS host. Toolchain preinstalled.
+  # Runner label must map to `darwin-arm64:host` in config.yml.
+  # ─────────────────────────────────────────────────────────────────────────────
+  ci-darwin-arm64:
+    name: Build & Test darwin-arm64
+    runs-on: darwin-arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-darwin-arm64-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-darwin-arm64-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        # darwin/arm64 has solid TSan support in Go.
+        run: go test -race ./...
+
+      - name: Integration tests
         run: go test -race -v -tags integration -timeout 5m ./...
 
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Lint runs once, on amd64 only — golangci-lint's findings are
+  # architecture-independent.
+  # ─────────────────────────────────────────────────────────────────────────────
   lint:
     name: Lint
     runs-on: docker
     container:
       image: golang:1.25
+      options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Install Node.js (required by JS-based actions)
         run: apt-get update && apt-get install -y --no-install-recommends nodejs
@@ -86,9 +157,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-amd64-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-go-
+            ${{ runner.os }}-amd64-go-
 
       - name: Download dependencies
         run: go mod download
