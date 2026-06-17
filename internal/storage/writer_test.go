@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -558,4 +559,141 @@ func TestWriter_OpenActive_OpenError(t *testing.T) {
 	assert.True(t, log.HasError("open active segment on startup"))
 
 	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
+}
+
+// TestWriter_OpenActive_TruncatesPartialTrailing verifies that when the active
+// segment ends in non-newline-terminated bytes (the signature of a crash
+// mid-write), the writer truncates them on startup so subsequent appends
+// produce valid records. Without this, the next message would concatenate
+// with the garbage and fail to unmarshal in the subscriber.
+func TestWriter_OpenActive_TruncatesPartialTrailing(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "orders")
+
+	// Stage 1: write N valid lines via a normal ChannelWriter and close it cleanly.
+	w1, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
+	require.NoError(t, err)
+	const validLines = 5
+	for i := 0; i < validLines; i++ {
+		require.NoError(t, w1.Write(context.Background(), makeTestEnvelope(t, fmt.Sprintf("ord-%d", i))))
+	}
+	require.NoError(t, w1.Close())
+
+	// Stage 2: simulate a crash mid-write by appending garbage bytes with no
+	// trailing newline directly to the segment file.
+	segPath := filepath.Join(channelDir, segmentName(0))
+	cleanInfo, err := os.Stat(segPath)
+	require.NoError(t, err)
+	cleanSize := cleanInfo.Size()
+
+	const garbage = `{"id":"partial","channel":"orders","payload":{"data":"trunc`
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0)
+	require.NoError(t, err)
+	_, err = f.Write([]byte(garbage))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	// Sanity check: the file now ends without a newline.
+	tail := make([]byte, 1)
+	rf, err := os.Open(segPath)
+	require.NoError(t, err)
+	dirty, err := rf.Stat()
+	require.NoError(t, err)
+	require.Equal(t, cleanSize+int64(len(garbage)), dirty.Size())
+	_, err = rf.ReadAt(tail, dirty.Size()-1)
+	require.NoError(t, err)
+	require.NotEqual(t, byte('\n'), tail[0])
+	require.NoError(t, rf.Close())
+
+	// Stage 3: open a new ChannelWriter on the same directory. Startup must
+	// detect the partial trailing bytes and truncate them.
+	log := &testutil.FakeLogger{}
+	w2, err := NewChannelWriter(channelDir, 0, 1000000, nil, log)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(segPath)
+		return err == nil && info.Size() == cleanSize
+	}, time.Second, 10*time.Millisecond, "writer did not truncate partial trailing bytes")
+
+	assert.True(t, log.HasWarn("recovered partial trailing bytes after crash"),
+		"expected recovery warning in logs")
+
+	// Stage 4: write one more message. It must append cleanly and parse as
+	// valid JSON — the proof that the file invariant has been restored.
+	require.NoError(t, w2.Write(context.Background(), makeTestEnvelope(t, "ord-post-crash")))
+	require.NoError(t, w2.Close())
+
+	lines := readAllSegments(t, channelDir)
+	assert.Len(t, lines, validLines+1)
+	for i, line := range lines {
+		var v map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &v), "line %d invalid JSON: %q", i, line)
+	}
+}
+
+// TestWriter_OpenActive_TruncatesFullyCorruptSegment verifies the edge case
+// where the segment file contains no '\n' at all (e.g. the very first write
+// crashed). The writer should truncate the file to zero so subsequent writes
+// produce a clean log.
+func TestWriter_OpenActive_TruncatesFullyCorruptSegment(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "orders")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+
+	// Create a segment file filled with non-newline bytes.
+	segPath := filepath.Join(channelDir, segmentName(0))
+	require.NoError(t, os.WriteFile(segPath, []byte("partial-garbage-no-newline-ever"), 0o600))
+
+	log := &testutil.FakeLogger{}
+	w, err := NewChannelWriter(channelDir, 0, 1000000, nil, log)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(segPath)
+		return err == nil && info.Size() == 0
+	}, time.Second, 10*time.Millisecond, "writer did not truncate fully-corrupt segment")
+
+	assert.True(t, log.HasWarn("recovered fully-corrupt segment after crash"),
+		"expected fully-corrupt recovery warning in logs")
+
+	// Subsequent writes succeed and produce a valid record.
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord-post-crash")))
+	require.NoError(t, w.Close())
+
+	lines := readAllSegments(t, channelDir)
+	require.Len(t, lines, 1)
+	var v map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &v))
+}
+
+// TestWriter_OpenActive_CleanSegmentNoTruncation verifies that a segment
+// already ending in '\n' (the normal case) is left untouched and no recovery
+// warning is logged.
+func TestWriter_OpenActive_CleanSegmentNoTruncation(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "orders")
+
+	w1, err := NewChannelWriter(channelDir, 0, 1000000, nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, w1.Write(context.Background(), makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w1.Close())
+
+	segPath := filepath.Join(channelDir, segmentName(0))
+	beforeInfo, err := os.Stat(segPath)
+	require.NoError(t, err)
+
+	log := &testutil.FakeLogger{}
+	w2, err := NewChannelWriter(channelDir, 0, 1000000, nil, log)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w2.Close() })
+
+	require.Eventually(t, func() bool {
+		info, err := os.Stat(segPath)
+		return err == nil && info.Size() == beforeInfo.Size()
+	}, time.Second, 10*time.Millisecond)
+
+	assert.False(t, log.HasWarn("recovered partial trailing bytes"),
+		"clean segment must not trigger recovery warning")
+	assert.False(t, log.HasWarn("recovered fully-corrupt segment"),
+		"clean segment must not trigger fully-corrupt recovery warning")
 }

@@ -2,6 +2,7 @@
 package storage
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -211,6 +212,13 @@ func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 // openActive returns the active segment file (highest start offset) ready for
 // appending, along with its start offset and current byte size. If no segments
 // exist yet, the first segment is created.
+//
+// If the active segment's last byte is not '\n', that's evidence of a previous
+// crash mid-write: the file invariant (every byte belongs to a \n-terminated
+// record) has been violated. Truncate the trailing partial bytes so subsequent
+// writes appended at end-of-file produce valid records. Without this, the next
+// message would concatenate with the garbage and fail to unmarshal in the
+// subscriber, silently dropping the first post-crash message.
 func (w *channelWriter) openActive() (fileWriter, int64, int64, error) {
 	segs, err := listSegments(w.channelDir)
 	if err != nil {
@@ -225,11 +233,70 @@ func (w *channelWriter) openActive() (fileWriter, int64, int64, error) {
 		return f, 0, 0, nil
 	}
 	active := segs[len(segs)-1]
+	size, err := truncatePartialTrailing(active.path, active.size, w.log)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("truncate partial trailing in %q: %w", active.path, err)
+	}
 	f, err := w.sf.openSegment(active.path)
 	if err != nil {
 		return nil, 0, 0, fmt.Errorf("open active segment %q: %w", active.path, err)
 	}
-	return f, active.startOffset, active.size, nil
+	return f, active.startOffset, size, nil
+}
+
+// truncatePartialTrailing inspects the last byte of path. If it's already '\n'
+// the file is intact and the function is a no-op. Otherwise it scans backward
+// in 4 KiB chunks to find the most recent '\n' and truncates the file to one
+// byte after it. If no '\n' is found anywhere, the file is truncated to zero.
+// Returns the post-truncation file size.
+func truncatePartialTrailing(path string, currentSize int64, log logger) (int64, error) {
+	if currentSize == 0 {
+		return 0, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return 0, fmt.Errorf("open for recovery: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+
+	var last [1]byte
+	if _, err := f.ReadAt(last[:], currentSize-1); err != nil {
+		return 0, fmt.Errorf("read tail byte: %w", err)
+	}
+	if last[0] == '\n' {
+		return currentSize, nil
+	}
+
+	const chunk = 4096
+	pos := currentSize
+	for pos > 0 {
+		n := int64(chunk)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		buf := make([]byte, n)
+		if _, err := f.ReadAt(buf, pos); err != nil {
+			return 0, fmt.Errorf("read chunk at %d: %w", pos, err)
+		}
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			newSize := pos + int64(i) + 1
+			if err := f.Truncate(newSize); err != nil {
+				return 0, fmt.Errorf("truncate to %d: %w", newSize, err)
+			}
+			log.Warn("recovered partial trailing bytes after crash",
+				"path", path, "old_size", currentSize, "new_size", newSize,
+				"dropped_bytes", currentSize-newSize)
+			return newSize, nil
+		}
+	}
+	// No '\n' anywhere — the entire file is partial garbage.
+	if err := f.Truncate(0); err != nil {
+		return 0, fmt.Errorf("truncate to 0: %w", err)
+	}
+	log.Warn("recovered fully-corrupt segment after crash",
+		"path", path, "dropped_bytes", currentSize)
+	return 0, nil
 }
 
 // doWrite performs the write with retry-on-error (backpressure) and optional
