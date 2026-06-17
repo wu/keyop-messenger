@@ -1,3 +1,21 @@
+## [1.13.0](https://github.com/wu/keyop-messenger/compare/v1.12.0...v1.13.0) (2026-06-17)
+
+### Features
+
+* add diagnostic counters and stats for subscriber and notifier ([02d40d8](https://github.com/wu/keyop-messenger/commit/02d40d8634e0f0971735a6fd7196c0835e1aba7d))
+* add periodic polling to prevent lost-wakeup races in subscriber ([21fa3a5](https://github.com/wu/keyop-messenger/commit/21fa3a5e80fb450f629d2f03d7d9324da5310ab5))
+* enhance CI configuration for multi-architecture  tests ([8bc0682](https://github.com/wu/keyop-messenger/commit/8bc0682e8edb3a980fa481aa9117f25cb4e494ed))
+* increase timeout for tests on raspi (armv6 and arm64) ([0af5d81](https://github.com/wu/keyop-messenger/commit/0af5d81f5997cd8cd3eb9a46aedabd4dbf6838ff))
+
+### Bug Fixes
+
+* do not emit partial trailing lines from subscriber scanner ([e996468](https://github.com/wu/keyop-messenger/commit/e9964682d942772d0306e745959876519e93a40b))
+* truncate partial trailing bytes on writer startup ([d40902c](https://github.com/wu/keyop-messenger/commit/d40902c90efa681b3ecbe51bb98251b17677f857))
+
+### Refactoring
+
+* consolidate test steps and extend timeout for throughput tests ([a6ca2a9](https://github.com/wu/keyop-messenger/commit/a6ca2a9d1b8678b354d451f98c4c4778a5de3a37))
+
 ## [1.12.0](https://github.com/wu/keyop-messenger/compare/v1.11.1...v1.12.0) (2026-06-16)
 
 ### Features
