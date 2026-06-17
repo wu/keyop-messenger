@@ -47,10 +47,36 @@ func throughputRun(t *testing.T, count int, flushIntervalMS int) {
 		}
 	}
 
-	select {
-	case <-done:
-	case <-time.After(10 * time.Minute):
-		t.Fatalf("timed out: received %d/%d messages", received.Load(), count)
+	// Periodic progress logging surfaces the subscriber's diagnostic counters
+	// while we wait, so a stall like "998/1000" gives us actionable data instead
+	// of a single fatal line.
+	progressTick := time.NewTicker(5 * time.Second)
+	defer progressTick.Stop()
+	deadline := time.After(10 * time.Minute)
+waitLoop:
+	for {
+		select {
+		case <-done:
+			break waitLoop
+		case <-progressTick.C:
+			s := m.DiagnosticStats("tput", "sub")
+			t.Logf("progress: received=%d/%d notifies=%d drops=%d wakes_notify=%d wakes_poll=%d process_calls=%d dispatched=%d unmarshal_skipped=%d decode_skipped=%d offset=%d flushed=%d",
+				received.Load(), count,
+				s.NotifySent, s.NotifyDropped,
+				s.WakesByNotify, s.WakesByPoll,
+				s.ProcessCalls, s.Dispatched,
+				s.UnmarshalSkipped, s.DecodeSkipped,
+				s.CurrentOffset, s.FlushedOffset)
+		case <-deadline:
+			s := m.DiagnosticStats("tput", "sub")
+			t.Fatalf("timed out: received=%d/%d notifies=%d drops=%d wakes_notify=%d wakes_poll=%d process_calls=%d dispatched=%d unmarshal_skipped=%d decode_skipped=%d offset=%d flushed=%d",
+				received.Load(), count,
+				s.NotifySent, s.NotifyDropped,
+				s.WakesByNotify, s.WakesByPoll,
+				s.ProcessCalls, s.Dispatched,
+				s.UnmarshalSkipped, s.DecodeSkipped,
+				s.CurrentOffset, s.FlushedOffset)
+		}
 	}
 
 	elapsed := time.Since(start)

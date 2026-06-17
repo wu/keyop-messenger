@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -50,10 +51,12 @@ type Subscriber struct {
 	// flushInterval is the minimum time between offset file flushes.
 	// 0 flushes after every message (strictest at-least-once).
 	flushInterval time.Duration
-	// flushedOffset and lastFlush track what has actually been written to disk.
-	// Both are only accessed from the subscriber goroutine — no mutex needed.
-	flushedOffset int64
-	lastFlush     time.Time
+	// flushedOffset tracks what has actually been written to disk. Atomic so
+	// external Stats() callers can read it safely. Writes are still only from
+	// the subscriber goroutine.
+	flushedOffset atomic.Int64
+	// lastFlush is only accessed from the subscriber goroutine — no mutex needed.
+	lastFlush time.Time
 
 	stopCh    chan struct{}
 	doneCh    chan struct{}
@@ -70,6 +73,45 @@ type Subscriber struct {
 	// consecutiveOffsetErrs counts successive WriteOffset failures.
 	// Only accessed from the subscriber goroutine — no mutex needed.
 	consecutiveOffsetErrs int
+
+	// Diagnostic counters for investigating lost-wakeup and offset-skew bugs.
+	// All updated only from the subscriber goroutine and accessed via Stats().
+	wakesByNotify    atomic.Int64
+	wakesByPoll      atomic.Int64
+	processCalls     atomic.Int64
+	dispatched       atomic.Int64
+	unmarshalSkipped atomic.Int64
+	decodeSkipped    atomic.Int64
+}
+
+// SubscriberStats returns a snapshot of the diagnostic counters. Intended for
+// tests and observability hooks investigating delivery anomalies.
+type SubscriberStats struct {
+	WakesByNotify    int64
+	WakesByPoll      int64
+	ProcessCalls     int64
+	Dispatched       int64
+	UnmarshalSkipped int64
+	DecodeSkipped    int64
+	CurrentOffset    int64
+	FlushedOffset    int64
+}
+
+// Stats returns a snapshot of the diagnostic counters.
+func (s *Subscriber) Stats() SubscriberStats {
+	s.mu.Lock()
+	off := s.offset
+	s.mu.Unlock()
+	return SubscriberStats{
+		WakesByNotify:    s.wakesByNotify.Load(),
+		WakesByPoll:      s.wakesByPoll.Load(),
+		ProcessCalls:     s.processCalls.Load(),
+		Dispatched:       s.dispatched.Load(),
+		UnmarshalSkipped: s.unmarshalSkipped.Load(),
+		DecodeSkipped:    s.decodeSkipped.Load(),
+		CurrentOffset:    off,
+		FlushedOffset:    s.flushedOffset.Load(),
+	}
 }
 
 // NewSubscriber constructs a Subscriber and initialises its offset file.
@@ -115,7 +157,7 @@ func NewSubscriber(
 		}
 	}
 
-	return &Subscriber{
+	s := &Subscriber{
 		id:            id,
 		channelDir:    channelDir,
 		offsetPath:    offsetPath,
@@ -125,13 +167,14 @@ func NewSubscriber(
 		log:           log,
 		offset:        offset,
 		flushInterval: flushInterval,
-		flushedOffset: offset,
 		lastFlush:     time.Now(),
 		stopCh:        make(chan struct{}),
 		doneCh:        make(chan struct{}),
 		retryDelay:    defaultRetryDelay,
 		writeOffsetFn: WriteOffset,
-	}, nil
+	}
+	s.flushedOffset.Store(offset)
+	return s, nil
 }
 
 // Start launches the subscriber goroutine. notifyC should come from
@@ -168,7 +211,7 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	// before those writes are visible, it could otherwise sleep forever despite
 	// pending data. processAvailable is idempotent (offset tracking skips
 	// already-delivered messages), so a periodic re-check is safe and cheap.
-	const pollInterval = 100 * time.Millisecond
+	const pollInterval = time.Second
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
@@ -176,8 +219,10 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	for {
 		select {
 		case <-notifyC:
+			s.wakesByNotify.Add(1)
 			s.processAvailable(handler)
 		case <-ticker.C:
+			s.wakesByPoll.Add(1)
 			s.processAvailable(handler)
 		case <-s.stopCh:
 			return
@@ -191,7 +236,7 @@ func (s *Subscriber) flushOnStop() {
 	s.mu.Lock()
 	offset := s.offset
 	s.mu.Unlock()
-	if offset != s.flushedOffset {
+	if offset != s.flushedOffset.Load() {
 		s.flushToDisk(offset)
 	}
 }
@@ -199,6 +244,7 @@ func (s *Subscriber) flushOnStop() {
 // processAvailable reads all complete lines across all segment files starting
 // from the subscriber's current global offset and dispatches them.
 func (s *Subscriber) processAvailable(handler HandlerFunc) {
+	s.processCalls.Add(1)
 	segs, err := listSegments(s.channelDir)
 	if err != nil {
 		s.log.Error("list channel segments", "dir", s.channelDir, "err", err)
@@ -221,7 +267,7 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 			return
 		}
 		s.consecutiveOffsetErrs = 0
-		s.flushedOffset = offset
+		s.flushedOffset.Store(offset)
 		s.lastFlush = time.Now()
 	}
 
@@ -254,7 +300,8 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 
 			env, err := envelope.Unmarshal(line)
 			if err != nil {
-				s.log.Error("unmarshal envelope", "err", err)
+				s.unmarshalSkipped.Add(1)
+				s.log.Error("unmarshal envelope", "err", err, "line_len", len(line), "next_offset", nextOffset)
 				s.advanceOffset(nextOffset)
 				offset = nextOffset
 				continue
@@ -262,12 +309,14 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 
 			payload, err := s.reg.Decode(env.PayloadType, env.Payload)
 			if err != nil {
+				s.decodeSkipped.Add(1)
 				s.log.Error("decode payload", "type", env.PayloadType, "err", err)
 				s.advanceOffset(nextOffset)
 				offset = nextOffset
 				continue
 			}
 
+			s.dispatched.Add(1)
 			s.dispatch(handler, &env, payload, nextOffset)
 			offset = nextOffset
 		}
@@ -378,6 +427,6 @@ func (s *Subscriber) flushToDisk(newOffset int64) {
 		return
 	}
 	s.consecutiveOffsetErrs = 0
-	s.flushedOffset = newOffset
+	s.flushedOffset.Store(newOffset)
 	s.lastFlush = time.Now()
 }

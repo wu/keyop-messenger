@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -21,7 +22,9 @@ type ChannelWatcher interface {
 // LocalNotifier.Notify as the notifyFn argument to NewChannelWriter; have the
 // subscriber select on LocalNotifier.C().
 type LocalNotifier struct {
-	ch chan struct{}
+	ch       chan struct{}
+	notifies atomic.Int64
+	drops    atomic.Int64
 }
 
 // NewLocalNotifier creates a LocalNotifier with a capacity-1 channel.
@@ -33,12 +36,20 @@ func NewLocalNotifier() *LocalNotifier {
 func (n *LocalNotifier) Notify() {
 	select {
 	case n.ch <- struct{}{}:
+		n.notifies.Add(1)
 	default:
+		n.drops.Add(1)
 	}
 }
 
 // C returns the read-only channel that subscribers should select on.
 func (n *LocalNotifier) C() <-chan struct{} { return n.ch }
+
+// Stats returns total successful notifies and dropped notifies since creation.
+// Intended for diagnostics and tests investigating lost-wakeup scenarios.
+func (n *LocalNotifier) Stats() (notifies, drops int64) {
+	return n.notifies.Load(), n.drops.Load()
+}
 
 // fsnotifyBackend abstracts *fsnotify.Watcher so tests can inject a fake.
 type fsnotifyBackend interface {

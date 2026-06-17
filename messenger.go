@@ -97,6 +97,54 @@ type subscriberEntry struct {
 	cancel   context.CancelFunc // cancels subCtx; wakes the ctx-watcher goroutine
 }
 
+// DiagnosticStats is a snapshot of all instrumentation counters for one
+// (channel, subscriberID) pair. Used by tests and observability hooks to
+// investigate lost-wakeup or offset-skew bugs.
+type DiagnosticStats struct {
+	NotifySent       int64 // successful Notify calls
+	NotifyDropped    int64 // Notify calls dropped because notifyC was full
+	WakesByNotify    int64 // subscriber select cases that fired on notifyC
+	WakesByPoll      int64 // subscriber select cases that fired on the safety ticker
+	ProcessCalls     int64 // total processAvailable invocations
+	Dispatched       int64 // messages successfully passed to the handler
+	UnmarshalSkipped int64 // lines that failed envelope.Unmarshal (offset still advanced)
+	DecodeSkipped    int64 // payloads that failed reg.Decode (offset still advanced)
+	CurrentOffset    int64 // subscriber's in-memory cursor
+	FlushedOffset    int64 // subscriber's on-disk cursor
+}
+
+// DiagnosticStats returns counters for the named subscription. Returns the
+// zero value if the subscription doesn't exist (caller should check Dispatched
+// to disambiguate "not found" from "exists but processed nothing").
+func (m *Messenger) DiagnosticStats(channel, subscriberID string) DiagnosticStats {
+	m.mu.RLock()
+	cs, ok := m.channels[channel]
+	m.mu.RUnlock()
+	if !ok {
+		return DiagnosticStats{}
+	}
+	cs.mu.RLock()
+	entry, ok := cs.subs[subscriberID]
+	cs.mu.RUnlock()
+	if !ok {
+		return DiagnosticStats{}
+	}
+	subStats := entry.sub.Stats()
+	notifies, drops := entry.notifier.Stats()
+	return DiagnosticStats{
+		NotifySent:       notifies,
+		NotifyDropped:    drops,
+		WakesByNotify:    subStats.WakesByNotify,
+		WakesByPoll:      subStats.WakesByPoll,
+		ProcessCalls:     subStats.ProcessCalls,
+		Dispatched:       subStats.Dispatched,
+		UnmarshalSkipped: subStats.UnmarshalSkipped,
+		DecodeSkipped:    subStats.DecodeSkipped,
+		CurrentOffset:    subStats.CurrentOffset,
+		FlushedOffset:    subStats.FlushedOffset,
+	}
+}
+
 // channelState holds all writers, subscribers, and compaction state for one
 // channel. It is created on first access (Publish or Subscribe).
 type channelState struct {
