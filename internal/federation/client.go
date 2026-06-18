@@ -250,7 +250,7 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 	if c.grpcConn != nil {
 		return c.grpcConn, nil
 	}
-	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg)
+	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -464,15 +464,23 @@ func minDuration(a, b time.Duration) time.Duration {
 // tlsCfg is non-nil, otherwise uses insecure (plaintext) credentials.
 // The connection is created with lazy dialing; the actual TCP connection is
 // established on the first RPC call.
-func newGRPCClientConn(target string, tlsCfg *tls.Config) (*grpc.ClientConn, error) {
+func newGRPCClientConn(target string, tlsCfg *tls.Config, maxBatchBytes int) (*grpc.ClientConn, error) {
 	var creds credentials.TransportCredentials
 	if tlsCfg != nil {
 		creds = credentials.NewTLS(tlsCfg)
 	} else {
 		creds = insecure.NewCredentials()
 	}
+	// Match the hub's raised frame limit so receiving a batch up to
+	// maxRecordBytes does not fail with ResourceExhausted (gRPC's client
+	// receive default is also 4 MiB).
+	limit := grpcMessageLimit(maxBatchBytes)
 	return grpc.NewClient(target,
 		grpc.WithTransportCredentials(creds),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(limit),
+			grpc.MaxCallSendMsgSize(limit),
+		),
 		grpc.WithKeepaliveParams(keepalive.ClientParameters{
 			Time:                30 * time.Second,
 			Timeout:             10 * time.Second,

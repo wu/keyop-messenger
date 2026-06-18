@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -39,6 +40,147 @@ func makeEnvelope(t *testing.T, channel, id string) envelope.Envelope {
 	env, err := envelope.NewEnvelope(channel, "test-origin", "test.Type", map[string]any{"id": id})
 	require.NoError(t, err)
 	return env
+}
+
+// makeBigEnvelope creates an envelope whose marshalled JSONL line is at least
+// minBytes long, used to exercise the oversized-record handling.
+func makeBigEnvelope(t *testing.T, channel string, minBytes int) envelope.Envelope {
+	t.Helper()
+	env, err := envelope.NewEnvelope(channel, "test-origin", "test.Type",
+		map[string]any{"id": strings.Repeat("x", minBytes)})
+	require.NoError(t, err)
+	return env
+}
+
+// drainUntilOffset acks every batch from requestCh until the reader reaches
+// wantOffset, returning the total number of records delivered. It fails if the
+// reader loops without making progress, which is the bug this guards against.
+func drainUntilOffset(t *testing.T, requestCh <-chan sendReq, wantOffset int64) int {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	delivered := 0
+	for {
+		select {
+		case req := <-requestCh:
+			delivered += len(req.rawLines)
+			off := req.newOffset
+			close(req.doneCh)
+			if off >= wantOffset {
+				return delivered
+			}
+		case <-deadline:
+			t.Fatalf("reader did not reach offset %d (delivered=%d)", wantOffset, delivered)
+		}
+	}
+}
+
+// TestChannelReader_SkipsOversizedRecord verifies that a record larger than the
+// per-record cap (but small enough to scan) is dropped and surrounding records
+// are still delivered — the reader must not loop forever on the poison record.
+// Limits are shrunk so the oversized record is a few KiB, not megabytes.
+func TestChannelReader_SkipsOversizedRecord(t *testing.T) {
+	setTestLimits(t, 2*1024, 4*1024) // cap 2 KiB, frame limit 6 KiB
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "big")
+	offsetDir := filepath.Join(dir, "subscribers", "big")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 2*1024, requestCh, log)
+	require.NoError(t, err)
+
+	small1 := makeEnvelope(t, "big", "small1")
+	// > maxRecordBytes (2 KiB) but < the scan buffer, so it is read then dropped in-loop.
+	oversized := makeBigEnvelope(t, "big", 3*1024)
+	small2 := makeEnvelope(t, "big", "small2")
+	data := writeTestSegment(t, channelDir, 0, []envelope.Envelope{small1, oversized, small2})
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	delivered := drainUntilOffset(t, requestCh, int64(len(data)))
+	assert.Equal(t, 2, delivered, "both small records delivered, oversized dropped")
+
+	offsetPath := filepath.Join(offsetDir, "fed-peer1.offset")
+	require.Eventually(t, func() bool {
+		off, err := storage.ReadOffset(offsetPath)
+		return err == nil && off == int64(len(data))
+	}, 2*time.Second, 10*time.Millisecond, "offset should advance past the oversized record")
+}
+
+// TestChannelReader_SkipsUnscannableRecord verifies the bufio.ErrTooLong path:
+// a record larger than the scan buffer is skipped via offsetPastNextLine so the
+// reader still makes forward progress.
+func TestChannelReader_SkipsUnscannableRecord(t *testing.T) {
+	setTestLimits(t, 2*1024, 512) // frame limit 2.5 KiB → scan buffer 2.5 KiB
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "huge")
+	offsetDir := filepath.Join(dir, "subscribers", "huge")
+	log := &testutil.FakeLogger{}
+
+	const maxBatch = 2 * 1024
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "huge", channelDir, offsetDir, "fed-", maxBatch, requestCh, log)
+	require.NoError(t, err)
+
+	small1 := makeEnvelope(t, "huge", "small1")
+	// Larger than the scan buffer (grpcMessageLimit) → triggers bufio.ErrTooLong.
+	unscannable := makeBigEnvelope(t, "huge", grpcMessageLimit(maxBatch)+1024)
+	small2 := makeEnvelope(t, "huge", "small2")
+	data := writeTestSegment(t, channelDir, 0, []envelope.Envelope{small1, unscannable, small2})
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	delivered := drainUntilOffset(t, requestCh, int64(len(data)))
+	assert.Equal(t, 2, delivered, "both small records delivered, unscannable record dropped")
+
+	offsetPath := filepath.Join(offsetDir, "fed-peer1.offset")
+	require.Eventually(t, func() bool {
+		off, err := storage.ReadOffset(offsetPath)
+		return err == nil && off == int64(len(data))
+	}, 2*time.Second, 10*time.Millisecond, "offset should advance past the unscannable record")
+}
+
+// TestChannelReader_SkipsLoneOversizedRecord covers the case where a batch
+// contains nothing but a dropped record: readBatch returns no rawLines but an
+// advanced offset, and drainAndSend must still persist that offset so the reader
+// does not re-scan (and re-drop) the same record on every notification.
+func TestChannelReader_SkipsLoneOversizedRecord(t *testing.T) {
+	setTestLimits(t, 2*1024, 4*1024)
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "lone")
+	offsetDir := filepath.Join(dir, "subscribers", "lone")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "lone", channelDir, offsetDir, "fed-", 2*1024, requestCh, log)
+	require.NoError(t, err)
+
+	// A single oversized record, nothing else.
+	oversized := makeBigEnvelope(t, "lone", 3*1024)
+	data := writeTestSegment(t, channelDir, 0, []envelope.Envelope{oversized})
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	// No batch should ever be delivered — the only record was dropped.
+	select {
+	case req := <-requestCh:
+		close(req.doneCh)
+		t.Fatalf("unexpected batch with %d records; lone oversized record must be dropped", len(req.rawLines))
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// ...but the offset must still advance past it so it is not re-scanned.
+	offsetPath := filepath.Join(offsetDir, "fed-peer1.offset")
+	require.Eventually(t, func() bool {
+		off, err := storage.ReadOffset(offsetPath)
+		return err == nil && off == int64(len(data))
+	}, 2*time.Second, 10*time.Millisecond, "offset must advance even when the batch is empty")
 }
 
 // TestChannelReader_NewSubscriber_StartsAtEnd verifies that a brand-new reader

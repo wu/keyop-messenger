@@ -2,6 +2,8 @@ package federation
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -208,6 +210,19 @@ func (cr *channelReader) drainAndSend() {
 			return // error already logged
 		}
 		if len(rawLines) == 0 {
+			// No deliverable records. readBatch may still have advanced past
+			// corrupt or oversized records it dropped; persist that progress so we
+			// don't re-scan (and re-drop) them on every notification.
+			if newOffset > cr.offset {
+				cr.offset = newOffset
+				if err := storage.WriteOffset(cr.offsetPath, newOffset); err != nil {
+					cr.log.Error("channelReader: persist offset",
+						"channel", cr.channel, "peer", cr.peerName, "err", err)
+				}
+				if hasMore {
+					continue
+				}
+			}
 			return // nothing new
 		}
 
@@ -288,13 +303,33 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 			return nil, cr.offset, false, false
 		}
 
-		const maxLineSize = 10 * 1024 * 1024 // 10 MiB per line
+		// Allow reading lines up to the gRPC frame limit so a record that the
+		// transport could carry is never truncated; records beyond that are
+		// handled by the bufio.ErrTooLong branch below. Never allocate an initial
+		// buffer larger than that ceiling.
+		maxLine := grpcMessageLimit(cr.maxBatchBytes)
+		initBuf := 64 * 1024
+		if maxLine < initBuf {
+			initBuf = maxLine
+		}
 		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+		scanner.Buffer(make([]byte, initBuf), maxLine)
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
 			next := lineOffset + int64(len(line)) + 1 // +1 for the '\n'
+
+			// Drop records too large to ever fit in a gRPC frame. Advance past
+			// them so a single oversized message cannot wedge this channel in an
+			// endless disconnect/redeliver loop.
+			if len(line) > maxRecordBytes {
+				cr.log.Error("channelReader: dropping oversized record",
+					"channel", cr.channel, "peer", cr.peerName,
+					"bytes", len(line), "max", maxRecordBytes)
+				lineOffset = next
+				newOffset = next
+				continue
+			}
 
 			// Stop before this line if it would overflow the batch (always include
 			// at least one line so we make forward progress even on huge messages).
@@ -320,6 +355,29 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 			newOffset = next
 		}
 		if scanErr := scanner.Err(); scanErr != nil {
+			if errors.Is(scanErr, bufio.ErrTooLong) {
+				// The record is larger than the scan buffer (and thus larger than
+				// any frame we could send). Locate its terminating newline and skip
+				// past it so the reader makes forward progress instead of looping.
+				skipTo, found, serr := offsetPastNextLine(seg.path, lineOffset-seg.startOffset, seg.startOffset)
+				_ = f.Close()
+				if serr != nil {
+					cr.log.Error("channelReader: locate oversized record end",
+						"channel", cr.channel, "err", serr)
+					return rawLines, newOffset, len(rawLines) > 0, true
+				}
+				if !found {
+					// No terminating newline yet — the record is still being
+					// written. Deliver what we have and retry on the next notify.
+					return rawLines, newOffset, false, true
+				}
+				cr.log.Error("channelReader: dropping oversized record",
+					"channel", cr.channel, "peer", cr.peerName,
+					"from", lineOffset, "to", skipTo)
+				newOffset = skipTo
+				// Loop again from the advanced offset to pick up later records.
+				return rawLines, newOffset, true, true
+			}
 			cr.log.Error("channelReader: scan", "path", seg.path, "err", scanErr)
 		}
 		_ = f.Close()
@@ -331,4 +389,38 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 	}
 
 	return rawLines, newOffset, false, true
+}
+
+// offsetPastNextLine scans segPath from relStart looking for the next '\n' and
+// returns the global offset (segStart + position just past the newline). found
+// is false when EOF is reached with no newline — the record is still being
+// written, so the caller should wait rather than skip a partial line.
+func offsetPastNextLine(segPath string, relStart, segStart int64) (globalOff int64, found bool, err error) {
+	f, err := os.Open(segPath) // #nosec G304 -- segPath is an internally-derived segment path
+	if err != nil {
+		return 0, false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Seek(relStart, io.SeekStart); err != nil {
+		return 0, false, err
+	}
+
+	buf := make([]byte, 256*1024)
+	pos := relStart
+	for {
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if idx := bytes.IndexByte(buf[:n], '\n'); idx >= 0 {
+				return segStart + pos + int64(idx) + 1, true, nil
+			}
+			pos += int64(n)
+		}
+		if rerr == io.EOF {
+			return 0, false, nil
+		}
+		if rerr != nil {
+			return 0, false, rerr
+		}
+	}
 }

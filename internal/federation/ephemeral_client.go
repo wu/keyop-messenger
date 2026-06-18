@@ -183,7 +183,7 @@ func (c *EphemeralClient) Close() {
 // and starts per-connection goroutines. Returns a channel closed when the
 // connection is lost.
 func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, error) {
-	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg)
+	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes)
 	if err != nil {
 		return nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
 	}

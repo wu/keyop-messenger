@@ -137,6 +137,11 @@ func (h *Hub) newGRPCServer() *grpc.Server {
 		Time:              30 * time.Second,
 		Timeout:           10 * time.Second,
 	}))
+	// Raise the receive limit above gRPC's 4 MiB default so peers can publish
+	// records up to maxRecordBytes; the default would reject a larger batch with
+	// ResourceExhausted, dropping the stream and triggering an endless reconnect.
+	limit := grpcMessageLimit(h.maxBatchBytes)
+	opts = append(opts, grpc.MaxRecvMsgSize(limit), grpc.MaxSendMsgSize(limit))
 	srv := grpc.NewServer(opts...)
 	federationv1.RegisterFederationServiceServer(srv, h)
 	return srv
