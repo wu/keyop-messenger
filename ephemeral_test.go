@@ -51,7 +51,7 @@ func TestEphemeralMessenger_Publish_ToHub(t *testing.T) {
 	subCtx, subCancel := context.WithCancel(context.Background())
 	defer subCancel()
 	require.NoError(t, hub.Subscribe(subCtx, "events", "hub-sub",
-		func(_ context.Context, msg Message) error {
+		func(_ context.Context, _ Message) error {
 			hubReceived.Add(1)
 			return nil
 		},
@@ -89,7 +89,7 @@ func TestEphemeralMessenger_Subscribe_FromHub(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"events"})
 
 	var received atomic.Int32
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		received.Add(1)
 	}))
 
@@ -129,7 +129,7 @@ func TestEphemeralMessenger_Subscribe_NoReplay(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"events"})
 
 	var received atomic.Int32
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		received.Add(1)
 	}))
 
@@ -310,10 +310,10 @@ func TestEphemeralMessenger_SubscribeBeforeConnect(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"chan1", "chan2"})
 
 	var received1, received2 atomic.Int32
-	require.NoError(t, em.Subscribe("chan1", func(msg Message) {
+	require.NoError(t, em.Subscribe("chan1", func(_ Message) {
 		received1.Add(1)
 	}))
-	require.NoError(t, em.Subscribe("chan2", func(msg Message) {
+	require.NoError(t, em.Subscribe("chan2", func(_ Message) {
 		received2.Add(1)
 	}))
 
@@ -349,13 +349,13 @@ func TestEphemeralMessenger_MultipleHandlers(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"events"})
 
 	var handler1, handler2, handler3 atomic.Int32
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		handler1.Add(1)
 	}))
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		handler2.Add(1)
 	}))
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		handler3.Add(1)
 	}))
 
@@ -389,11 +389,11 @@ func TestEphemeralMessenger_HandlerError(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"events"})
 
 	var handler1, handler2 atomic.Int32
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		handler1.Add(1)
 		// Handler errors are logged but don't stop other handlers; this handler runs normally.
 	}))
-	require.NoError(t, em.Subscribe("events", func(msg Message) {
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
 		handler2.Add(1)
 	}))
 
@@ -431,7 +431,7 @@ func TestEphemeralMessenger_PublishAfterClose(t *testing.T) {
 	defer cancel()
 	require.NoError(t, em.Connect(ctx))
 
-	em.Close()
+	_ = em.Close()
 	err := em.Publish(ctx, "events", "test.Event", "payload")
 	// After Close, Publish returns an error (either ErrEphemeralConnLost or connection closed error).
 	assert.Error(t, err)
@@ -453,9 +453,9 @@ func TestEphemeralMessenger_SubscribeAfterClose(t *testing.T) {
 	defer cancel()
 	require.NoError(t, em.Connect(ctx))
 
-	em.Close()
+	_ = em.Close()
 	// Subscribe should not panic; it may succeed or fail depending on timing.
-	_ = em.Subscribe("events", func(msg Message) {})
+	_ = em.Subscribe("events", func(_ Message) {})
 }
 
 // TestEphemeralMessenger_CloseIdempotent verifies that Close can be called
@@ -500,10 +500,10 @@ func TestEphemeralMessenger_AllowChannels(t *testing.T) {
 	em := newEphemeralMessenger(t, "em-client", hubLocalAddr(t, hub), caFile, certFor("em-client"), keyFor("em-client"), []string{"allowed-chan", "denied-chan"})
 
 	var allowedReceived, deniedReceived atomic.Int32
-	require.NoError(t, em.Subscribe("allowed-chan", func(msg Message) {
+	require.NoError(t, em.Subscribe("allowed-chan", func(_ Message) {
 		allowedReceived.Add(1)
 	}))
-	require.NoError(t, em.Subscribe("denied-chan", func(msg Message) {
+	require.NoError(t, em.Subscribe("denied-chan", func(_ Message) {
 		deniedReceived.Add(1)
 	}))
 

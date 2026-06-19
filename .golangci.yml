@@ -3,6 +3,9 @@ version: 2
 run:
   timeout: 5m
   go: "1.22"
+  # Lint integration-tagged files too, so `make lint` matches what CI builds.
+  build-tags:
+    - integration
 
 linters:
   enable:

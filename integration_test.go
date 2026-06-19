@@ -51,7 +51,7 @@ func integrationTLS(
 // newHubMessenger creates a Messenger in hub mode listening on 127.0.0.1:0.
 func newHubMessenger(
 	t *testing.T,
-	name, dir, caFile, certFile, keyFile string,
+	_, dir, caFile, certFile, keyFile string,
 	hubCfg HubConfig,
 ) *Messenger {
 	t.Helper()
@@ -64,29 +64,6 @@ func newHubMessenger(
 			DataDir: dir,
 		},
 		Hub: hubCfg,
-		TLS: TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
-	}
-	cfg.ApplyDefaults()
-	m, err := New(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = m.Close() })
-	return m
-}
-
-// newClientMessenger creates a Messenger in client-only mode dialling hubAddr.
-func newClientMessenger(
-	t *testing.T,
-	name, dir, caFile, certFile, keyFile, hubAddr string,
-) *Messenger {
-	t.Helper()
-	cfg := &Config{
-		Storage: StorageConfig{
-			DataDir: filepath.Join(dir, name),
-		},
-		Client: ClientConfig{
-			Enabled: true,
-			Hubs:    []ClientHubRef{{Addr: hubAddr}},
-		},
 		TLS: TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
 	}
 	cfg.ApplyDefaults()

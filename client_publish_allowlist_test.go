@@ -83,7 +83,7 @@ func TestMessenger_Client_PublishAllowlist(t *testing.T) {
 	for _, ch := range []string{"movie", "movies"} {
 		ch := ch // capture for closure
 		go func() {
-			err := hubMsg.Subscribe(ctx, ch, "tracker-"+ch, func(ctx context.Context, msg Message) error {
+			err := hubMsg.Subscribe(ctx, ch, "tracker-"+ch, func(_ context.Context, _ Message) error {
 				receivedMu.Lock()
 				receivedChannels[ch]++
 				receivedMu.Unlock()
@@ -197,7 +197,7 @@ func TestMessenger_Client_ReceiveAllowlist(t *testing.T) {
 	for _, ch := range []string{"alerts", "metrics"} {
 		ch := ch // capture for closure
 		go func() {
-			err := clientMsg.Subscribe(ctx, ch, "tracker-"+ch, func(ctx context.Context, msg Message) error {
+			err := clientMsg.Subscribe(ctx, ch, "tracker-"+ch, func(_ context.Context, _ Message) error {
 				receivedMu.Lock()
 				receivedChannels[ch]++
 				receivedMu.Unlock()

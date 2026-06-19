@@ -586,7 +586,7 @@ func TestWriter_OpenActive_TruncatesPartialTrailing(t *testing.T) {
 	cleanSize := cleanInfo.Size()
 
 	const garbage = `{"id":"partial","channel":"orders","payload":{"data":"trunc`
-	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0)
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0) //nolint:gosec // test file: segPath is test-controlled
 	require.NoError(t, err)
 	_, err = f.Write([]byte(garbage))
 	require.NoError(t, err)
@@ -594,7 +594,7 @@ func TestWriter_OpenActive_TruncatesPartialTrailing(t *testing.T) {
 
 	// Sanity check: the file now ends without a newline.
 	tail := make([]byte, 1)
-	rf, err := os.Open(segPath)
+	rf, err := os.Open(segPath) //nolint:gosec // test file: segPath is test-controlled
 	require.NoError(t, err)
 	dirty, err := rf.Stat()
 	require.NoError(t, err)
