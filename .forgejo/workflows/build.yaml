@@ -163,3 +163,74 @@ jobs:
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Coverage runs once on amd64 (coverage % is architecture- and race-independent)
+  # and posts a "coverage" commit status whose description shows the percentage.
+  # The job also fails when coverage drops below MIN_COVERAGE, so it gates merges.
+  # ─────────────────────────────────────────────────────────────────────────────
+  coverage:
+    name: Coverage
+    runs-on: docker
+    container:
+      image: golang:1.25
+      options: "--init --tmpfs /tmp:exec,size=2g"
+    steps:
+      - name: Install Node.js (required by JS-based actions) and curl
+        run: apt-get update && apt-get install -y --no-install-recommends nodejs curl
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-amd64-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-amd64-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run tests with coverage
+        # -coverpkg=./... so integration tests (which live in the root package but
+        # exercise the internal/* packages) count toward those packages' coverage.
+        # No -race: it doesn't change the coverage number and keeps the run fast.
+        run: go test -tags integration -coverpkg=./... -coverprofile=coverage.out -timeout 15m ./...
+
+      - name: Report coverage and enforce threshold
+        env:
+          # ── Adjust the minimum coverage gate here ──
+          MIN_COVERAGE: "83.0"
+          TOKEN: ${{ github.token }}
+          # Report against the PR head on pull_request so the status shows on the
+          # PR; fall back to the pushed commit otherwise.
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "Total coverage: ${pct}% (minimum ${MIN_COVERAGE}%)"
+          echo "### Coverage: ${pct}% (minimum ${MIN_COVERAGE}%)" >> "$GITHUB_STEP_SUMMARY"
+
+          # state=failure when pct < MIN_COVERAGE (awk handles the float compare).
+          state=success
+          if awk "BEGIN{exit !(${pct} < ${MIN_COVERAGE})}"; then
+            state=failure
+          fi
+
+          # Post a commit status carrying the percentage in its description.
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/statuses/${HEAD_SHA}"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          curl -fsS -X POST "$api" \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"state\":\"${state}\",\"context\":\"coverage\",\"description\":\"coverage: ${pct}% (min ${MIN_COVERAGE}%)\",\"target_url\":\"${run_url}\"}" \
+            || echo "warning: failed to post coverage commit status (continuing)"
+
+          if [ "${state}" = "failure" ]; then
+            echo "::error::coverage ${pct}% is below the ${MIN_COVERAGE}% minimum"
+            exit 1
+          fi
