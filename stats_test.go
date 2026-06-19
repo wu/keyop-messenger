@@ -69,7 +69,19 @@ func TestStats_SubscriberLagAfterDelivery(t *testing.T) {
 	assert.Positive(t, ch.StreamBytes)
 	require.Len(t, ch.Subscribers, 1)
 	assert.Equal(t, "sub1", ch.Subscribers[0].ID)
-	assert.Zero(t, ch.Subscribers[0].LagBytes)
+
+	// The handler signals delivery (delivered<-) before the subscriber advances
+	// its offset, so lag can briefly be non-zero. Poll until the offset catches
+	// up rather than reading a single racy snapshot.
+	require.Eventually(t, func() bool {
+		s := m.Stats()
+		for _, c := range s.Channels {
+			if c.Channel == "events" && len(c.Subscribers) == 1 {
+				return c.Subscribers[0].LagBytes == 0
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "subscriber lag should reach zero after delivery")
 }
 
 func TestStats_MultipleChannels(t *testing.T) {
