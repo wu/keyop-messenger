@@ -1,4 +1,4 @@
-.PHONY: all build test test-integration test-fast test-coverage coverage bench lint clean release help
+.PHONY: all build test test-integration test-fast coverage bench lint clean release help
 
 # Default target
 all: test build
@@ -14,21 +14,16 @@ test:
 
 # Run integration tests (requires build tag)
 test-integration:
-	go test -race -v -tags integration -timeout 60s ./...
+	go test -race -v -tags integration -timeout 5m ./...
 
 # Run tests without race detection (faster)
 test-fast:
 	go test -v ./...
 
-# Run tests with coverage
-test-coverage:
-	go test -race -coverprofile=coverage.out ./...
-	go tool cover -func=coverage.out
-
-# Run tests with coverage, excluding example and testutil packages
+# Run tests with coverage, excluding the example, internal/testutil, and gen packages
 COVER_PKGS := $(shell go list ./... | grep -Ev '/(example|internal/testutil|gen/)$$')
 coverage:
-	go test -race -tags integration -coverprofile=coverage.out $(COVER_PKGS)
+	go test -race -tags integration -timeout 5m -coverprofile=coverage.out $(COVER_PKGS)
 	@grep -v -E '^github\.com/wu/keyop-messenger/(example|internal/testutil|gen/)' coverage.out > coverage-filtered.out
 	go tool cover -func=coverage-filtered.out
 	@rm -f coverage-filtered.out
@@ -59,7 +54,6 @@ help:
 	@echo "  test             - Run all unit tests with race detection"
 	@echo "  test-integration - Run integration tests (build tag: integration)"
 	@echo "  test-fast        - Run all tests without race detection"
-	@echo "  test-coverage    - Run all tests and show coverage"
 	@echo "  coverage         - Run tests and show coverage (excludes example and testutil)"
 	@echo "  bench            - Run benchmarks"
 	@echo "  lint             - Run golangci-lint"

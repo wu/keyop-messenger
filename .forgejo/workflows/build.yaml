@@ -59,9 +59,9 @@ jobs:
         # -tags integration runs unit tests *and* integration tests in a single
         # invocation (build tags are inclusive — untagged tests always compile).
         # -v streams per-test progress so the runner UI doesn't appear stalled
-        # while the large root package runs. 15m timeout gives the throughput
-        # test's 10m internal timer room to fire first with a useful diagnostic.
-        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 15m ./...
+        # while the large root package runs. 5m timeout: the suite completes well
+        # under that now; a hang trips the timeout (with a goroutine dump) instead.
+        run: go test ${{ matrix.race_flag }} -v -tags integration -timeout 5m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # armv6 runs on the bare Linux host (no `container:` block) because Docker
@@ -94,7 +94,7 @@ jobs:
       - name: Test
         # -tags integration runs unit tests *and* integration tests in a single
         # invocation. No -race: TSan doesn't support 32-bit ARM at all.
-        run: go test -v -tags integration -timeout 15m ./...
+        run: go test -v -tags integration -timeout 5m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # darwin/arm64 runs on the bare macOS host. Toolchain preinstalled.
@@ -126,7 +126,7 @@ jobs:
       - name: Test
         # -tags integration runs unit tests *and* integration tests in a single
         # invocation. darwin/arm64 has solid TSan support in Go.
-        run: go test -race -v -tags integration -timeout 15m ./...
+        run: go test -race -v -tags integration -timeout 5m ./...
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Lint runs once, on amd64 only — golangci-lint's findings are
@@ -176,8 +176,8 @@ jobs:
       image: golang:1.25
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
-      - name: Install Node.js (required by JS-based actions) and curl
-        run: apt-get update && apt-get install -y --no-install-recommends nodejs curl
+      - name: Install Node.js (required by JS-based actions), curl and make
+        run: apt-get update && apt-get install -y --no-install-recommends nodejs curl make
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -195,23 +195,27 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Run tests with coverage
-        # -coverpkg=./... so integration tests (which live in the root package but
-        # exercise the internal/* packages) count toward those packages' coverage.
-        # No -race: it doesn't change the coverage number and keeps the run fast.
-        run: go test -tags integration -coverpkg=./... -coverprofile=coverage.out -timeout 15m ./...
+      - name: Run coverage (replicates `make coverage`)
+        # Delegate to the Makefile target so CI and local `make coverage` compute
+        # coverage identically: go test -race -tags integration over the package
+        # list excluding the example, internal/testutil, and gen packages, the
+        # profile filtered the same way, then `go tool cover -func`. tee keeps the
+        # output for the threshold step.
+        run: make coverage 2>&1 | tee coverage.log
 
       - name: Report coverage and enforce threshold
         env:
           # ── Adjust the minimum coverage gate here ──
-          MIN_COVERAGE: "83.0"
+          MIN_COVERAGE: "84.0"
           TOKEN: ${{ github.token }}
           # Report against the PR head on pull_request so the status shows on the
           # PR; fall back to the pushed commit otherwise.
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          pct=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          # The total line is the last line of `go tool cover -func` that
+          # `make coverage` prints; take the percentage from its final column.
+          pct=$(awk '/^total:/ {gsub(/%/,"",$NF); print $NF}' coverage.log)
           echo "Total coverage: ${pct}% (minimum ${MIN_COVERAGE}%)"
           echo "### Coverage: ${pct}% (minimum ${MIN_COVERAGE}%)" >> "$GITHUB_STEP_SUMMARY"
 
