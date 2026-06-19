@@ -1,3 +1,10 @@
+## [1.13.1](https://github.com/wu/keyop-messenger/compare/v1.13.0...v1.13.1) (2026-06-19)
+
+### Bug Fixes
+
+* **federation:** raise gRPC frame limit and skip undeliverable records ([4394443](https://github.com/wu/keyop-messenger/commit/4394443ceb4f85606a9ea808c8cbeae2455e0d3b))
+* **messenger:** release audit writer when New fails after start ([224e077](https://github.com/wu/keyop-messenger/commit/224e077ce3ad59f749fc4cf5b7c0cb3f9a9594a8))
+
 ## [1.13.0](https://github.com/wu/keyop-messenger/compare/v1.12.0...v1.13.0) (2026-06-17)
 
 ### Features
