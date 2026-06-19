@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -349,4 +350,35 @@ func TestInstanceName_FederationRequiresTLS(t *testing.T) {
 	_, err := New(cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "federation requires TLS")
+}
+
+// TestNew_ErrorPathDoesNotLeakAuditWriter verifies that when construction fails
+// after the audit writer has been started, New closes it rather than leaking its
+// goroutine. A leaked writer keeps creating files under the data dir and races
+// t.TempDir() cleanup (the "directory not empty" failure seen on arm64). We
+// assert the goroutine count returns to its pre-New baseline.
+func TestNew_ErrorPathDoesNotLeakAuditWriter(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	cfg.Hub.Enabled = true
+	cfg.Hub.ListenAddr = "127.0.0.1:0" // federation enabled but no TLS -> fails after audit writer starts
+
+	before := runtime.NumGoroutine()
+
+	_, err := New(cfg)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "federation requires TLS")
+
+	// With the audit writer closed, no goroutine is left behind. Poll in this
+	// goroutine (testify's Eventually would spawn its own goroutine and skew the
+	// count); without the fix the writer blocks on its channel forever and the
+	// count stays above baseline.
+	after := runtime.NumGoroutine()
+	for i := 0; i < 200 && after > before; i++ {
+		time.Sleep(5 * time.Millisecond)
+		runtime.GC()
+		after = runtime.NumGoroutine()
+	}
+	assert.LessOrEqual(t, after, before,
+		"audit writer goroutine leaked after New returned an error")
 }

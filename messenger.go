@@ -233,6 +233,27 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		return nil, fmt.Errorf("create audit writer: %w", err)
 	}
 
+	// If construction fails after this point, roll back the resources we have
+	// already started. Otherwise the audit writer's background goroutine (and any
+	// hub/client goroutines) leak and keep writing into the data dir, which on a
+	// caller using t.TempDir() races RemoveAll and fails the test.
+	var m *Messenger
+	success := false
+	defer func() {
+		if success {
+			return
+		}
+		if m != nil {
+			if m.hub != nil {
+				_ = m.hub.Close()
+			}
+			for _, c := range m.clients {
+				c.Close()
+			}
+		}
+		_ = auditL.Close()
+	}()
+
 	// Build TLS config and check certificate expiry when certs are configured.
 	var tlsCfg *tls.Config
 	if cfg.TLS.Cert != "" {
@@ -266,7 +287,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		}
 	}
 
-	m := &Messenger{
+	m = &Messenger{
 		cfg:      cfg,
 		name:     name,
 		log:      log,
@@ -325,6 +346,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				cfg.Storage.DataDir,
 			)
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
+				c.Close()
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)
 			}
 			m.clients = append(m.clients, c)
@@ -347,6 +369,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		}
 	}()
 
+	success = true
 	return m, nil
 }
 
