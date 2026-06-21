@@ -273,6 +273,69 @@ func TestSubscriber_DeadLetter(t *testing.T) {
 	assert.Equal(t, "com.keyop.messenger.DeadLetterPayload", dl.PayloadType)
 }
 
+func TestSubscriber_RetryLater_PausesAndResumes(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "metrics")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	// Use a LocalNotifier so the test deterministically drives re-attempts: an
+	// ErrRetryLater halts the batch, and a fresh notification re-reads the same
+	// message from the unadvanced offset.
+	notifier := NewLocalNotifier()
+	dlWriter := &testutil.FakeChannelWriter{}
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 3, dlWriter, &testutil.FakeLogger{}, 0)
+	require.NoError(t, err)
+	sub.retryDelay = func(int) time.Duration { return 0 }
+
+	writeTestEnvelope(t, channelDir, makeEnv(t, "metrics", map[string]any{"n": 1}))
+	streamEnd, err := ChannelStreamEnd(channelDir)
+	require.NoError(t, err)
+
+	const failTimes = 3
+	var calls atomic.Int64
+	called := make(chan struct{}, 32)
+	sub.Start(notifier.C(), func(_ *envelope.Envelope, _ any) error {
+		n := calls.Add(1)
+		called <- struct{}{}
+		if n <= failTimes {
+			// Transient downstream failure (wrapped, to prove errors.Is works).
+			return fmt.Errorf("downstream unavailable: %w", ErrRetryLater)
+		}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// First attempt comes from Start's initial processAvailable. At this point
+	// exactly one ErrRetryLater has been returned, so the offset must be parked.
+	select {
+	case <-called:
+	case <-time.After(testTimeout):
+		t.Fatal("handler not called on initial processing")
+	}
+	assert.Zero(t, sub.Offset(), "offset must not advance on ErrRetryLater")
+	assert.Empty(t, dlWriter.Written(), "ErrRetryLater must not dead-letter")
+
+	// Drive the remaining failing attempts and the eventual success.
+	for i := 1; i <= failTimes; i++ {
+		notifier.Notify()
+		select {
+		case <-called:
+		case <-time.After(testTimeout):
+			t.Fatalf("handler not called for attempt %d", i+1)
+		}
+		assert.Empty(t, dlWriter.Written(), "ErrRetryLater must never dead-letter")
+	}
+
+	// Once the handler stops signalling ErrRetryLater the offset advances.
+	require.Eventually(t, func() bool {
+		return sub.Offset() == streamEnd
+	}, testTimeout, 10*time.Millisecond, "offset should advance after the handler finally succeeds")
+
+	assert.Empty(t, dlWriter.Written(), "a recovered transient failure must never dead-letter")
+	assert.GreaterOrEqual(t, sub.Stats().RetryLaterPauses, int64(failTimes),
+		"each ErrRetryLater must be counted as a pause")
+}
+
 func TestSubscriber_PanicRecovery(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "orders")

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -16,6 +17,15 @@ import (
 
 	"github.com/wu/keyop-messenger/internal/envelope"
 )
+
+// ErrRetryLater signals a transient downstream failure. When a HandlerFunc
+// returns it (directly or wrapped), the subscriber does NOT advance its offset
+// and does NOT dead-letter the message; it stops processing the current batch
+// and re-attempts from the same offset on the next notify or poll. The durable
+// channel log buffers the backlog, and offset-aware compaction will not delete
+// data behind the unadvanced offset. Unlike an ordinary handler error, it is
+// not counted against the retry budget.
+var ErrRetryLater = errors.New("transient downstream failure; retry later")
 
 // scanCompleteLines is like bufio.ScanLines but never returns a partial line
 // at EOF. ScanLines's behaviour of emitting an unterminated final token is a
@@ -107,6 +117,7 @@ type Subscriber struct {
 	dispatched       atomic.Int64
 	unmarshalSkipped atomic.Int64
 	decodeSkipped    atomic.Int64
+	retryLaterPauses atomic.Int64
 }
 
 // SubscriberStats returns a snapshot of the diagnostic counters. Intended for
@@ -118,6 +129,7 @@ type SubscriberStats struct {
 	Dispatched       int64
 	UnmarshalSkipped int64
 	DecodeSkipped    int64
+	RetryLaterPauses int64
 	CurrentOffset    int64
 	FlushedOffset    int64
 }
@@ -134,6 +146,7 @@ func (s *Subscriber) Stats() SubscriberStats {
 		Dispatched:       s.dispatched.Load(),
 		UnmarshalSkipped: s.unmarshalSkipped.Load(),
 		DecodeSkipped:    s.decodeSkipped.Load(),
+		RetryLaterPauses: s.retryLaterPauses.Load(),
 		CurrentOffset:    off,
 		FlushedOffset:    s.flushedOffset.Load(),
 	}
@@ -343,7 +356,13 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 			}
 
 			s.dispatched.Add(1)
-			s.dispatch(handler, &env, payload, nextOffset)
+			if s.dispatch(handler, &env, payload, nextOffset) {
+				// Transient downstream failure (ErrRetryLater): leave the offset
+				// unadvanced and halt the batch. The next notify/poll re-reads
+				// from the same offset; the durable log buffers the backlog.
+				_ = f.Close()
+				return
+			}
 			offset = nextOffset
 		}
 		if err := scanner.Err(); err != nil {
@@ -363,7 +382,12 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 // dispatch calls handler with up to maxRetries+1 total attempts with
 // exponential backoff. If Stop is called during a backoff the function returns
 // immediately without advancing the offset (message re-delivered on restart).
-func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, payload any, nextOffset int64) {
+//
+// It returns retryLater=true when the handler signalled a transient downstream
+// failure via ErrRetryLater. In that case the message is neither retried to
+// exhaustion nor dead-lettered, and the offset is left unadvanced, so the caller
+// halts the batch and re-attempts from the same position on the next wake-up.
+func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, payload any, nextOffset int64) (retryLater bool) {
 	var lastErr error
 	for attempt := 0; attempt < s.maxRetries+1; attempt++ {
 		if attempt > 0 {
@@ -372,13 +396,20 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 				select {
 				case <-time.After(delay):
 				case <-s.stopCh:
-					return
+					return false
 				}
 			}
 		}
-		if lastErr = s.callHandler(handler, env, payload); lastErr == nil {
+		lastErr = s.callHandler(handler, env, payload)
+		if lastErr == nil {
 			s.advanceOffset(nextOffset)
-			return
+			return false
+		}
+		if errors.Is(lastErr, ErrRetryLater) {
+			// Transient failure: pause without dead-lettering or advancing, and
+			// do not count it against the retry budget.
+			s.retryLaterPauses.Add(1)
+			return true
 		}
 	}
 
@@ -389,6 +420,7 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 		s.sendToDeadLetter(env, lastErr)
 	}
 	s.advanceOffset(nextOffset)
+	return false
 }
 
 // callHandler invokes the handler and converts any panic into an error.

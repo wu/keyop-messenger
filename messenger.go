@@ -37,6 +37,14 @@ var (
 	// ErrMessengerClosed is returned when an operation is attempted on a
 	// Messenger after Close has been called.
 	ErrMessengerClosed = errors.New("messenger is closed")
+
+	// ErrRetryLater signals a transient failure when returned (or wrapped) by a
+	// HandlerFunc: the message is not dead-lettered and the offset is not
+	// advanced, so the durable channel log buffers it until a later delivery
+	// attempt succeeds. The message is re-attempted from the same offset on the
+	// next notify/poll. Use it for downstream-unavailable conditions (e.g. a sink
+	// server is down) where dropping the message is worse than pausing delivery.
+	ErrRetryLater = storage.ErrRetryLater
 )
 
 // ----- Channel name validation -----------------------------------------------
