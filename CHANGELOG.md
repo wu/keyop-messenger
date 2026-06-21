@@ -1,3 +1,9 @@
+## [1.14.0](https://github.com/wu/keyop-messenger/compare/v1.13.1...v1.14.0) (2026-06-21)
+
+### Features
+
+* add ErrRetryLater for transient handler failures ([8ece79b](https://github.com/wu/keyop-messenger/commit/8ece79b1b519fdcf8dc82a08ac92736c9365cddc))
+
 ## [1.13.1](https://github.com/wu/keyop-messenger/compare/v1.13.0...v1.13.1) (2026-06-19)
 
 ### Bug Fixes
