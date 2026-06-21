@@ -65,10 +65,6 @@ type StorageConfig struct {
 	// > 0 fsyncs periodically at this interval in milliseconds (batched, faster).
 	SyncIntervalMS int `yaml:"sync_interval_ms"`
 
-	// MaxSubscriberLagMB triggers a warning log when a subscriber's unread backlog
-	// exceeds this many megabytes. Default: 512.
-	MaxSubscriberLagMB int `yaml:"max_subscriber_lag_mb"`
-
 	// CompactionThresholdMB triggers file rotation when the consumed (already-read-by-all-
 	// subscribers) portion of a channel file exceeds this size. Default: 256.
 	CompactionThresholdMB int `yaml:"compaction_threshold_mb"`
@@ -265,9 +261,6 @@ func LoadConfig(path string) (*Config, error) {
 // It is called automatically by [LoadConfig]. When constructing a Config
 // programmatically, call ApplyDefaults before passing it to [New].
 func (c *Config) ApplyDefaults() {
-	if c.Storage.MaxSubscriberLagMB == 0 {
-		c.Storage.MaxSubscriberLagMB = 512
-	}
 	if c.Storage.CompactionThresholdMB == 0 {
 		c.Storage.CompactionThresholdMB = 256
 	}

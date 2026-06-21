@@ -468,12 +468,17 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 // Subscribe registers handler for all new messages on channel. Delivery is
 // at-least-once: the handler may be called again for the same message after a
 // restart. The goroutine runs until ctx is cancelled or Unsubscribe is called.
-func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string, handler HandlerFunc) error {
+func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string, handler HandlerFunc, opts ...SubscribeOption) error {
 	if err := ValidateChannelName(channel); err != nil {
 		return err
 	}
 	if m.isClosed() {
 		return ErrMessengerClosed
+	}
+
+	var so subscribeOptions
+	for _, opt := range opts {
+		opt(&so)
 	}
 
 	cs, err := m.getOrCreateChannelState(channel)
@@ -504,6 +509,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		cancel()
 		return fmt.Errorf("subscribe %q/%q: %w", channel, subscriberID, err)
 	}
+	sub.SetMaxAge(so.maxAge)
 
 	entry := &subscriberEntry{sub: sub, notifier: notifier, cancel: cancel}
 
@@ -738,7 +744,6 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 		subs: make(map[string]*subscriberEntry),
 		compactor: storage.NewCompactor(
 			m.offsetDir(channel),
-			int64(m.cfg.Storage.MaxSubscriberLagMB)*1024*1024,
 			int64(m.cfg.Storage.MaxChannelSizeMB)*1024*1024,
 			m.cfg.Storage.RetentionAge.Duration,
 			m.log,

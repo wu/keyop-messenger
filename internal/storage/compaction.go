@@ -23,7 +23,6 @@ type Compactor struct {
 	mu           sync.Mutex
 	offsetDir    string
 	subscribers  map[string]struct{}
-	maxLagBytes  int64
 	maxSizeBytes int64         // 0 = no size cap
 	retention    time.Duration // 0 = no age cap
 	now          func() time.Time
@@ -32,21 +31,19 @@ type Compactor struct {
 
 // NewCompactor returns a Compactor that reads subscriber offsets from offsetDir.
 //
-//   - maxLagBytes: per-subscriber lag above which a warning is logged; 0 disables.
 //   - maxSizeBytes: hard cap on a channel's retained on-disk bytes; when exceeded,
 //     oldest sealed segments are force-deleted regardless of consumption. 0 disables.
 //   - retention: max age of retained messages; sealed segments older than this are
 //     force-deleted regardless of consumption. 0 disables.
 //
 // log may be nil.
-func NewCompactor(offsetDir string, maxLagBytes, maxSizeBytes int64, retention time.Duration, log logger) *Compactor {
+func NewCompactor(offsetDir string, maxSizeBytes int64, retention time.Duration, log logger) *Compactor {
 	if log == nil {
 		log = nopLogger{}
 	}
 	return &Compactor{
 		offsetDir:    offsetDir,
 		subscribers:  make(map[string]struct{}),
-		maxLagBytes:  maxLagBytes,
 		maxSizeBytes: maxSizeBytes,
 		retention:    retention,
 		now:          time.Now,
@@ -145,9 +142,6 @@ func (c *Compactor) fedMinOffset() (int64, error) {
 // segment is never deleted. No writer pause is needed — the writer only ever
 // appends to the active segment, and Unix allows open-fd reads of deleted files
 // to complete normally.
-//
-// Lag warnings are logged for any subscriber whose unconsumed bytes exceed
-// maxLagBytes (if configured).
 func (c *Compactor) MaybeCompact(channelDir string) error {
 	segs, err := listSegments(channelDir)
 	if err != nil {
@@ -165,14 +159,12 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 	}
 	c.mu.Unlock()
 
-	offsets := make(map[string]int64, len(ids))
 	var minOffset int64 = math.MaxInt64
 	for _, id := range ids {
 		off, err := ReadOffset(filepath.Join(c.offsetDir, id+".offset"))
 		if err != nil {
 			return fmt.Errorf("read offset for subscriber %q: %w", id, err)
 		}
-		offsets[id] = off
 		if off < minOffset {
 			minOffset = off
 		}
@@ -183,18 +175,6 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 	// prevent compacting data that federation peers have not yet consumed.
 	if fedMin, err := c.fedMinOffset(); err == nil && fedMin < minOffset {
 		minOffset = fedMin
-	}
-
-	// Lag warnings: compute total stream size from last segment's end.
-	if c.maxLagBytes > 0 {
-		active := segs[len(segs)-1]
-		streamEnd := active.startOffset + active.size
-		for id, off := range offsets {
-			if lag := streamEnd - off; lag > c.maxLagBytes {
-				c.log.Warn("subscriber is lagging behind channel file",
-					"subscriber", id, "lag_bytes", lag, "max_lag_bytes", c.maxLagBytes)
-			}
-		}
 	}
 
 	// Nothing to delete if there is only the active segment.

@@ -168,6 +168,8 @@ Each subscriber has a durable offset file recording the **global byte offset** o
 
 A new subscriber starts at the global offset of the stream end (last segment's start offset + last segment's size), skipping pre-existing history. A restarting subscriber resumes from the persisted offset.
 
+**Startup freshness filtering:** A subscription may set a maximum message age (`WithMaxAge`). On its first run such a subscriber fast-forwards its offset past any buffered messages older than the cutoff, so it begins delivery near real time instead of replaying a stale backlog after a restart or reconnect. The fast-forward skips whole sealed segments whose last write predates the cutoff without reading them — a record's timestamp is at most its write time, so an old-mtime sealed segment cannot contain a fresh record — then scans only the single boundary segment by envelope timestamp to land on the first fresh record. Filtering happens **only at startup**: once delivery begins no message is ever skipped for age, so a subscriber that falls behind at runtime still receives every message (preserving state-dependent processing). New subscribers, which already start at the stream end, are unaffected; this matters for resuming subscribers. Bytes skipped are reported via the `StartupSkippedBytes` subscriber stat.
+
 To find the right segment given a global offset: iterate the sorted segment list and find the segment where `seg.startOffset <= globalOffset < nextSeg.startOffset`. Seek within the file to `globalOffset - seg.startOffset`.
 
 If the process crashes after processing but before writing the offset, the message is redelivered on restart. Subscriber handlers must be idempotent.
@@ -197,6 +199,8 @@ The dead-letter envelope payload:
 
 Dead-letter channels are regular channels. They can be subscribed to for monitoring or reprocessing. Dead-letter channels are not themselves subject to dead-lettering (a failing dead-letter handler is logged and the offset advanced).
 
+**Transient failures (`ErrRetryLater`):** A handler can return `messenger.ErrRetryLater` (directly or wrapped) to signal that a failure is transient — e.g. a downstream sink is temporarily unavailable. Unlike an ordinary error, this does **not** count against `max_retries` and does **not** dead-letter the message. The subscriber stops processing the current batch, leaves the offset unadvanced, and re-attempts the same message on the next change notification or poll. The durable channel log buffers the backlog (subject to retention — see §5.7), so messages queue during an outage and delivery resumes from the same position once the downstream recovers. It is the inverse of dead-lettering: use it when dropping a message is worse than pausing delivery. Pauses are surfaced via the `RetryLaterPauses` subscriber stat.
+
 ### 5.6 File Change Notification
 
 Subscribers use `fsnotify` (inotify on Linux, kqueue on macOS) to receive push notification when new data is appended to a channel file. On notification, the subscriber reads from its current offset to EOF in a single buffered read.
@@ -215,11 +219,18 @@ Multiple notifications from overlapping sources (fsnotify and polling) are coale
 
 ### 5.7 File Rotation and Compaction
 
-**Segment rolling:** The writer rolls to a new segment when the current segment's size would exceed `max_segment_bytes` (default: 64 MB). Rolling is O(1): the current segment is synced and closed, a new file is created with a name encoding its start offset, and subsequent writes land in the new file. There is no pause, copy, or coordination with subscribers.
+**Segment rolling:** The writer rolls to a new segment when the current segment's size would exceed `compaction_threshold_mb` (default: 256 MB). Rolling is O(1): the current segment is synced and closed, a new file is created with a name encoding its start offset, and subsequent writes land in the new file. There is no pause, copy, or coordination with subscribers.
 
 **Compaction:** The compactor periodically scans the channel directory and deletes any sealed segment (all segments except the active one) whose entire content lies before the minimum subscriber offset — i.e., every registered subscriber has advanced past the segment's last byte. Deletion is a single `unlink` syscall. No writer pause is needed: the writer holds the active segment open, and Unix permits deletion of sealed segments even while subscribers hold open file descriptors to them (the inode persists until all readers close their fds).
 
-A subscriber that falls too far behind (configurable `max_subscriber_lag_bytes`) is logged as a warning. No automatic action is taken.
+**Retention caps (force-eviction):** Consumption-based compaction alone lets a single parked or lagging subscriber pin a channel's log into unbounded growth, eventually filling the disk. Two optional bounds cap usage by force-deleting the oldest sealed segments **even if a subscriber has not consumed them**:
+
+- `max_channel_size_mb` — a hard cap on a channel's total retained on-disk bytes.
+- `retention` — a maximum message age. A sealed segment's file mtime is used as the age of its newest record (a record's timestamp is at most its write time). Accepts a day unit, e.g. `7d` or `168h`.
+
+Eviction fires when **either** bound is exceeded; both default to `0` (disabled), preserving pure consumption-based behavior. Sealed segments are evaluated oldest-first and deleted while consumed, over the size cap, or past the age bound; the active segment is never deleted, so the effective floor is one segment (keep `compaction_threshold_mb` small to keep that floor low). Federation peer offsets participate in the minimum-offset boundary like any subscriber, so a lagging peer's unconsumed data is subject to the same force-eviction.
+
+**Subscriber fast-forward on undercut:** When force-eviction drops data a subscriber had not yet read, that subscriber's persisted offset falls below the earliest surviving segment's start. On its next read the subscriber detects this, fast-forwards to that start (skipping the dropped messages), logs a warning, and continues — preventing a negative-seek wedge. The event is surfaced via the `CompactionDrops` subscriber stat.
 
 ### 5.8 Subscriber Registration
 
@@ -601,8 +612,12 @@ storage:
   data_dir: "/var/keyop"   # Required. Root directory for channel files, offset files, audit log.
   sync_interval_ms: 0      # 0 = fsync after every write (default, strictest durability, slowest);
                            # > 0 = fsync periodically at interval in milliseconds (batched, faster).
-  max_subscriber_lag_mb: 512   # Warn when a subscriber is this far behind
-  max_segment_bytes: 67108864  # 64 MiB; writer rolls to new segment when active segment reaches this size
+  offset_flush_interval_ms: 0  # 0 = flush subscriber offset after every message (strictest at-least-once);
+                           # > 0 = batch offset flushes (faster; may redeliver up to this window on crash).
+  compaction_threshold_mb: 256 # Writer rolls to a new segment when the active segment reaches this size.
+  max_channel_size_mb: 0   # 0 = unlimited; > 0 force-evicts oldest segments to cap a channel's retained bytes.
+  retention: 0             # 0 = no age limit; e.g. "7d" / "168h" force-evicts segments older than this.
+                           # max_channel_size_mb and retention drop the oldest data even if unconsumed.
 
 subscribers:
   max_retries: 5           # Retry count before routing a message to the dead-letter channel.

@@ -144,7 +144,6 @@ func TestApplyDefaults(t *testing.T) {
 		c.ApplyDefaults()
 
 		assert.Equal(t, 0, c.Storage.SyncIntervalMS)
-		assert.Equal(t, 512, c.Storage.MaxSubscriberLagMB)
 		assert.Equal(t, 256, c.Storage.CompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 5, *c.Subscribers.MaxRetries)
@@ -163,7 +162,6 @@ func TestApplyDefaults(t *testing.T) {
 		c := Config{
 			Storage: StorageConfig{
 				SyncIntervalMS:        999,
-				MaxSubscriberLagMB:    1024,
 				CompactionThresholdMB: 512,
 			},
 			Subscribers: SubscribersConfig{MaxRetries: intPtr(10)},
@@ -181,7 +179,6 @@ func TestApplyDefaults(t *testing.T) {
 		c.ApplyDefaults()
 
 		assert.Equal(t, 999, c.Storage.SyncIntervalMS)
-		assert.Equal(t, 1024, c.Storage.MaxSubscriberLagMB)
 		assert.Equal(t, 512, c.Storage.CompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 10, *c.Subscribers.MaxRetries)
@@ -212,7 +209,8 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 storage:
   data_dir: /var/keyop
   sync_interval_ms: 500
-  max_subscriber_lag_mb: 1024
+  max_channel_size_mb: 2048
+  retention: 7d
   compaction_threshold_mb: 512
 subscribers:
   max_retries: 10
@@ -256,7 +254,8 @@ audit:
 
 	assert.Equal(t, "/var/keyop", cfg.Storage.DataDir)
 	assert.Equal(t, 500, cfg.Storage.SyncIntervalMS)
-	assert.Equal(t, 1024, cfg.Storage.MaxSubscriberLagMB)
+	assert.Equal(t, 2048, cfg.Storage.MaxChannelSizeMB)
+	assert.Equal(t, 7*24*time.Hour, cfg.Storage.RetentionAge.Duration)
 	assert.Equal(t, 512, cfg.Storage.CompactionThresholdMB)
 	require.NotNil(t, cfg.Subscribers.MaxRetries)
 	assert.Equal(t, 10, *cfg.Subscribers.MaxRetries)

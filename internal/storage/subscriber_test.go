@@ -47,8 +47,8 @@ func activeSegmentPath(t *testing.T, channelDir string) string {
 }
 
 // writeTestEnvelope marshals env and appends it as a JSONL line to the active
-// segment in channelDir.
-func writeTestEnvelope(t *testing.T, channelDir string, env envelope.Envelope) {
+// segment in channelDir. It returns the number of bytes written (line + '\n').
+func writeTestEnvelope(t *testing.T, channelDir string, env envelope.Envelope) int64 {
 	t.Helper()
 	segPath := activeSegmentPath(t, channelDir)
 	data, err := envelope.Marshal(env)
@@ -56,8 +56,9 @@ func writeTestEnvelope(t *testing.T, channelDir string, env envelope.Envelope) {
 	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	require.NoError(t, err)
 	defer func() { _ = f.Close() }()
-	_, err = fmt.Fprintf(f, "%s\n", data)
+	n, err := fmt.Fprintf(f, "%s\n", data)
 	require.NoError(t, err)
+	return int64(n)
 }
 
 // makeEnv creates a test envelope for the given channel and payload.
@@ -65,6 +66,14 @@ func makeEnv(t *testing.T, channel string, payload any) envelope.Envelope {
 	t.Helper()
 	env, err := envelope.NewEnvelope(channel, "test-host", "com.test.Msg", payload)
 	require.NoError(t, err)
+	return env
+}
+
+// makeEnvAt is makeEnv with an explicit publish timestamp.
+func makeEnvAt(t *testing.T, channel string, ts time.Time, payload any) envelope.Envelope {
+	t.Helper()
+	env := makeEnv(t, channel, payload)
+	env.Ts = ts.UTC()
 	return env
 }
 
@@ -381,6 +390,70 @@ func TestSubscriber_FastForwardsPastCompactedData(t *testing.T) {
 
 	assert.Equal(t, int64(1), sub.Stats().CompactionDrops,
 		"exactly one fast-forward over compacted data should be recorded")
+}
+
+func TestSubscriber_StartupMaxAge_SkipsStaleBacklog(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "metrics")
+	offsetDir := filepath.Join(dir, "offsets")
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+
+	// Persist an offset of 0 so the subscriber "resumes" and the whole backlog is
+	// eligible for the startup max-age scan.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "s.offset"), 0))
+
+	now := time.Now()
+	stale := now.Add(-2 * time.Hour)
+	fresh := now.Add(-10 * time.Minute)
+
+	// Three stale messages followed by two fresh ones, in publish order.
+	var staleBytes int64
+	for i := 0; i < 3; i++ {
+		staleBytes += writeTestEnvelope(t, channelDir, makeEnvAt(t, "metrics", stale, map[string]any{"n": i}))
+	}
+	for i := 0; i < 2; i++ {
+		writeTestEnvelope(t, channelDir, makeEnvAt(t, "metrics", fresh, map[string]any{"n": 100 + i}))
+	}
+	streamEnd, err := ChannelStreamEnd(channelDir)
+	require.NoError(t, err)
+
+	watcher := &testutil.FakeChannelWatcher{}
+	notifyC, err := watcher.Watch(channelDir)
+	require.NoError(t, err)
+	dlWriter := &testutil.FakeChannelWriter{}
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, &testutil.FakeLogger{}, 0)
+	require.NoError(t, err)
+	sub.SetMaxAge(time.Hour) // skip anything older than 1h on startup
+	sub.retryDelay = func(int) time.Duration { return 0 }
+
+	var delivered atomic.Int64
+	done := make(chan struct{})
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		if delivered.Add(1) == 2 {
+			close(done)
+		}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// Only the two fresh messages should be delivered; the three stale ones are
+	// skipped at startup.
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatalf("expected 2 fresh deliveries, got %d", delivered.Load())
+	}
+
+	require.Eventually(t, func() bool {
+		return sub.Offset() == streamEnd
+	}, testTimeout, 10*time.Millisecond, "offset should reach stream end after delivering the fresh tail")
+
+	assert.Equal(t, staleBytes, sub.Stats().StartupSkippedBytes,
+		"the stale backlog bytes should be reported as skipped")
+
+	// No further deliveries: the stale messages must never arrive mid-stream.
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int64(2), delivered.Load())
 }
 
 func TestSubscriber_PanicRecovery(t *testing.T) {

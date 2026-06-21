@@ -40,7 +40,7 @@ func newTestCompactor(t *testing.T) (*Compactor, string, string) {
 	channelDir := filepath.Join(base, "orders")
 	offsetDir := filepath.Join(base, "offsets")
 	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
-	return NewCompactor(offsetDir, 0, 0, 0, &testutil.FakeLogger{}), channelDir, offsetDir
+	return NewCompactor(offsetDir, 0, 0, &testutil.FakeLogger{}), channelDir, offsetDir
 }
 
 // TestCompactor_NoSegmentsToDelete verifies MaybeCompact is a no-op when only
@@ -160,27 +160,6 @@ func TestCompactor_DeregisterRemovesOffsetFile(t *testing.T) {
 	assert.Equal(t, int64(0), minOff)
 }
 
-// TestCompactor_LagWarning verifies that a subscriber lagging beyond the
-// configured threshold causes a warning to be logged.
-func TestCompactor_LagWarning(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
-	log := &testutil.FakeLogger{}
-
-	const maxLag = int64(100)
-	c := NewCompactor(offsetDir, maxLag, 0, 0, log)
-
-	size := writeSegment(t, channelDir, 0, 20) // > 100 bytes
-	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
-	c.RegisterSubscriber("sub1")
-	require.Greater(t, size, maxLag)
-
-	require.NoError(t, c.MaybeCompact(channelDir))
-	assert.True(t, log.HasWarn("subscriber is lagging"), "lag warning must be logged")
-}
-
 // TestCompactor_NoPauseNeeded verifies that concurrent writes to the active
 // segment and compaction of sealed segments do not interfere — the writer keeps
 // appending to the active segment while old ones are deleted.
@@ -208,7 +187,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	// Mark subscriber as having consumed all sealed segments.
 	active := segs[len(segs)-1]
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), active.startOffset))
-	c := NewCompactor(offsetDir, 0, 0, 0, nil)
+	c := NewCompactor(offsetDir, 0, 0, nil)
 	c.RegisterSubscriber("sub1")
 
 	// Compact while the writer is still running.
@@ -407,7 +386,7 @@ func TestMaybeCompact_OffsetDirNotExist(t *testing.T) {
 	channelDir := filepath.Join(base, "orders")
 	// offsetDir intentionally absent — covers the os.IsNotExist branch in fedMinOffset.
 	offsetDir := filepath.Join(base, "nonexistent-offsets")
-	c := NewCompactor(offsetDir, 0, 0, 0, nil)
+	c := NewCompactor(offsetDir, 0, 0, nil)
 
 	seg0Size := writeSegment(t, channelDir, 0, 5)
 	seg1Size := writeSegment(t, channelDir, seg0Size, 5)
@@ -461,7 +440,7 @@ func TestCompactor_SizeCapForceEvictsUnconsumed(t *testing.T) {
 
 	// Cap retains roughly two segments' worth of bytes.
 	maxSize := 2 * s0
-	c := NewCompactor(offsetDir, 0, maxSize, 0, &testutil.FakeLogger{})
+	c := NewCompactor(offsetDir, maxSize, 0, &testutil.FakeLogger{})
 	c.RegisterSubscriber("sub1")
 
 	require.NoError(t, c.MaybeCompact(channelDir))
@@ -500,7 +479,7 @@ func TestCompactor_RetentionAgeForceEvicts(t *testing.T) {
 	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(0)), old, old))
 	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(s0)), old, old))
 
-	c := NewCompactor(offsetDir, 0, 0, time.Hour, &testutil.FakeLogger{})
+	c := NewCompactor(offsetDir, 0, time.Hour, &testutil.FakeLogger{})
 	c.now = func() time.Time { return now }
 	c.RegisterSubscriber("sub1")
 

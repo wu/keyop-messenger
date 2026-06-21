@@ -119,21 +119,32 @@ type Subscriber struct {
 	decodeSkipped    atomic.Int64
 	retryLaterPauses atomic.Int64
 	compactionDrops  atomic.Int64
+	startupSkipped   atomic.Int64
+
+	// maxAge, when > 0, enables one-time startup freshness filtering: on first
+	// start the subscriber fast-forwards its offset past buffered messages older
+	// than maxAge. Set via SetMaxAge before Start; read only from the subscriber
+	// goroutine thereafter.
+	maxAge time.Duration
 }
+
+// maxLineSize bounds a single scanned record (10 MiB).
+const maxLineSize = 10 * 1024 * 1024
 
 // SubscriberStats returns a snapshot of the diagnostic counters. Intended for
 // tests and observability hooks investigating delivery anomalies.
 type SubscriberStats struct {
-	WakesByNotify    int64
-	WakesByPoll      int64
-	ProcessCalls     int64
-	Dispatched       int64
-	UnmarshalSkipped int64
-	DecodeSkipped    int64
-	RetryLaterPauses int64
-	CompactionDrops  int64
-	CurrentOffset    int64
-	FlushedOffset    int64
+	WakesByNotify       int64
+	WakesByPoll         int64
+	ProcessCalls        int64
+	Dispatched          int64
+	UnmarshalSkipped    int64
+	DecodeSkipped       int64
+	RetryLaterPauses    int64
+	CompactionDrops     int64
+	StartupSkippedBytes int64
+	CurrentOffset       int64
+	FlushedOffset       int64
 }
 
 // Stats returns a snapshot of the diagnostic counters.
@@ -142,16 +153,17 @@ func (s *Subscriber) Stats() SubscriberStats {
 	off := s.offset
 	s.mu.Unlock()
 	return SubscriberStats{
-		WakesByNotify:    s.wakesByNotify.Load(),
-		WakesByPoll:      s.wakesByPoll.Load(),
-		ProcessCalls:     s.processCalls.Load(),
-		Dispatched:       s.dispatched.Load(),
-		UnmarshalSkipped: s.unmarshalSkipped.Load(),
-		DecodeSkipped:    s.decodeSkipped.Load(),
-		RetryLaterPauses: s.retryLaterPauses.Load(),
-		CompactionDrops:  s.compactionDrops.Load(),
-		CurrentOffset:    off,
-		FlushedOffset:    s.flushedOffset.Load(),
+		WakesByNotify:       s.wakesByNotify.Load(),
+		WakesByPoll:         s.wakesByPoll.Load(),
+		ProcessCalls:        s.processCalls.Load(),
+		Dispatched:          s.dispatched.Load(),
+		UnmarshalSkipped:    s.unmarshalSkipped.Load(),
+		DecodeSkipped:       s.decodeSkipped.Load(),
+		RetryLaterPauses:    s.retryLaterPauses.Load(),
+		CompactionDrops:     s.compactionDrops.Load(),
+		StartupSkippedBytes: s.startupSkipped.Load(),
+		CurrentOffset:       off,
+		FlushedOffset:       s.flushedOffset.Load(),
 	}
 }
 
@@ -240,6 +252,13 @@ func (s *Subscriber) Stop() {
 	<-s.doneCh
 }
 
+// SetMaxAge enables one-time startup freshness filtering. When d > 0, the first
+// time the subscriber runs it fast-forwards its offset past any buffered messages
+// older than d, so delivery begins near real time instead of replaying a stale
+// backlog. Filtering happens only at startup — steady-state messages are never
+// skipped. Must be called before Start.
+func (s *Subscriber) SetMaxAge(d time.Duration) { s.maxAge = d }
+
 func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	defer close(s.doneCh)
 	// On clean shutdown flush any in-memory offset that hasn't reached disk yet,
@@ -255,6 +274,9 @@ func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	const pollInterval = time.Second
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+
+	// One-time startup freshness filtering, before any delivery.
+	s.applyStartupMaxAge()
 
 	s.processAvailable(handler)
 	for {
@@ -280,6 +302,108 @@ func (s *Subscriber) flushOnStop() {
 	if offset != s.flushedOffset.Load() {
 		s.flushToDisk(offset)
 	}
+}
+
+// applyStartupMaxAge fast-forwards the offset past messages older than s.maxAge.
+// It runs once, from the subscriber goroutine, before delivery begins. A failure
+// to scan is non-fatal: the subscriber falls back to delivering the full backlog.
+func (s *Subscriber) applyStartupMaxAge() {
+	if s.maxAge <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-s.maxAge)
+
+	s.mu.Lock()
+	offset := s.offset
+	s.mu.Unlock()
+
+	newOffset, err := fastForwardToCutoff(s.channelDir, offset, cutoff)
+	if err != nil {
+		s.log.Error("startup max-age fast-forward failed; delivering full backlog",
+			"subscriber", s.id, "err", err)
+		return
+	}
+	if newOffset > offset {
+		skipped := newOffset - offset
+		s.startupSkipped.Add(skipped)
+		s.log.Warn("startup max-age: skipping stale backlog",
+			"subscriber", s.id, "max_age", s.maxAge.String(),
+			"old_offset", offset, "new_offset", newOffset, "skipped_bytes", skipped)
+		s.advanceOffset(newOffset)
+	}
+}
+
+// fastForwardToCutoff returns the offset of the first record at or after cutoff,
+// scanning forward from startOffset. Whole sealed segments older than the cutoff
+// (by file mtime) are skipped without reading their contents; the boundary
+// segment is scanned line-by-line by envelope timestamp. If every record is older
+// than cutoff, the channel's current stream end is returned.
+func fastForwardToCutoff(channelDir string, startOffset int64, cutoff time.Time) (int64, error) {
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return startOffset, err
+	}
+	newOffset := startOffset
+	for i := 0; i < len(segs); i++ {
+		seg := segs[i]
+		segEnd := seg.startOffset + seg.size
+		if segEnd <= newOffset {
+			continue // entirely behind our current position
+		}
+		// A sealed segment whose last write predates the cutoff cannot contain a
+		// fresh record (a record's timestamp is <= its write time), so skip it
+		// wholesale without reading. The active segment (i == len-1) always gets
+		// the line-level scan since its mtime is current.
+		if i < len(segs)-1 && seg.modTime.Before(cutoff) {
+			newOffset = segEnd
+			continue
+		}
+		from := newOffset
+		if seg.startOffset > from {
+			from = seg.startOffset
+		}
+		found, pos, err := firstOffsetAtOrAfter(seg, from, cutoff)
+		if err != nil {
+			return startOffset, err
+		}
+		if found {
+			return pos, nil
+		}
+		newOffset = pos // whole segment was stale; check the next one
+	}
+	return newOffset, nil
+}
+
+// firstOffsetAtOrAfter scans seg from the global offset `from` and returns the
+// offset of the first record whose timestamp is at or after cutoff. If no such
+// record exists, it returns found=false and the offset of the segment's end.
+func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, int64, error) {
+	f, err := os.Open(seg.path)
+	if err != nil {
+		return false, 0, err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Seek(from-seg.startOffset, io.SeekStart); err != nil {
+		return false, 0, err
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+	scanner.Split(scanCompleteLines)
+
+	pos := from
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		env, uerr := envelope.Unmarshal(line)
+		if uerr == nil && !env.Ts.Before(cutoff) {
+			return true, pos, nil // first record at or after the cutoff
+		}
+		pos += int64(len(line)) + 1 // skip this stale (or unparseable) record
+	}
+	if err := scanner.Err(); err != nil {
+		return false, 0, err
+	}
+	return false, pos, nil
 }
 
 // processAvailable reads all complete lines across all segment files starting
@@ -324,8 +448,6 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 		s.flushedOffset.Store(offset)
 		s.lastFlush = time.Now()
 	}
-
-	const maxLineSize = 10 * 1024 * 1024 // 10 MiB per line
 
 	for i, seg := range segs {
 		segEnd := seg.startOffset + seg.size
