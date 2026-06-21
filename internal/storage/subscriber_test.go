@@ -336,6 +336,53 @@ func TestSubscriber_RetryLater_PausesAndResumes(t *testing.T) {
 		"each ErrRetryLater must be counted as a pause")
 }
 
+func TestSubscriber_FastForwardsPastCompactedData(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "metrics")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	// New subscriber on an empty channel starts at offset 0.
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 0)
+	require.Zero(t, sub.Offset())
+
+	// Two segments. The subscriber's offset (0) sits at the start of seg0.
+	s0 := writeSegment(t, channelDir, 0, 5)
+	_ = writeSegment(t, channelDir, s0, 3)
+
+	// Simulate retention compaction force-deleting the oldest segment before the
+	// subscriber has read it: the earliest surviving segment now starts at s0,
+	// which is past the subscriber's offset of 0.
+	require.NoError(t, os.Remove(filepath.Join(channelDir, segmentName(0))))
+
+	streamEnd, err := ChannelStreamEnd(channelDir)
+	require.NoError(t, err)
+
+	var delivered atomic.Int64
+	done := make(chan struct{})
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		if delivered.Add(1) == 3 {
+			close(done)
+		}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// The subscriber must fast-forward past the dropped segment and deliver the
+	// 3 surviving messages rather than wedging on a negative seek.
+	select {
+	case <-done:
+	case <-time.After(testTimeout):
+		t.Fatalf("expected 3 deliveries from the surviving segment, got %d", delivered.Load())
+	}
+
+	require.Eventually(t, func() bool {
+		return sub.Offset() == streamEnd
+	}, testTimeout, 10*time.Millisecond, "offset should advance to the stream end after fast-forward")
+
+	assert.Equal(t, int64(1), sub.Stats().CompactionDrops,
+		"exactly one fast-forward over compacted data should be recorded")
+}
+
 func TestSubscriber_PanicRecovery(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "orders")

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // logger is the minimum logging interface required by this package.
@@ -53,6 +54,9 @@ type segmentInfo struct {
 	path        string
 	startOffset int64
 	size        int64
+	// modTime is the file's last-modification time, used as a proxy for the
+	// timestamp of the newest record in the segment (age-based retention).
+	modTime time.Time
 }
 
 // ChannelStreamEnd returns the byte position at the end of the channel's write
@@ -100,6 +104,7 @@ func listSegments(channelDir string) ([]segmentInfo, error) {
 			path:        filepath.Join(channelDir, e.Name()),
 			startOffset: start,
 			size:        info.Size(),
+			modTime:     info.ModTime(),
 		})
 	}
 	return segs, nil

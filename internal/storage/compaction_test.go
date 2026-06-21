@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,7 +40,7 @@ func newTestCompactor(t *testing.T) (*Compactor, string, string) {
 	channelDir := filepath.Join(base, "orders")
 	offsetDir := filepath.Join(base, "offsets")
 	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
-	return NewCompactor(offsetDir, 0, &testutil.FakeLogger{}), channelDir, offsetDir
+	return NewCompactor(offsetDir, 0, 0, 0, &testutil.FakeLogger{}), channelDir, offsetDir
 }
 
 // TestCompactor_NoSegmentsToDelete verifies MaybeCompact is a no-op when only
@@ -169,7 +170,7 @@ func TestCompactor_LagWarning(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	const maxLag = int64(100)
-	c := NewCompactor(offsetDir, maxLag, log)
+	c := NewCompactor(offsetDir, maxLag, 0, 0, log)
 
 	size := writeSegment(t, channelDir, 0, 20) // > 100 bytes
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
@@ -207,7 +208,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	// Mark subscriber as having consumed all sealed segments.
 	active := segs[len(segs)-1]
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), active.startOffset))
-	c := NewCompactor(offsetDir, 0, nil)
+	c := NewCompactor(offsetDir, 0, 0, 0, nil)
 	c.RegisterSubscriber("sub1")
 
 	// Compact while the writer is still running.
@@ -406,7 +407,7 @@ func TestMaybeCompact_OffsetDirNotExist(t *testing.T) {
 	channelDir := filepath.Join(base, "orders")
 	// offsetDir intentionally absent — covers the os.IsNotExist branch in fedMinOffset.
 	offsetDir := filepath.Join(base, "nonexistent-offsets")
-	c := NewCompactor(offsetDir, 0, nil)
+	c := NewCompactor(offsetDir, 0, 0, 0, nil)
 
 	seg0Size := writeSegment(t, channelDir, 0, 5)
 	seg1Size := writeSegment(t, channelDir, seg0Size, 5)
@@ -438,4 +439,75 @@ func TestMaybeCompact_CorruptFedOffset(t *testing.T) {
 	segs, err := listSegments(channelDir)
 	require.NoError(t, err)
 	assert.Len(t, segs, 1, "sealed segment must be deleted based on subscriber offset despite corrupt fed file")
+}
+
+// TestCompactor_SizeCapForceEvictsUnconsumed verifies that the size cap deletes
+// the oldest sealed segments even when a subscriber has consumed nothing, so a
+// lagging subscriber cannot pin the channel log into unbounded growth.
+func TestCompactor_SizeCapForceEvictsUnconsumed(t *testing.T) {
+	base := t.TempDir()
+	channelDir := filepath.Join(base, "orders")
+	offsetDir := filepath.Join(base, "offsets")
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+
+	s0 := writeSegment(t, channelDir, 0, 10)
+	s1 := writeSegment(t, channelDir, s0, 10)
+	s2 := writeSegment(t, channelDir, s0+s1, 10)
+	_ = writeSegment(t, channelDir, s0+s1+s2, 5) // active segment
+
+	// Subscriber has consumed nothing; consumption-based compaction alone would
+	// delete no segments (minOffset == 0).
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
+
+	// Cap retains roughly two segments' worth of bytes.
+	maxSize := 2 * s0
+	c := NewCompactor(offsetDir, 0, maxSize, 0, &testutil.FakeLogger{})
+	c.RegisterSubscriber("sub1")
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	require.Len(t, segs, 2, "oldest unconsumed segments should be force-evicted to honor the size cap")
+	assert.Equal(t, s0+s1, segs[0].startOffset, "earliest surviving segment should start past the dropped data")
+
+	var total int64
+	for _, sg := range segs {
+		total += sg.size
+	}
+	assert.LessOrEqual(t, total, maxSize, "retained bytes should be within the size cap")
+}
+
+// TestCompactor_RetentionAgeForceEvicts verifies that sealed segments older than
+// the retention window are deleted even when unconsumed.
+func TestCompactor_RetentionAgeForceEvicts(t *testing.T) {
+	base := t.TempDir()
+	channelDir := filepath.Join(base, "orders")
+	offsetDir := filepath.Join(base, "offsets")
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+
+	s0 := writeSegment(t, channelDir, 0, 10)
+	s1 := writeSegment(t, channelDir, s0, 10)
+	_ = writeSegment(t, channelDir, s0+s1, 5) // active segment
+
+	// Consumed nothing.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
+
+	now := time.Now()
+	// Age the two sealed segments past the retention window. The active segment
+	// keeps its recent mtime and is never deleted regardless of age.
+	old := now.Add(-2 * time.Hour)
+	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(0)), old, old))
+	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(s0)), old, old))
+
+	c := NewCompactor(offsetDir, 0, 0, time.Hour, &testutil.FakeLogger{})
+	c.now = func() time.Time { return now }
+	c.RegisterSubscriber("sub1")
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	require.Len(t, segs, 1, "both aged-out sealed segments should be evicted, leaving only the active one")
+	assert.Equal(t, s0+s1, segs[0].startOffset)
 }

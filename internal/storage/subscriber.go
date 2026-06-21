@@ -118,6 +118,7 @@ type Subscriber struct {
 	unmarshalSkipped atomic.Int64
 	decodeSkipped    atomic.Int64
 	retryLaterPauses atomic.Int64
+	compactionDrops  atomic.Int64
 }
 
 // SubscriberStats returns a snapshot of the diagnostic counters. Intended for
@@ -130,6 +131,7 @@ type SubscriberStats struct {
 	UnmarshalSkipped int64
 	DecodeSkipped    int64
 	RetryLaterPauses int64
+	CompactionDrops  int64
 	CurrentOffset    int64
 	FlushedOffset    int64
 }
@@ -147,6 +149,7 @@ func (s *Subscriber) Stats() SubscriberStats {
 		UnmarshalSkipped: s.unmarshalSkipped.Load(),
 		DecodeSkipped:    s.decodeSkipped.Load(),
 		RetryLaterPauses: s.retryLaterPauses.Load(),
+		CompactionDrops:  s.compactionDrops.Load(),
 		CurrentOffset:    off,
 		FlushedOffset:    s.flushedOffset.Load(),
 	}
@@ -295,6 +298,19 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 	s.mu.Lock()
 	offset := s.offset
 	s.mu.Unlock()
+
+	// If retention compaction deleted segments below our offset, the earliest
+	// surviving segment now starts past where we are. Fast-forward to its start
+	// to avoid a negative seek (which would wedge delivery) and report the gap of
+	// permanently-dropped messages.
+	if earliest := segs[0].startOffset; offset < earliest {
+		dropped := earliest - offset
+		s.log.Warn("subscriber offset undercut by retention compaction; skipping dropped messages",
+			"subscriber", s.id, "old_offset", offset, "new_offset", earliest, "dropped_bytes", dropped)
+		s.compactionDrops.Add(1)
+		offset = earliest
+		s.advanceOffset(offset)
+	}
 
 	// If offset writes have been failing repeatedly, attempt a probe write
 	// before processing more messages.

@@ -7,31 +7,50 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Compactor tracks registered subscribers for a single channel and deletes
 // fully-consumed sealed segment files. Unlike the old copy-based approach,
 // compaction is a simple O(1)-per-segment file deletion with no writer pause.
+//
+// In addition to consumption-based deletion, the compactor enforces optional
+// retention bounds (maxSizeBytes, retention age). When a channel exceeds a
+// bound, the oldest sealed segments are force-deleted even if a subscriber has
+// not consumed them — trading bounded disk usage for dropped messages on
+// lagging subscribers. The active (newest) segment is never deleted.
 type Compactor struct {
-	mu          sync.Mutex
-	offsetDir   string
-	subscribers map[string]struct{}
-	maxLagBytes int64
-	log         logger
+	mu           sync.Mutex
+	offsetDir    string
+	subscribers  map[string]struct{}
+	maxLagBytes  int64
+	maxSizeBytes int64         // 0 = no size cap
+	retention    time.Duration // 0 = no age cap
+	now          func() time.Time
+	log          logger
 }
 
 // NewCompactor returns a Compactor that reads subscriber offsets from offsetDir.
-// maxLagBytes is the per-subscriber lag threshold above which a warning is
-// logged; 0 disables lag warnings. log may be nil.
-func NewCompactor(offsetDir string, maxLagBytes int64, log logger) *Compactor {
+//
+//   - maxLagBytes: per-subscriber lag above which a warning is logged; 0 disables.
+//   - maxSizeBytes: hard cap on a channel's retained on-disk bytes; when exceeded,
+//     oldest sealed segments are force-deleted regardless of consumption. 0 disables.
+//   - retention: max age of retained messages; sealed segments older than this are
+//     force-deleted regardless of consumption. 0 disables.
+//
+// log may be nil.
+func NewCompactor(offsetDir string, maxLagBytes, maxSizeBytes int64, retention time.Duration, log logger) *Compactor {
 	if log == nil {
 		log = nopLogger{}
 	}
 	return &Compactor{
-		offsetDir:   offsetDir,
-		subscribers: make(map[string]struct{}),
-		maxLagBytes: maxLagBytes,
-		log:         log,
+		offsetDir:    offsetDir,
+		subscribers:  make(map[string]struct{}),
+		maxLagBytes:  maxLagBytes,
+		maxSizeBytes: maxSizeBytes,
+		retention:    retention,
+		now:          time.Now,
+		log:          log,
 	}
 }
 
@@ -183,19 +202,51 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 		return nil
 	}
 
-	// Delete any sealed segment (not the last) whose entire content lies
-	// before minOffset. A segment is fully consumed when the next segment's
-	// start offset is <= minOffset. When there are no consumers at all,
-	// minOffset remains math.MaxInt64 and all sealed segments are eligible.
+	// Total retained bytes across all segments, used for the size cap. It is
+	// decremented as segments are deleted so the cap is re-evaluated each step.
+	var total int64
+	for _, s := range segs {
+		total += s.size
+	}
+	now := c.now()
+
+	// Walk sealed segments oldest-first (never the active/last segment). Delete a
+	// segment when it is either fully consumed, or — when a retention bound is
+	// configured and exceeded — force it out even if unconsumed. A segment that is
+	// consumed, within the size cap, and within the age bound is retained; because
+	// consumption, size, and age are all monotonic oldest-first, every newer sealed
+	// segment is then also retained, so we can stop.
 	for i := 0; i < len(segs)-1; i++ {
+		seg := segs[i]
 		nextStart := segs[i+1].startOffset
-		if nextStart <= minOffset {
-			if err := os.Remove(segs[i].path); err != nil {
-				c.log.Error("delete segment", "path", segs[i].path, "err", err)
-			} else {
-				c.log.Warn("deleted consumed segment",
-					"path", segs[i].path, "bytes_freed", segs[i].size)
-			}
+
+		consumed := nextStart <= minOffset
+		overSize := c.maxSizeBytes > 0 && total > c.maxSizeBytes
+		tooOld := c.retention > 0 && now.Sub(seg.modTime) > c.retention
+
+		if !consumed && !overSize && !tooOld {
+			break
+		}
+
+		if err := os.Remove(seg.path); err != nil && !os.IsNotExist(err) {
+			c.log.Error("delete segment", "path", seg.path, "err", err)
+			break // stop on a real failure to avoid spinning over an undeletable file
+		}
+		total -= seg.size
+
+		switch {
+		case consumed:
+			c.log.Warn("deleted consumed segment",
+				"path", seg.path, "bytes_freed", seg.size)
+		case overSize:
+			c.log.Warn("force-deleted unconsumed segment to enforce size cap",
+				"path", seg.path, "bytes_freed", seg.size,
+				"next_offset", nextStart, "min_subscriber_offset", minOffset,
+				"max_size_bytes", c.maxSizeBytes)
+		case tooOld:
+			c.log.Warn("force-deleted unconsumed segment past retention age",
+				"path", seg.path, "bytes_freed", seg.size,
+				"age", now.Sub(seg.modTime).String(), "retention", c.retention.String())
 		}
 	}
 

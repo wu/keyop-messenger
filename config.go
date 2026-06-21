@@ -6,22 +6,52 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Duration is a time.Duration that unmarshals from a YAML string (e.g. "168h", "30m").
+// Duration is a time.Duration that unmarshals from a YAML string. It accepts Go
+// duration strings (e.g. "168h", "30m", "500ms") plus a day unit "d" that Go's
+// time.ParseDuration lacks, including compound values: "7d", "1.5d", "1d12h".
 type Duration struct{ time.Duration }
 
-// UnmarshalYAML implements yaml.Unmarshaler so Duration fields accept Go duration strings.
+// UnmarshalYAML implements yaml.Unmarshaler so Duration fields accept Go duration
+// strings extended with a day unit.
 func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
-	dur, err := time.ParseDuration(value.Value)
+	dur, err := parseDuration(value.Value)
 	if err != nil {
 		return fmt.Errorf("invalid duration %q: %w", value.Value, err)
 	}
 	d.Duration = dur
 	return nil
+}
+
+// parseDuration is time.ParseDuration extended with a day unit "d". A leading
+// "<n>d" component (n may be fractional) is converted to hours and added to any
+// standard duration remainder, so "7d", "1.5d", and "1d12h" all parse. Strings
+// without a day component fall through to time.ParseDuration unchanged.
+func parseDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	i := strings.IndexByte(s, 'd')
+	if i < 0 {
+		return time.ParseDuration(s)
+	}
+	days, err := strconv.ParseFloat(s[:i], 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid day count %q", s[:i])
+	}
+	total := time.Duration(days * 24 * float64(time.Hour))
+	if rest := s[i+1:]; rest != "" {
+		restDur, err := time.ParseDuration(rest)
+		if err != nil {
+			return 0, err
+		}
+		total += restDur
+	}
+	return total, nil
 }
 
 // StorageConfig controls the on-disk message store.
@@ -42,6 +72,23 @@ type StorageConfig struct {
 	// CompactionThresholdMB triggers file rotation when the consumed (already-read-by-all-
 	// subscribers) portion of a channel file exceeds this size. Default: 256.
 	CompactionThresholdMB int `yaml:"compaction_threshold_mb"`
+
+	// MaxChannelSizeMB caps the on-disk size of a single channel's retained segment
+	// files. When the total exceeds this, the compactor force-deletes the oldest
+	// sealed segments — including ones a lagging subscriber has not yet consumed —
+	// to bound disk usage. The active (currently-written) segment is never deleted,
+	// so the effective floor is one segment (keep CompactionThresholdMB small to
+	// keep that floor low). A subscriber whose offset is undercut fast-forwards past
+	// the dropped messages. 0 (default) disables the size cap.
+	MaxChannelSizeMB int `yaml:"max_channel_size_mb"`
+
+	// RetentionAge caps how long messages are retained. The compactor force-deletes
+	// sealed segments whose most recent write is older than this, even if a
+	// subscriber has not consumed them. The active segment is never deleted.
+	// 0 (default) disables age-based retention. Eviction occurs when EITHER
+	// MaxChannelSizeMB or RetentionAge is exceeded. Accepts a day unit, e.g.
+	// "7d" or "168h" for one week.
+	RetentionAge Duration `yaml:"retention"`
 
 	// OffsetFlushIntervalMS is the minimum time between subscriber offset file
 	// flushes (fsync + atomic rename). 0 flushes after every delivered message,

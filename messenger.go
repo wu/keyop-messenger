@@ -739,6 +739,8 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 		compactor: storage.NewCompactor(
 			m.offsetDir(channel),
 			int64(m.cfg.Storage.MaxSubscriberLagMB)*1024*1024,
+			int64(m.cfg.Storage.MaxChannelSizeMB)*1024*1024,
+			m.cfg.Storage.RetentionAge.Duration,
 			m.log,
 		),
 	}

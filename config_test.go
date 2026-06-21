@@ -350,6 +350,11 @@ func TestDuration_UnmarshalYAML(t *testing.T) {
 		{"168h", 168 * time.Hour},
 		{"500ms", 500 * time.Millisecond},
 		{"0s", 0},
+		{"7d", 7 * 24 * time.Hour},
+		{"1d", 24 * time.Hour},
+		{"30d", 30 * 24 * time.Hour},
+		{"1.5d", 36 * time.Hour},
+		{"1d12h", 36 * time.Hour},
 	}
 	for _, tc := range cases {
 		t.Run(tc.input, func(t *testing.T) {
