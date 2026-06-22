@@ -574,6 +574,57 @@ func TestSubscriber_LargePayload(t *testing.T) {
 	assert.Equal(t, "orders", msgs[0].Channel)
 }
 
+// TestSubscriber_SkipsOversizedRecord verifies that a record larger than
+// maxLineSize does not wedge the subscriber forever. The oversized record is
+// skipped (offset advanced past it, oversizedSkipped incremented) and the
+// surrounding records are still delivered. Regression test for a poison
+// >10 MiB record freezing a channel's subscriber offset.
+func TestSubscriber_SkipsOversizedRecord(t *testing.T) {
+	// Shrink the scan limits so the test exercises the oversized-record path with
+	// a few-KiB record instead of writing a real 10 MiB file on every run. The
+	// restore is registered first so it runs last (after sub.Stop), keeping the
+	// subscriber goroutine from reading these vars while they are reset.
+	origMax, origBuf := maxLineSize, scanInitialBufSize
+	maxLineSize, scanInitialBufSize = 4096, 1024
+	t.Cleanup(func() { maxLineSize, scanInitialBufSize = origMax, origBuf })
+
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "rss")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 1)
+
+	// A small record, an oversized one (> maxLineSize), then another small one.
+	writeTestEnvelope(t, channelDir, makeEnv(t, "rss", map[string]any{"n": 1}))
+	oversized := strings.Repeat("x", maxLineSize+4096) // exceeds the shrunk scan limit
+	writeTestEnvelope(t, channelDir, makeEnv(t, "rss", map[string]any{"blob": oversized}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "rss", map[string]any{"n": 3}))
+
+	received := make(chan *envelope.Envelope, 4)
+	sub.Start(notifyC, func(env *envelope.Envelope, _ any) error {
+		received <- env
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// Only the two small records are delivered; the oversized one is skipped.
+	msgs := collectN(t, received, 2, testTimeout)
+	require.Len(t, msgs, 2)
+
+	// No further messages should arrive (the oversized record is not redelivered).
+	select {
+	case extra := <-received:
+		t.Fatalf("unexpected extra delivery: %+v", extra)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	assert.Equal(t, int64(1), sub.Stats().OversizedSkipped, "oversized record should be counted as skipped")
+
+	streamEnd, err := ChannelStreamEnd(channelDir)
+	require.NoError(t, err)
+	assert.Equal(t, streamEnd, sub.Offset(), "offset should advance past all records, including the skipped one")
+}
+
 func TestSubscriber_RetryBackoff(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "orders")

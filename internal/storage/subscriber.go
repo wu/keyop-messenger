@@ -120,6 +120,7 @@ type Subscriber struct {
 	retryLaterPauses atomic.Int64
 	compactionDrops  atomic.Int64
 	startupSkipped   atomic.Int64
+	oversizedSkipped atomic.Int64
 
 	// maxAge, when > 0, enables one-time startup freshness filtering: on first
 	// start the subscriber fast-forwards its offset past buffered messages older
@@ -128,8 +129,17 @@ type Subscriber struct {
 	maxAge time.Duration
 }
 
-// maxLineSize bounds a single scanned record (10 MiB).
-const maxLineSize = 10 * 1024 * 1024
+// maxLineSize bounds a single scanned record (10 MiB); records larger than this
+// are skipped by scanSegment so one oversized payload cannot wedge delivery.
+// scanInitialBufSize is the scanner's starting buffer. bufio.Scanner's effective
+// maximum token size is max(maxLineSize, cap(initial buffer)), so the two values
+// set the record-size ceiling together. Both are vars rather than consts only so
+// tests can shrink them to exercise the oversized-record path without writing a
+// real 10 MiB record; production never mutates them.
+var (
+	maxLineSize        = 10 * 1024 * 1024
+	scanInitialBufSize = 64 * 1024
+)
 
 // SubscriberStats returns a snapshot of the diagnostic counters. Intended for
 // tests and observability hooks investigating delivery anomalies.
@@ -143,6 +153,7 @@ type SubscriberStats struct {
 	RetryLaterPauses    int64
 	CompactionDrops     int64
 	StartupSkippedBytes int64
+	OversizedSkipped    int64
 	CurrentOffset       int64
 	FlushedOffset       int64
 }
@@ -162,6 +173,7 @@ func (s *Subscriber) Stats() SubscriberStats {
 		RetryLaterPauses:    s.retryLaterPauses.Load(),
 		CompactionDrops:     s.compactionDrops.Load(),
 		StartupSkippedBytes: s.startupSkipped.Load(),
+		OversizedSkipped:    s.oversizedSkipped.Load(),
 		CurrentOffset:       off,
 		FlushedOffset:       s.flushedOffset.Load(),
 	}
@@ -388,7 +400,7 @@ func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, 
 		return false, 0, err
 	}
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
 	scanner.Split(scanCompleteLines)
 
 	pos := from
@@ -455,21 +467,50 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 			continue // subscriber is already past this entire segment
 		}
 
+		newOffset, stop := s.scanSegment(seg, handler, offset)
+		offset = newOffset
+		if stop {
+			return
+		}
+
+		// If there is a next segment, advance to its start offset. This handles
+		// the gap between a sealed segment's end and the next segment's start
+		// (in the normal case these are equal, so this is a no-op on offset).
+		if i+1 < len(segs) {
+			offset = segs[i+1].startOffset
+		}
+	}
+}
+
+// scanSegment reads and dispatches complete records from seg starting at the
+// subscriber's current global offset. It returns the updated offset and whether
+// delivery should halt for now (an ErrRetryLater pause, an unrecoverable read
+// error, or an in-flight partial write at the tail).
+//
+// A record larger than maxLineSize cannot be returned by the scanner, which
+// would otherwise wedge the subscriber on that offset forever. Such records are
+// skipped: the offset advances past them with an error log and the
+// oversizedSkipped counter is incremented, mirroring how unmarshal/decode
+// failures are skipped. Because a scanner is single-use after returning
+// ErrTooLong, the segment is re-opened to resume scanning past the skipped
+// record.
+func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset int64) (int64, bool) {
+	for {
 		f, err := os.Open(seg.path)
 		if err != nil {
 			s.log.Error("open segment", "path", seg.path, "err", err)
-			return
+			return offset, true
 		}
 
 		localOffset := offset - seg.startOffset
 		if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
 			s.log.Error("seek in segment", "path", seg.path, "local_offset", localOffset, "err", err)
 			_ = f.Close()
-			return
+			return offset, true
 		}
 
 		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 64*1024), maxLineSize)
+		scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
 		scanner.Split(scanCompleteLines)
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -499,20 +540,74 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 				// unadvanced and halt the batch. The next notify/poll re-reads
 				// from the same offset; the durable log buffers the backlog.
 				_ = f.Close()
-				return
+				return offset, true
 			}
 			offset = nextOffset
 		}
-		if err := scanner.Err(); err != nil {
-			s.log.Error("scan segment", "path", seg.path, "err", err)
-		}
+		serr := scanner.Err()
 		_ = f.Close()
 
-		// If there is a next segment, advance to its start offset. This handles
-		// the gap between a sealed segment's end and the next segment's start
-		// (in the normal case these are equal, so this is a no-op on offset).
-		if i+1 < len(segs) {
-			offset = segs[i+1].startOffset
+		if serr == nil {
+			return offset, false
+		}
+		if !errors.Is(serr, bufio.ErrTooLong) {
+			s.log.Error("scan segment", "path", seg.path, "err", serr)
+			return offset, false
+		}
+
+		// The record at offset exceeds maxLineSize. Measure it by reading to the
+		// next newline so we can advance past it instead of stalling forever.
+		recLen, rerr := recordLenAt(seg.path, offset-seg.startOffset)
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				// The oversized record has no terminating newline yet: it is an
+				// in-flight write, not a complete poison record. Wait for the
+				// next poll rather than skipping a message mid-flight.
+				return offset, true
+			}
+			s.log.Error("measure oversized record; halting to avoid skipping data",
+				"subscriber", s.id, "path", seg.path, "offset", offset, "err", rerr)
+			return offset, true
+		}
+
+		s.oversizedSkipped.Add(1)
+		s.log.Error("record exceeds max line size; skipping",
+			"subscriber", s.id, "path", seg.path, "offset", offset,
+			"max_line_size", maxLineSize, "record_len", recLen)
+		offset += recLen
+		s.advanceOffset(offset)
+		// Loop: re-open the segment and resume scanning after the skipped record.
+	}
+}
+
+// recordLenAt returns the byte length, including the trailing newline, of the
+// record beginning at localOffset within the segment file. It is used to skip a
+// record too large for the scanner buffer. It returns io.EOF (with the bytes
+// read so far) when no terminating newline is present, which indicates an
+// in-flight write rather than a complete record.
+func recordLenAt(path string, localOffset int64) (int64, error) {
+	//nolint:gosec // G304: segment path is a trusted, library-constructed data file path
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
+		return 0, err
+	}
+	r := bufio.NewReader(f)
+	var n int64
+	for {
+		b, err := r.ReadByte()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return n, io.EOF
+			}
+			return 0, err
+		}
+		n++
+		if b == '\n' {
+			return n, nil
 		}
 	}
 }

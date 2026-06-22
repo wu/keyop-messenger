@@ -117,6 +117,7 @@ type DiagnosticStats struct {
 	Dispatched       int64 // messages successfully passed to the handler
 	UnmarshalSkipped int64 // lines that failed envelope.Unmarshal (offset still advanced)
 	DecodeSkipped    int64 // payloads that failed reg.Decode (offset still advanced)
+	OversizedSkipped int64 // records larger than maxLineSize (offset still advanced)
 	CurrentOffset    int64 // subscriber's in-memory cursor
 	FlushedOffset    int64 // subscriber's on-disk cursor
 }
@@ -148,6 +149,7 @@ func (m *Messenger) DiagnosticStats(channel, subscriberID string) DiagnosticStat
 		Dispatched:       subStats.Dispatched,
 		UnmarshalSkipped: subStats.UnmarshalSkipped,
 		DecodeSkipped:    subStats.DecodeSkipped,
+		OversizedSkipped: subStats.OversizedSkipped,
 		CurrentOffset:    subStats.CurrentOffset,
 		FlushedOffset:    subStats.FlushedOffset,
 	}
