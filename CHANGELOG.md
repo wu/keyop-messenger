@@ -1,3 +1,9 @@
+## [1.15.1](https://github.com/wu/keyop-messenger/compare/v1.15.0...v1.15.1) (2026-06-22)
+
+### Bug Fixes
+
+* skip records larger than maxLineSize instead of wedging the subscriber ([3a5d83f](https://github.com/wu/keyop-messenger/commit/3a5d83f30ed474b258af33c4f5af46552e4c0858))
+
 ## [1.15.0](https://github.com/wu/keyop-messenger/compare/v1.14.0...v1.15.0) (2026-06-22)
 
 ### Features
