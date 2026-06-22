@@ -1,3 +1,10 @@
+## [1.15.0](https://github.com/wu/keyop-messenger/compare/v1.14.0...v1.15.0) (2026-06-22)
+
+### Features
+
+* add per-subscription startup max-age; remove max_subscriber_lag_mb ([6f5258a](https://github.com/wu/keyop-messenger/commit/6f5258aec2649e2e09cc33493feab050ac4a4ec9))
+* bound channel disk usage with size and age retention ([f1d0866](https://github.com/wu/keyop-messenger/commit/f1d086676e0a4aedd79f9bbc6bfef4a521f8703e))
+
 ## [1.14.0](https://github.com/wu/keyop-messenger/compare/v1.13.1...v1.14.0) (2026-06-21)
 
 ### Features
