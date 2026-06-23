@@ -1,3 +1,12 @@
+## [1.16.0](https://github.com/wu/keyop-messenger/compare/v1.15.1...v1.16.0) (2026-06-23)
+
+### Features
+
+* **federation:** batch hub ingest and unify the inbound commit path ([85d280e](https://github.com/wu/keyop-messenger/commit/85d280e4b081875261521dc719c5fefeb61fbd32))
+* **federation:** batch receive-side commits with strict ack-after-commit ([59f9e4d](https://github.com/wu/keyop-messenger/commit/59f9e4dc41b5eb1d6f7504adfa16d10def413163))
+* **messenger:** add PublishBatch built on WriteBatch ([aacf374](https://github.com/wu/keyop-messenger/commit/aacf374972e85b86fbc2202756125cd5e7bc97c8))
+* **storage:** add WriteBatch for single-fsync batch appends ([cc0b18f](https://github.com/wu/keyop-messenger/commit/cc0b18f17d13587c6e431e0bb68b2ac0519319e3))
+
 ## [1.15.1](https://github.com/wu/keyop-messenger/compare/v1.15.0...v1.15.1) (2026-06-22)
 
 ### Bug Fixes
