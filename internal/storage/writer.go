@@ -32,6 +32,7 @@ import (
 // fsync regardless of caller cancellation.
 type ChannelWriter interface {
 	Write(ctx context.Context, env *envelope.Envelope) error
+	WriteBatch(ctx context.Context, envs []*envelope.Envelope) error
 	Close() error
 }
 
@@ -70,7 +71,11 @@ func (osSegmentFactory) createSegment(path string) (fileWriter, error) {
 
 type writeRequest struct {
 	data []byte
-	done chan<- error
+	// records is non-nil for a batch request: each element is one newline-
+	// terminated record to append as a single durable unit. When set, data is
+	// unused. A batch shares one fsync and one notify across all its records.
+	records [][]byte
+	done    chan<- error
 	// ctx is the caller's context. The writer goroutine watches it during the
 	// disk-full retry loop and abandons the write (signalling done with
 	// ctx.Err()) if the caller gives up.
@@ -146,6 +151,40 @@ func (w *channelWriter) Write(ctx context.Context, env *envelope.Envelope) error
 	return <-done
 }
 
+// WriteBatch marshals and appends all envs as a single durable unit: one fsync
+// and one subscriber notification cover the whole batch (when sync_interval_ms
+// is 0), amortising the per-record fsync cost. Ordering within the batch is
+// preserved, and no individual record is ever split across a segment boundary.
+//
+// The return value follows the same written/not-written contract as Write: nil
+// means every record was durably committed; a non-nil error means the batch was
+// not fully committed and the caller may safely retry it. A retry may duplicate
+// any record-aligned prefix that reached disk before the failure, which is
+// consistent with at-least-once delivery. An empty batch is a no-op.
+func (w *channelWriter) WriteBatch(ctx context.Context, envs []*envelope.Envelope) error {
+	if len(envs) == 0 {
+		return nil
+	}
+	records := make([][]byte, 0, len(envs))
+	for _, env := range envs {
+		data, err := envelope.Marshal(*env)
+		if err != nil {
+			return fmt.Errorf("marshal envelope: %w", err)
+		}
+		records = append(records, append(data, '\n'))
+	}
+
+	done := make(chan error, 1)
+	select {
+	case w.requests <- writeRequest{records: records, done: done, ctx: ctx}:
+	case <-w.stopCh:
+		return ErrWriterClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return <-done
+}
+
 // Close signals the writer goroutine to stop and waits for it to exit.
 // Safe to call concurrently and more than once.
 func (w *channelWriter) Close() error {
@@ -177,26 +216,18 @@ func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 	for {
 		select {
 		case req := <-w.requests:
-			// Roll to a new segment if the current one would exceed the limit.
-			if w.maxSegmentBytes > 0 && segSize > 0 &&
-				segSize+int64(len(req.data)) > w.maxSegmentBytes {
-				if err := f.Sync(); err != nil {
-					w.log.Warn("fsync before segment roll", "err", err)
-				}
-				_ = f.Close()
-				newStart := segStart + segSize
-				newPath := filepath.Join(w.channelDir, segmentName(newStart))
-				newF, err := w.sf.createSegment(newPath)
-				if err != nil {
-					w.log.Error("create new segment", "offset", newStart, "err", err)
-					req.done <- fmt.Errorf("create new segment: %w", err)
-					return
-				}
-				f = newF
-				segStart = newStart
-				segSize = 0
+			var fatal error
+			if req.records != nil {
+				f, segStart, segSize, fatal = w.doWriteBatch(f, segStart, segSize, req, syncIntervalMS, notifyFn)
+			} else {
+				f, segStart, segSize, fatal = w.doWriteSingle(f, segStart, segSize, req, syncIntervalMS, notifyFn)
 			}
-			w.doWrite(f, req, &segSize, syncIntervalMS, notifyFn)
+			// A fatal error is an unrecoverable segment-create failure; the
+			// goroutine cannot continue writing. doWrite* has already signalled
+			// req.done with the error.
+			if fatal != nil {
+				return
+			}
 
 		case <-tickCh:
 			if err := f.Sync(); err != nil {
@@ -299,55 +330,136 @@ func truncatePartialTrailing(path string, currentSize int64, log logger) (int64,
 	return 0, nil
 }
 
-// doWrite performs the write with retry-on-error (backpressure) and optional
-// fsync. It signals req.done exactly once before returning.
-func (w *channelWriter) doWrite(f fileWriter, req writeRequest, segSize *int64, syncIntervalMS int, notifyFn func()) {
-	needLock := len(req.data) > pipeBuf
+// rollIfNeeded rolls to a new segment when appending recLen bytes to the current
+// segment would exceed maxSegmentBytes. It fsyncs and closes the current segment
+// and creates the next one, so no record is ever split across a boundary (a
+// segment always holds whole records starting at its start offset). It returns
+// the (possibly unchanged) file, start offset, and size. A non-nil error means
+// the next segment could not be created and the writer goroutine must exit.
+func (w *channelWriter) rollIfNeeded(f fileWriter, segStart, segSize int64, recLen int) (fileWriter, int64, int64, error) {
+	if w.maxSegmentBytes <= 0 || segSize == 0 || segSize+int64(recLen) <= w.maxSegmentBytes {
+		return f, segStart, segSize, nil
+	}
+	if err := f.Sync(); err != nil {
+		w.log.Warn("fsync before segment roll", "err", err)
+	}
+	_ = f.Close()
+	newStart := segStart + segSize
+	newPath := filepath.Join(w.channelDir, segmentName(newStart))
+	newF, err := w.sf.createSegment(newPath)
+	if err != nil {
+		w.log.Error("create new segment", "offset", newStart, "err", err)
+		return nil, 0, 0, fmt.Errorf("create new segment: %w", err)
+	}
+	return newF, newStart, 0, nil
+}
 
+// writeRecord appends data to f with retry-on-error (backpressure) and an
+// advisory flock for records larger than PIPE_BUF. It performs no fsync or
+// notify — callers batch those so a multi-record write shares one fsync.
+//
+// A non-nil error means the record was NOT written: either Close() was called
+// or the caller's ctx was cancelled while retrying a transient write error
+// (disk full, I/O). In both cases write(2) never succeeded, so the caller's
+// "not written" contract holds.
+func (w *channelWriter) writeRecord(ctx context.Context, f fileWriter, data []byte) error {
+	needLock := len(data) > pipeBuf
 	for {
 		if needLock {
 			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
 				w.log.Warn("flock LOCK_EX failed", "err", err)
 			}
 		}
-		_, err := f.Write(req.data)
+		_, err := f.Write(data)
 		if needLock {
 			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
 				w.log.Warn("flock LOCK_UN failed", "err", err)
 			}
 		}
 		if err == nil {
-			break
+			return nil
 		}
-		// Retry on write error (disk full, transient I/O). Honour Close() to
-		// avoid spinning forever on shutdown, and honour the caller's ctx so
-		// a deadline-bound publisher can give up. Abandoning here means no
-		// data was written — write(2) returned an error this attempt and we
-		// never retried successfully — so the caller's "not written" contract
-		// holds.
 		select {
 		case <-time.After(10 * time.Millisecond):
 		case <-w.stopCh:
-			req.done <- fmt.Errorf("write aborted: writer closed during retry")
-			return
-		case <-req.ctx.Done():
-			req.done <- req.ctx.Err()
-			return
+			return fmt.Errorf("write aborted: writer closed during retry")
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
+}
 
-	*segSize += int64(len(req.data))
+// doWriteSingle writes one record (req.data): it rolls the segment first if the
+// record would overflow it, appends, then fsyncs (when syncIntervalMS == 0) and
+// notifies. It signals req.done exactly once. The returned error is non-nil only
+// for a fatal segment-create failure, which makes the writer goroutine exit;
+// ordinary write/fsync failures are reported via req.done with a nil returned
+// error so the goroutine keeps serving subsequent requests.
+func (w *channelWriter) doWriteSingle(f fileWriter, segStart, segSize int64, req writeRequest, syncIntervalMS int, notifyFn func()) (fileWriter, int64, int64, error) {
+	nf, ns, nsz, err := w.rollIfNeeded(f, segStart, segSize, len(req.data))
+	if err != nil {
+		req.done <- err
+		return f, segStart, segSize, err
+	}
+	f, segStart, segSize = nf, ns, nsz
+
+	if err := w.writeRecord(req.ctx, f, req.data); err != nil {
+		req.done <- err
+		return f, segStart, segSize, nil
+	}
+	segSize += int64(len(req.data))
 
 	if syncIntervalMS == 0 {
 		if err := f.Sync(); err != nil {
 			w.log.Error("fsync failed", "err", err)
 			req.done <- fmt.Errorf("fsync channel file: %w", err)
-			return
+			return f, segStart, segSize, nil
 		}
 	}
-
 	if notifyFn != nil {
 		notifyFn()
 	}
 	req.done <- nil
+	return f, segStart, segSize, nil
+}
+
+// doWriteBatch writes every record in req.records as a single durable unit: each
+// record is appended in order (rolling segments at boundaries so no record is
+// split across files), then a single fsync (when syncIntervalMS == 0) and a
+// single notify cover the whole batch. req.done is signalled exactly once.
+//
+// As with doWriteSingle, a non-nil returned error is fatal (segment-create
+// failure) and exits the writer goroutine; a write/fsync failure mid-batch is
+// reported via req.done with a nil returned error. On a mid-batch write failure
+// the records already appended may remain on disk; the caller treated the batch
+// as not-acked and retries the whole batch, so at-least-once holds (the retry
+// may duplicate the persisted prefix).
+func (w *channelWriter) doWriteBatch(f fileWriter, segStart, segSize int64, req writeRequest, syncIntervalMS int, notifyFn func()) (fileWriter, int64, int64, error) {
+	for _, rec := range req.records {
+		nf, ns, nsz, err := w.rollIfNeeded(f, segStart, segSize, len(rec))
+		if err != nil {
+			req.done <- err
+			return f, segStart, segSize, err
+		}
+		f, segStart, segSize = nf, ns, nsz
+
+		if err := w.writeRecord(req.ctx, f, rec); err != nil {
+			req.done <- err
+			return f, segStart, segSize, nil
+		}
+		segSize += int64(len(rec))
+	}
+
+	if syncIntervalMS == 0 {
+		if err := f.Sync(); err != nil {
+			w.log.Error("fsync failed", "err", err)
+			req.done <- fmt.Errorf("fsync channel file: %w", err)
+			return f, segStart, segSize, nil
+		}
+	}
+	if notifyFn != nil {
+		notifyFn()
+	}
+	req.done <- nil
+	return f, segStart, segSize, nil
 }

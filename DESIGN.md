@@ -152,6 +152,14 @@ What "write confirmed" means depends on `sync_interval_ms`:
 
 For `sync_interval_ms=0`, an fsync failure is returned as an error to the caller. For `sync_interval_ms>0`, fsync failures are logged as warnings and retried on the next timer tick; `Publish()` is not affected.
 
+**Batched writes.** The writer also accepts a *batch* request (`WriteBatch`) carrying multiple records. The batch is a single rendezvous request handled atomically with respect to other writes: each record is appended in order through the same single-record write path (with the same `PIPE_BUF`/`flock` rule per record), but **one `fsync` and one subscriber notification cover the whole batch** when `sync_interval_ms=0`. This amortises the per-record fsync — the dominant write cost — across the batch while keeping strict durability. The fsync is the cost being amortised; the per-record `write()` syscalls are not coalesced.
+
+`WriteBatch` follows the same written/not-written contract as a single write: it returns `nil` only after the entire batch is durably committed (fsynced, when `sync_interval_ms=0`), and a non-nil error means the batch was **not** fully committed and may be safely retried. An empty batch is a no-op. Crucially, the batch's confirmation is never returned ahead of the commit — the same invariant that single writes uphold, extended to the group.
+
+A batch never splits a record across a segment boundary. If appending the next record would exceed the segment size limit, the writer rolls to a new segment at the record boundary (fsyncing and sealing the current segment first, as for single writes), so a single batch may span multiple segments but every record lands wholly within one. Each roll necessarily fsyncs the sealed segment, so a batch large enough to roll performs one fsync per segment boundary plus the final fsync — the single-fsync amortisation applies to the common case where the batch fits the active segment.
+
+On a mid-batch write failure the records already appended may remain on disk; because the caller treated the batch as not-acked and retries the whole batch, at-least-once is preserved — the retry may duplicate the record-aligned prefix that survived (a crash leaves only a trailing partial record, which recovery truncates; see §5.1). `WriteBatch` is the storage-layer primitive underlying higher-level batched publish and batched federation ingest, which share its single-commit, single-notify behaviour.
+
 ### 5.3 Backpressure on Disk Full
 
 If the channel writer goroutine encounters a write error (disk full, I/O error), it does **not** drop the message or return an error to the caller. Instead:
@@ -523,6 +531,20 @@ writer goroutine (one per channel)
 
 `Publish()` always blocks until the write is confirmed. There is no in-memory queue and no separate timeout or drop path — if the disk is unavailable, the publisher waits indefinitely (see §5.3 for backpressure propagation to federated senders).
 
+A **batch** request (`WriteBatch`) follows the same path with the loop body repeated per record and the fsync + subscriber-notify hoisted out of the loop:
+
+```
+writer goroutine (batch request)
+  └─ for each record in batch:
+       └─ roll to a new segment first if it would exceed the size limit (§5.2)
+       └─ single write() syscall  (retry on I/O error until success, §5.3)
+  └─ fsync once if sync_interval_ms = 0          ← amortised across the batch
+  └─ signal caller: whole batch confirmed
+  └─ signal waiting subscribers once             ← one notification per batch
+```
+
+See §5.2 for the batch durability contract and segment-boundary handling.
+
 ### 9.2 Read Path
 
 ```
@@ -537,7 +559,7 @@ fsnotify event on channel directory (or internal signal for same-process)
        → on write failure: log error, leave in-memory offset unchanged
 ```
 
-Subscribers within the same process use an internal notification channel bypassing the filesystem watcher for lower latency. The per-line scanner buffer is capped at 10 MiB; envelopes larger than this are skipped with an error logged and the offset advanced past them.
+Subscribers within the same process use an internal notification channel bypassing the filesystem watcher for lower latency. The per-line scanner buffer is capped at `maxLineSize` (10 MiB). A record larger than this cannot be returned by the scanner, so it is skipped rather than wedging delivery: an error is logged, the offset is advanced past it (its end located by reading to the record's terminating newline), and the `OversizedSkipped` subscriber stat is incremented. An oversized record not yet terminated by a newline is treated as an in-flight write and left in place until it completes, so a message mid-flight is never skipped.
 
 ### 9.3 Serialization
 

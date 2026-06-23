@@ -114,6 +114,21 @@ func (f *FakeChannelWriter) Write(_ context.Context, env *envelope.Envelope) err
 	return nil
 }
 
+// WriteBatch records a copy of each envelope in order, or returns writeErr if
+// set (in which case nothing is recorded, mirroring the all-or-nothing contract).
+func (f *FakeChannelWriter) WriteBatch(_ context.Context, envs []*envelope.Envelope) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.writeErr != nil {
+		return f.writeErr
+	}
+	for _, env := range envs {
+		cp := *env
+		f.written = append(f.written, &cp)
+	}
+	return nil
+}
+
 // Close marks the writer as closed.
 func (f *FakeChannelWriter) Close() error {
 	f.mu.Lock()

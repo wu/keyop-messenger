@@ -296,6 +296,107 @@ func TestWriter_SegmentRolling(t *testing.T) {
 	}
 }
 
+// makeTestBatch builds n envelopes with distinct, ordered order_id payloads.
+func makeTestBatch(t *testing.T, n int) []*envelope.Envelope {
+	t.Helper()
+	envs := make([]*envelope.Envelope, n)
+	for i := 0; i < n; i++ {
+		envs[i] = makeTestEnvelope(t, fmt.Sprintf("ord-%d", i))
+	}
+	return envs
+}
+
+// orderIDOf extracts payload.order_id from a marshalled envelope line.
+func orderIDOf(t *testing.T, line string) string {
+	t.Helper()
+	var v struct {
+		Payload struct {
+			OrderID string `json:"order_id"`
+		} `json:"payload"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(line), &v))
+	return v.Payload.OrderID
+}
+
+// TestWriter_WriteBatch_OrderedAndComplete verifies a batch writes every record
+// once, in the supplied order.
+func TestWriter_WriteBatch_OrderedAndComplete(t *testing.T) {
+	w, f, _ := newFakeWriter(1000000, nil)
+	const n = 50
+	require.NoError(t, w.WriteBatch(context.Background(), makeTestBatch(t, n)))
+	require.NoError(t, w.Close())
+
+	lines := f.Lines()
+	require.Len(t, lines, n)
+	for i, line := range lines {
+		assert.Equal(t, fmt.Sprintf("ord-%d", i), orderIDOf(t, line), "record %d out of order", i)
+	}
+}
+
+// TestWriter_WriteBatch_SingleSyncAndNotify is the core amortisation guarantee:
+// with syncIntervalMS=0 (strict durability) a batch of n records performs
+// exactly one fsync and one notify, not n of each.
+func TestWriter_WriteBatch_SingleSyncAndNotify(t *testing.T) {
+	var notifies atomic.Int64
+	w, f, _ := newFakeWriter(0, func() { notifies.Add(1) })
+	const n = 25
+	require.NoError(t, w.WriteBatch(context.Background(), makeTestBatch(t, n)))
+	require.NoError(t, w.Close())
+
+	assert.Len(t, f.Lines(), n)
+	assert.Equal(t, int64(1), f.syncCount.Load(), "a batch must fsync exactly once, not once per record")
+	assert.Equal(t, int64(1), notifies.Load(), "a batch must notify exactly once")
+}
+
+// TestWriter_WriteBatch_Empty is a no-op that touches nothing.
+func TestWriter_WriteBatch_Empty(t *testing.T) {
+	var notifies atomic.Int64
+	w, f, _ := newFakeWriter(0, func() { notifies.Add(1) })
+	require.NoError(t, w.WriteBatch(context.Background(), nil))
+	require.NoError(t, w.WriteBatch(context.Background(), []*envelope.Envelope{}))
+	require.NoError(t, w.Close())
+
+	assert.Empty(t, f.Lines())
+	assert.Zero(t, f.syncCount.Load())
+	assert.Zero(t, notifies.Load())
+}
+
+// TestWriter_WriteBatch_ClosedErrors verifies WriteBatch after Close is rejected.
+func TestWriter_WriteBatch_ClosedErrors(t *testing.T) {
+	w, _, _ := newFakeWriter(1000000, nil)
+	require.NoError(t, w.Close())
+	require.ErrorIs(t, w.WriteBatch(context.Background(), makeTestBatch(t, 3)), ErrWriterClosed)
+}
+
+// TestWriter_WriteBatch_SegmentRolling verifies a single batch larger than one
+// segment is split across segments at record boundaries (no record straddles a
+// boundary) and every record remains recoverable in order.
+func TestWriter_WriteBatch_SegmentRolling(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "orders")
+	const maxSeg = 200
+	w, err := NewChannelWriter(channelDir, maxSeg, 1000000, nil, nil)
+	require.NoError(t, err)
+
+	const n = 20
+	require.NoError(t, w.WriteBatch(context.Background(), makeTestBatch(t, n)))
+	require.NoError(t, w.Close())
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Greater(t, len(segs), 1, "a batch over the segment limit must roll")
+	for i := 1; i < len(segs); i++ {
+		expected := segs[i-1].startOffset + segs[i-1].size
+		assert.Equal(t, expected, segs[i].startOffset,
+			"segment %d startOffset must equal previous segment end (no split record)", i)
+	}
+
+	lines := readAllSegments(t, channelDir)
+	require.Len(t, lines, n)
+	for i, line := range lines {
+		assert.Equal(t, fmt.Sprintf("ord-%d", i), orderIDOf(t, line), "record %d out of order", i)
+	}
+}
+
 // ---- additional fake types for doWrite / openActive error-path tests --------
 
 // recoverableFailWriteFile is a fileWriter whose Write returns ENOSPC for the
