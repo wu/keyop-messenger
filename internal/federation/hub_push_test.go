@@ -79,7 +79,7 @@ func openSubscribeReceiver(t *testing.T, stub federationv1.FederationServiceClie
 
 	cw := &captureWriter{}
 	dd, _ := dedup.NewLRUDedup(1000)
-	pr := federation.NewPeerReceiver(stream, cancel, nil, dd, cw.write,
+	pr := federation.NewPeerReceiver(stream, cancel, nil, dd, cw.write, nil,
 		&fakeAuditLog{}, &testutil.FakeLogger{}, peerName, 65536)
 	t.Cleanup(func() { cancel(); pr.Close() })
 	return cw
@@ -437,7 +437,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 
 	cw := &captureWriter{}
 	subDD, _ := dedup.NewLRUDedup(1000)
-	pr := federation.NewPeerReceiver(subStream, subCancel, nil, subDD, cw.write,
+	pr := federation.NewPeerReceiver(subStream, subCancel, nil, subDD, cw.write, nil,
 		&fakeAuditLog{}, &testutil.FakeLogger{}, "audit-peer", 65536)
 	t.Cleanup(func() { subCancel(); pr.Close() })
 

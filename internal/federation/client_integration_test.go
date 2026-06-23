@@ -78,6 +78,7 @@ func newTestClient(log *testutil.FakeLogger, subscribeChannels []string) *Client
 	return NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter
 		dd, &fakeAuditLogger2{}, log,
 		65536,
 		100*time.Millisecond, 500*time.Millisecond, 0.1,
@@ -190,6 +191,7 @@ func TestClient_Dial_WithoutLocalWriter(t *testing.T) {
 	client := NewClient(
 		"sender-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil, // no localWriter
+		nil, // localBatchWriter
 		dd, &fakeAuditLogger2{}, log,
 		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
@@ -227,6 +229,7 @@ func TestClient_Dial_WithSubscriptions(t *testing.T) {
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter
 		dd, &fakeAuditLogger2{}, log,
 		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
@@ -278,7 +281,7 @@ func TestClient_Publish_DeliversFromChannelFile(t *testing.T) {
 	dataDir := t.TempDir()
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
-		nil, dd, &fakeAuditLogger2{}, log,
+		nil, nil, dd, &fakeAuditLogger2{}, log,
 		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
 		nil, []string{"ch"}, dataDir,
@@ -320,7 +323,7 @@ func TestClient_PeerConnected_AuditEvent(t *testing.T) {
 	dd, _ := dedup.NewLRUDedup(100)
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
-		nil, dd, auditL, log,
+		nil, nil, dd, auditL, log,
 		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
 		nil, nil, "",

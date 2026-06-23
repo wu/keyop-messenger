@@ -67,6 +67,7 @@ func newClientWithChannel(t *testing.T, auditL audit.AuditLogger, log *testutil.
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil,
+		nil, // localBatchWriter
 		dd, auditL, log,
 		65536,
 		50*time.Millisecond, 500*time.Millisecond, 0.0,

@@ -262,7 +262,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 		} else {
 			dd, _ := dedup.NewLRUDedup(1024)
 			recv := NewPeerReceiver(subStream, subCancel, nil, dd, c.dispatchEnvelope,
-				noopAuditLogger{}, c.log, hubAddr, c.maxBatchBytes)
+				nil /* no batch writer: ephemeral dispatches in-memory */, noopAuditLogger{}, c.log, hubAddr, c.maxBatchBytes)
 			c.wg.Add(1)
 			go func() {
 				defer c.wg.Done()

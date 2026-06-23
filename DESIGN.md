@@ -367,11 +367,15 @@ Forwarding is independent of whether any local subscriber currently exists for t
 
 Every instance (hub and client alike) maintains an in-memory LRU set of recently-seen message IDs. The set holds the last 100,000 IDs (configurable). TTL-based expiry is not used; the LRU eviction bound is sufficient for the expected message rates.
 
-On receiving a message via federation (PeerReceiver):
+On receiving a batch via federation (PeerReceiver), durable clients use a
+**commit-then-record** ordering so the seen-ID set and the local store never
+disagree:
 
-1. Check the seen-ID set.
-2. If present: discard silently.
-3. If absent: add to set, write to local file, notify local subscribers.
+1. For each record, check the seen-ID set (and the IDs already accepted earlier in this batch). If present, skip it.
+2. Accumulate the survivors and commit them to local storage as one durable unit (a single `WriteBatch`; see §5.2) **before** acking.
+3. Only **after** the commit succeeds, add the committed IDs to the seen-ID set, notify local subscribers, and ack the batch.
+
+The "add" is deliberately deferred until after the commit. If the commit fails, the batch is not acked and the sender resends it from its un-advanced offset (see §6.7); because the IDs were never recorded, the redelivery is not suppressed as a duplicate. The window between accepting and recording widens the duplicate window only across *concurrent* peers receiving the same ID — acceptable, since delivery is at-least-once and the dedup set is a loop/dual-path optimisation, not a correctness guarantee. (Ephemeral clients, which dispatch to in-memory handlers rather than a durable store, use the simpler atomic check-and-add per record.)
 
 On `Publish()` (local origin):
 
@@ -403,6 +407,8 @@ Operation in both directions:
 - Each `channelReader` reads from the segment files starting at its current byte offset, accumulates envelopes up to the configured batch size, and delivers them to the coordinator as one `sendReq`.
 - The coordinator serialises sends across all readers for one connection: one batch is in-flight at a time; the next batch is not sent until the peer acknowledges the current one.
 - After the ack, the reader persists the new byte offset atomically to its offset file. The file is the entire delivery state — there is no in-memory unacked window.
+
+**Receive-side batched commit:** On the receiving end, a durable client commits all accepted records of a wire batch in a single `WriteBatch` (one fsync) and sends the ack only after that commit returns (see §6.6). The ack is therefore never sent ahead of the durable write: the sender advances its offset solely on the ack, so a commit failure (no ack) leaves the sender's offset un-advanced and the whole batch is resent on the next connection. This amortises the per-record fsync across the batch while keeping the at-least-once guarantee strict — the receiver never tells the sender "done" for data it has not durably stored.
 
 **Offset files and compaction:** Both prefixes (`fed-` and `fedout-`) live under `subscribers/{channel}/` and are automatically included in the compactor's minimum-offset boundary calculation. A hub cannot compact past a peer that hasn't acked; a publishing client cannot compact past a hub that hasn't acked. On a colocated relay process (both hub and client roles), the two namespaces coexist without interference.
 

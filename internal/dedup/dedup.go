@@ -30,3 +30,17 @@ func (d *LRUDedup) SeenOrAdd(id string) bool {
 	ok, _ := d.cache.ContainsOrAdd(id, struct{}{})
 	return ok
 }
+
+// Contains reports whether id is already in the set without adding it. Use it
+// with Add when the decision to record an ID must be deferred until after a
+// side effect (e.g. a durable write) succeeds, so a failed-and-retried delivery
+// is not suppressed as a duplicate.
+func (d *LRUDedup) Contains(id string) bool {
+	return d.cache.Contains(id)
+}
+
+// Add records id as seen. It is idempotent and atomic with respect to
+// concurrent callers.
+func (d *LRUDedup) Add(id string) {
+	_ = d.cache.Add(id, struct{}{})
+}

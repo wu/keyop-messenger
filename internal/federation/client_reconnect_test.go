@@ -33,6 +33,7 @@ func newReconnectClient(
 	c := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		nil,
+		nil, // localBatchWriter
 		dd, &fakeAuditLogger2{}, log,
 		65536,
 		reconnBase, reconnMax, jitter,

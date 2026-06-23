@@ -42,6 +42,7 @@ type Client struct {
 	tlsCfg            *tls.Config
 	policy            *AtomicPolicy
 	localWriter       func(*envelope.Envelope) error
+	localBatchWriter  func([]*envelope.Envelope) error
 	dedup             Deduplicator
 	auditL            audit.AuditLogger
 	log               logger
@@ -85,6 +86,7 @@ func NewClient(
 	tlsCfg *tls.Config,
 	policy *AtomicPolicy,
 	localWriter func(*envelope.Envelope) error,
+	localBatchWriter func([]*envelope.Envelope) error,
 	dedup Deduplicator,
 	auditL audit.AuditLogger,
 	log logger,
@@ -101,6 +103,7 @@ func NewClient(
 		tlsCfg:            tlsCfg,
 		policy:            policy,
 		localWriter:       localWriter,
+		localBatchWriter:  localBatchWriter,
 		dedup:             dedup,
 		auditL:            auditL,
 		log:               log,
@@ -176,7 +179,7 @@ func (c *Client) dial(hubAddr string) error {
 		}
 
 		receiver = NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
-			c.auditL, c.log, hubAddr, c.maxBatchBytes)
+			c.localBatchWriter, c.auditL, c.log, hubAddr, c.maxBatchBytes)
 	}
 
 	c.mu.Lock()

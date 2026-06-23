@@ -344,6 +344,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				tlsCfg,
 				policy,
 				m.writeLocalEnvelope,
+				m.writeLocalEnvelopeBatch,
 				dd,
 				auditL,
 				log,
@@ -881,6 +882,47 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 		}
 	}
 
+	return nil
+}
+
+// writeLocalEnvelopeBatch is the federation localBatchWriter callback. It stores
+// a batch of remotely-received envelopes durably as a unit (one fsync per
+// channel group) before the receiver acks the batch, then wakes local
+// subscribers and outbound client peers once per channel. Envelopes are grouped
+// by channel because each WriteBatch targets one channel's segment; federation
+// batches are single-channel today, but grouping keeps this correct regardless.
+//
+// A non-nil error means the batch was not fully committed; the receiver will not
+// ack it, so the sender resends. The LRU dedup is updated by the receiver only
+// after this returns nil, so a resend is not suppressed as a duplicate.
+func (m *Messenger) writeLocalEnvelopeBatch(envs []*envelope.Envelope) error {
+	for i := 0; i < len(envs); {
+		channel := envs[i].Channel
+		j := i + 1
+		for j < len(envs) && envs[j].Channel == channel {
+			j++
+		}
+		group := envs[i:j]
+
+		cs, err := m.getOrCreateChannelState(channel)
+		if err != nil {
+			return err
+		}
+		if err := cs.writer.WriteBatch(context.Background(), group); err != nil {
+			return err
+		}
+		cs.publishCount.Add(int64(len(group)))
+
+		if m.hub != nil {
+			m.hub.NotifyChannel(channel)
+		}
+		for _, c := range m.clients {
+			if c.AllowPublish(channel) {
+				c.NotifyChannel(channel)
+			}
+		}
+		i = j
+	}
 	return nil
 }
 

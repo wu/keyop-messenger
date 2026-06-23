@@ -24,6 +24,17 @@ func (f *fakeAuditLog) Log(ev audit.Event) error {
 	return nil
 }
 func (f *fakeAuditLog) Close() error { return nil }
+func (f *fakeAuditLog) count(name string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, ev := range f.events {
+		if ev.Event == name {
+			n++
+		}
+	}
+	return n
+}
 func (f *fakeAuditLog) has(name string) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -25,7 +25,7 @@ func TestPeerReceiverErr_NilAfterCleanClose(t *testing.T) {
 
 	// Pass stream.cancel so pr.Close() → streamCancel() unblocks stream.Recv().
 	pr := federation.NewPeerReceiver(stream, stream.cancel, policy, dd,
-		func(*envelope.Envelope) error { return nil }, auditL, log, "test-peer", 65536)
+		func(*envelope.Envelope) error { return nil }, nil, auditL, log, "test-peer", 65536)
 
 	pr.Close()
 
@@ -50,7 +50,7 @@ func TestPeerReceiverErr_NonNilAfterStreamClosed(t *testing.T) {
 	auditL := &fakeAuditLog{}
 
 	pr := federation.NewPeerReceiver(stream, stream.cancel, policy, dd,
-		func(*envelope.Envelope) error { return nil }, auditL, log, "test-peer", 65536)
+		func(*envelope.Envelope) error { return nil }, nil, auditL, log, "test-peer", 65536)
 
 	// Abruptly cancel the stream context (simulates server-side close).
 	stream.cancel()
@@ -76,7 +76,7 @@ func TestPeerReceiverErr_SafeBeforeDone(t *testing.T) {
 	auditL := &fakeAuditLog{}
 
 	pr := federation.NewPeerReceiver(stream, stream.cancel, policy, dd,
-		func(*envelope.Envelope) error { return nil }, auditL, log, "test-peer", 65536)
+		func(*envelope.Envelope) error { return nil }, nil, auditL, log, "test-peer", 65536)
 
 	_ = pr.Err()
 

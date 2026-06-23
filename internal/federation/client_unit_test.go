@@ -31,6 +31,7 @@ func TestNewClient_ValidConfig(t *testing.T) {
 		nil, // no TLS
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -57,6 +58,7 @@ func TestNewClient_NoLocalWriter(t *testing.T) {
 		nil,
 		policy,
 		nil, // no localWriter → sender-only mode
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -83,6 +85,7 @@ func TestClient_Close_Idempotent(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -113,6 +116,7 @@ func TestClient_Config_WithTLS(t *testing.T) {
 		tlsCfg,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -139,6 +143,7 @@ func TestClient_Config_WithSubscribeChannels(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -165,6 +170,7 @@ func TestClient_Config_LargeBuffers(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -191,6 +197,7 @@ func TestClient_Config_CustomReconnectParams(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -224,6 +231,7 @@ func TestClient_LocalWriter_Signature(t *testing.T) {
 		nil,
 		policy,
 		localWriter,
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -252,6 +260,7 @@ func TestClient_Deduplicator_Provided(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -282,6 +291,7 @@ func TestClient_Policy_Provided(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -309,6 +319,7 @@ func TestClient_AuditLogger_Provided(t *testing.T) {
 		nil,
 		policy,
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter (per-record path)
 		dedupL,
 		auditL,
 		log,
@@ -334,6 +345,7 @@ func TestClient_StatsAccessors_BeforeConnect(t *testing.T) {
 	client := NewClient(
 		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
 		func(_ *envelope.Envelope) error { return nil },
+		nil, // localBatchWriter
 		dd, &fakeAuditLogger{}, log,
 		65536,
 		500*time.Millisecond, 60*time.Second, 0.2,
