@@ -319,7 +319,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		m.hub = federation.NewHub(
 			hubCfg,
 			tlsCfg,
-			m.writeLocalEnvelope,
+			m.writeLocalEnvelopeBatch,
 			dd,
 			auditL,
 			log,

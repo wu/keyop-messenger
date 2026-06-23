@@ -24,7 +24,7 @@ func newSweepTestHub(t *testing.T, dataDir string) (*Hub, *testutil.FakeLogger) 
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	h := NewHub(HubConfig{}, nil,
-		func(_ *envelope.Envelope) error { return nil },
+		func([]*envelope.Envelope) error { return nil },
 		dd, &fakeAuditLogger{}, log, 100, 65536, dataDir)
 	return h, log
 }

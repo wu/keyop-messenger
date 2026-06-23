@@ -202,9 +202,9 @@ func TestPeerReceiver_Durable_CommitsAndAcks(t *testing.T) {
 	assert.Equal(t, 3, auditL.count(audit.EventForward), "each committed record should be audited")
 }
 
-// TestPeerReceiver_Durable_DedupAfterCommit verifies an ID committed in one
-// batch is suppressed on a later batch (dedup recorded after commit).
-func TestPeerReceiver_Durable_DedupAfterCommit(t *testing.T) {
+// TestPeerReceiver_Durable_DedupSuppressesRepeat verifies an ID committed in one
+// batch is suppressed on a later batch and not committed a second time.
+func TestPeerReceiver_Durable_DedupSuppressesRepeat(t *testing.T) {
 	stream := newMockSubClientStream()
 	defer stream.cancel()
 	bw := &fakeBatchWriter{}

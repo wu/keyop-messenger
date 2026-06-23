@@ -42,8 +42,10 @@ func TestHubServerEnforcesRaisedRecvLimit(t *testing.T) {
 	require.NoError(t, err)
 
 	var written []string
-	writer := func(env *envelope.Envelope) error {
-		written = append(written, env.ID)
+	writer := func(envs []*envelope.Envelope) error {
+		for _, env := range envs {
+			written = append(written, env.ID)
+		}
 		return nil
 	}
 	hub := NewHub(cfg, nil, writer, dd, &fakeAuditLogger2{}, &testutil.FakeLogger{}, 1000, maxBatch, dataDir)

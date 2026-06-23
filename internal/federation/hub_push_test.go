@@ -35,7 +35,7 @@ func newHubWithData(t *testing.T, cfg federation.HubConfig, dataDir string) (*fe
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
 	hub := federation.NewHub(cfg, nil,
-		func(*envelope.Envelope) error { return nil },
+		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 65536, dataDir)
 	return hub, auditL
 }
@@ -254,7 +254,7 @@ func TestHubPushBatchSizeLimit(t *testing.T) {
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
 	hub := federation.NewHub(cfg, nil,
-		func(*envelope.Envelope) error { return nil },
+		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 512, dataDir)
 
 	stub := startHubWithData(t, hub)
@@ -416,7 +416,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 		AllowedPeers: []federation.AllowedPeer{{Name: "audit-peer", Subscribe: []string{"ch"}}},
 	}
 	hub := federation.NewHub(cfg, nil,
-		func(*envelope.Envelope) error { return nil },
+		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, &testutil.FakeLogger{}, 1000, 65536, dataDir)
 
 	stub := startHubWithData(t, hub)

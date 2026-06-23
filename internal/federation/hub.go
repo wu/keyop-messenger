@@ -63,7 +63,7 @@ type Hub struct {
 	federationv1.UnimplementedFederationServiceServer
 
 	tlsCfg             *tls.Config
-	localWriter        func(*envelope.Envelope) error
+	localBatchWriter   func([]*envelope.Envelope) error
 	dedup              Deduplicator
 	auditL             audit.AuditLogger
 	log                logger
@@ -98,7 +98,7 @@ type Hub struct {
 func NewHub(
 	cfg HubConfig,
 	tlsCfg *tls.Config,
-	localWriter func(*envelope.Envelope) error,
+	localBatchWriter func([]*envelope.Envelope) error,
 	dedup Deduplicator,
 	auditL audit.AuditLogger,
 	log logger,
@@ -106,17 +106,17 @@ func NewHub(
 	dataDir string,
 ) *Hub {
 	return &Hub{
-		cfg:            cfg,
-		tlsCfg:         tlsCfg,
-		localWriter:    localWriter,
-		dedup:          dedup,
-		auditL:         auditL,
-		log:            log,
-		sendBufSize:    sendBufSize,
-		maxBatchBytes:  maxBatchBytes,
-		dataDir:        dataDir,
-		notifyRegistry: make(map[string][]*channelReader),
-		stop:           make(chan struct{}),
+		cfg:              cfg,
+		tlsCfg:           tlsCfg,
+		localBatchWriter: localBatchWriter,
+		dedup:            dedup,
+		auditL:           auditL,
+		log:              log,
+		sendBufSize:      sendBufSize,
+		maxBatchBytes:    maxBatchBytes,
+		dataDir:          dataDir,
+		notifyRegistry:   make(map[string][]*channelReader),
+		stop:             make(chan struct{}),
 	}
 }
 
@@ -330,47 +330,17 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 			break
 		}
 
-		var lastID string
-		for _, rec := range batch.Records {
-			env, uErr := envelope.Unmarshal(rec)
-			if uErr != nil {
-				h.log.Error("federation: hub unmarshal", "peer", peerName, "err", uErr)
-				continue
-			}
-
-			if h.dedup.SeenOrAdd(env.ID) {
-				continue
-			}
-
-			if !policy.AllowReceive(env.Channel) {
-				h.log.Warn("federation: receive policy violation",
-					"channel", env.Channel, "peer", peerName, "id", env.ID)
-				_ = h.auditL.Log(audit.Event{
-					Event:     audit.EventPolicyViolation,
-					Channel:   env.Channel,
-					Peer:      peerName,
-					Direction: "inbound",
-					MessageID: env.ID,
-				})
-				lastID = env.ID
-				continue
-			}
-
-			envCopy := env
-			if wErr := h.localWriter(&envCopy); wErr != nil {
-				h.log.Error("federation: hub local write", "id", env.ID, "err", wErr, "channel", env.Channel)
-				lastID = env.ID
-				continue
-			}
-
-			_ = h.auditL.Log(audit.Event{
-				Event:     audit.EventForward,
-				MessageID: env.ID,
-				Channel:   env.Channel,
-				Peer:      peerName,
-				Direction: "inbound",
-			})
-			lastID = env.ID
+		// Commit the batch durably (one fsync) before acking. maxBatchBytes is 0
+		// here: per-record size is already bounded by the gRPC receive frame
+		// limit, so the hub does not additionally skip by batch size on ingest.
+		lastID, commitErr := commitInboundBatch(batch.Records, policy, h.dedup,
+			h.localBatchWriter, h.auditL, h.log, peerName, 0)
+		if commitErr != nil {
+			// Do not ack: the peer's offset stays put and it resends the batch.
+			h.log.Error("federation: hub batch commit failed; not acking, peer will resend",
+				"peer", peerName, "err", commitErr)
+			lastErr = commitErr
+			break
 		}
 
 		if sendErr := stream.Send(&federationv1.PublishAck{LastId: lastID}); sendErr != nil {

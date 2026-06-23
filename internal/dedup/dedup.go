@@ -31,16 +31,11 @@ func (d *LRUDedup) SeenOrAdd(id string) bool {
 	return ok
 }
 
-// Contains reports whether id is already in the set without adding it. Use it
-// with Add when the decision to record an ID must be deferred until after a
-// side effect (e.g. a durable write) succeeds, so a failed-and-retried delivery
-// is not suppressed as a duplicate.
-func (d *LRUDedup) Contains(id string) bool {
-	return d.cache.Contains(id)
-}
-
-// Add records id as seen. It is idempotent and atomic with respect to
-// concurrent callers.
-func (d *LRUDedup) Add(id string) {
-	_ = d.cache.Add(id, struct{}{})
+// Remove deletes id from the set. It rolls back a speculative SeenOrAdd when the
+// work that mark guarded (e.g. a durable batch commit) fails, so the delivery,
+// once retried, is not suppressed as a duplicate. Marking with SeenOrAdd before
+// the commit still atomically suppresses concurrent dual-path arrivals of the
+// same ID; only the failing path un-marks.
+func (d *LRUDedup) Remove(id string) {
+	_ = d.cache.Remove(id)
 }

@@ -48,6 +48,18 @@ func (c *countingWriter) write(_ *envelope.Envelope) error {
 	return nil
 }
 
+// writeBatch adapts the counting writer to the batch localWriter signature,
+// applying the same per-record count and delay so backpressure tests behave
+// identically.
+func (c *countingWriter) writeBatch(envs []*envelope.Envelope) error {
+	for range envs {
+		if err := c.write(nil); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *countingWriter) n() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -59,7 +71,7 @@ func newHub(t *testing.T, cfg federation.HubConfig, cw *countingWriter, auditL a
 	dd, err := dedup.NewLRUDedup(10000)
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
-	return federation.NewHub(cfg, nil, cw.write, dd, auditL, log, 1000, 65536, "")
+	return federation.NewHub(cfg, nil, cw.writeBatch, dd, auditL, log, 1000, 65536, "")
 }
 
 // startHub starts hub on ":0" and returns a connected grpc.ClientConn.
@@ -269,7 +281,7 @@ func TestMTLSRejection(t *testing.T) {
 	auditL := &fakeAuditLog{}
 	log := &testutil.FakeLogger{}
 	hub := federation.NewHub(federation.HubConfig{}, hubTLS,
-		func(*envelope.Envelope) error { return nil }, dd, auditL, log, 100, 65536, "")
+		func([]*envelope.Envelope) error { return nil }, dd, auditL, log, 100, 65536, "")
 	require.NoError(t, hub.Listen("127.0.0.1:0"))
 	defer func() { _ = hub.Close() }()
 
@@ -354,7 +366,7 @@ func TestHubListenError(t *testing.T) {
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub(federation.HubConfig{}, nil, func(*envelope.Envelope) error { return nil },
+	hub := federation.NewHub(federation.HubConfig{}, nil, func([]*envelope.Envelope) error { return nil },
 		dd, auditL, log, 16, 65536, "")
 
 	err = hub.Listen("127.0.0.1:notaport")
