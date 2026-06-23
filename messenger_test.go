@@ -77,6 +77,133 @@ func TestEndToEnd(t *testing.T) {
 	}
 }
 
+// TestPublishBatch_EndToEnd verifies every message in a batch is delivered in
+// order with its fields intact.
+func TestPublishBatch_EndToEnd(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	type Evt struct {
+		N int `json:"n"`
+	}
+	require.NoError(t, m.RegisterPayloadType("test.Evt", Evt{}))
+
+	const n = 20
+	received := make(chan Message, n)
+	require.NoError(t, m.Subscribe(context.Background(), "events", "sub1",
+		func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		}))
+
+	msgs := make([]BatchMessage, n)
+	for i := 0; i < n; i++ {
+		msgs[i] = BatchMessage{PayloadType: "test.Evt", Payload: Evt{N: i}}
+	}
+	require.NoError(t, m.PublishBatch(context.Background(), "events", msgs))
+
+	for i := 0; i < n; i++ {
+		select {
+		case msg := <-received:
+			assert.Equal(t, "events", msg.Channel)
+			assert.Equal(t, "test-instance", msg.Origin)
+			assert.Equal(t, "test.Evt", msg.PayloadType)
+			evt, ok := msg.Payload.(Evt)
+			require.True(t, ok, "payload should be Evt, got %T", msg.Payload)
+			assert.Equal(t, i, evt.N, "message %d delivered out of order", i)
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d batched messages delivered", i, n)
+		}
+	}
+}
+
+// TestPublishBatch_MixedTypes verifies a single batch can carry different
+// payload types on the same channel, each decoded to its registered prototype.
+func TestPublishBatch_MixedTypes(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	type Alert struct {
+		Level string `json:"level"`
+	}
+	type Metric struct {
+		V float64 `json:"v"`
+	}
+	require.NoError(t, m.RegisterPayloadType("test.Alert", Alert{}))
+	require.NoError(t, m.RegisterPayloadType("test.Metric", Metric{}))
+
+	received := make(chan Message, 3)
+	require.NoError(t, m.Subscribe(context.Background(), "events", "sub1",
+		func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		}))
+
+	require.NoError(t, m.PublishBatch(context.Background(), "events", []BatchMessage{
+		{PayloadType: "test.Alert", Payload: Alert{Level: "warn"}},
+		{PayloadType: "test.Metric", Payload: Metric{V: 0.5}},
+		{PayloadType: "test.Alert", Payload: Alert{Level: "crit"}},
+	}))
+
+	want := []struct {
+		typ string
+		val any
+	}{
+		{"test.Alert", Alert{Level: "warn"}},
+		{"test.Metric", Metric{V: 0.5}},
+		{"test.Alert", Alert{Level: "crit"}},
+	}
+	for i, w := range want {
+		select {
+		case msg := <-received:
+			assert.Equal(t, w.typ, msg.PayloadType, "message %d type", i)
+			assert.Equal(t, w.val, msg.Payload, "message %d payload", i)
+		case <-time.After(time.Second):
+			t.Fatalf("only %d of %d mixed-type messages delivered", i, len(want))
+		}
+	}
+}
+
+// TestPublishBatch_Empty verifies an empty batch is a no-op that delivers nothing.
+func TestPublishBatch_Empty(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	delivered := make(chan struct{}, 1)
+	require.NoError(t, m.Subscribe(context.Background(), "events", "sub1",
+		func(_ context.Context, _ Message) error {
+			delivered <- struct{}{}
+			return nil
+		}))
+
+	require.NoError(t, m.PublishBatch(context.Background(), "events", nil))
+	require.NoError(t, m.PublishBatch(context.Background(), "events", []BatchMessage{}))
+
+	time.Sleep(150 * time.Millisecond)
+	assert.Empty(t, delivered, "empty batch must deliver nothing")
+}
+
+// TestPublishBatch_Guards verifies PublishBatch enforces the same channel-name
+// and closed-messenger guards as Publish.
+func TestPublishBatch_Guards(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, m.PublishBatch(context.Background(), "bad name",
+		[]BatchMessage{{PayloadType: "test.T", Payload: 1}}), ErrInvalidChannelName)
+
+	require.NoError(t, m.Close())
+	require.ErrorIs(t, m.PublishBatch(context.Background(), "ch",
+		[]BatchMessage{{PayloadType: "test.T", Payload: 1}}), ErrMessengerClosed)
+}
+
 // TestAtLeastOnce verifies that a restarted subscriber resumes from its
 // persisted offset and does not replay already-delivered messages.
 func TestAtLeastOnce(t *testing.T) {

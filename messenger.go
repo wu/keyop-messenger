@@ -467,6 +467,88 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	return nil
 }
 
+// BatchMessage is one message in a PublishBatch. All messages in a batch are
+// published to the same channel, but each carries its own payload type — a
+// channel commonly carries several event types (alerts, metrics, status).
+type BatchMessage struct {
+	// PayloadType is the type discriminator for Payload, e.g.
+	// "com.keyop.orders.OrderCreated". Reverse-DNS format is recommended.
+	PayloadType string
+	// Payload is any JSON-serialisable value.
+	Payload any
+}
+
+// PublishBatch creates an envelope for each message and writes them all to
+// channel's storage as a single durable unit: one fsync and one subscriber
+// notification cover the whole batch (when sync_interval_ms=0), amortising the
+// per-message fsync cost. Every message goes to the same channel but may carry
+// a different payload type; message order is preserved.
+//
+// PublishBatch blocks until the whole batch is durably committed. The return
+// contract matches Publish: nil means every message was committed; a non-nil
+// error means the batch was not fully committed and may be safely retried. A
+// retry may duplicate the record-aligned prefix that reached disk before a
+// failure, consistent with at-least-once delivery. An empty batch is a no-op.
+//
+// Outbound delivery to configured client hubs continues asynchronously from the
+// channel file, exactly as for Publish.
+func (m *Messenger) PublishBatch(ctx context.Context, channel string, msgs []BatchMessage) error {
+	if err := ValidateChannelName(channel); err != nil {
+		return err
+	}
+	if m.isClosed() {
+		return ErrMessengerClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("publish batch %q: %w", channel, err)
+	}
+	if len(msgs) == 0 {
+		return nil
+	}
+
+	cs, err := m.getOrCreateChannelState(channel)
+	if err != nil {
+		return fmt.Errorf("publish batch %q: %w", channel, err)
+	}
+
+	// Correlation ID and service name are stamped once from the context and
+	// shared by every envelope in the batch.
+	correlationID := CorrelationIDFromContext(ctx)
+	serviceName := ServiceNameFromContext(ctx)
+
+	envs := make([]*envelope.Envelope, 0, len(msgs))
+	for _, msg := range msgs {
+		env, err := envelope.NewEnvelope(channel, m.name, msg.PayloadType, msg.Payload)
+		if err != nil {
+			return fmt.Errorf("publish batch %q: create envelope: %w", channel, err)
+		}
+		env.CorrelationID = correlationID
+		env.ServiceName = serviceName
+		// Mark in dedup so that if this message returns via federation it is
+		// recognised as already seen and not re-delivered locally.
+		m.dedup.SeenOrAdd(env.ID)
+		envs = append(envs, &env)
+	}
+
+	if err := cs.writer.WriteBatch(ctx, envs); err != nil {
+		return fmt.Errorf("publish batch %q: write: %w", channel, err)
+	}
+	cs.publishCount.Add(int64(len(envs)))
+
+	// One notification per batch wakes local subscribers and outbound readers;
+	// each drains all newly-available records on the next read.
+	if m.hub != nil {
+		m.hub.NotifyChannel(channel)
+	}
+	for _, c := range m.clients {
+		if c.AllowPublish(channel) {
+			c.NotifyChannel(channel)
+		}
+	}
+
+	return nil
+}
+
 // Subscribe registers handler for all new messages on channel. Delivery is
 // at-least-once: the handler may be called again for the same message after a
 // restart. The goroutine runs until ctx is cancelled or Unsubscribe is called.
