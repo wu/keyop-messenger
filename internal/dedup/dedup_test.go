@@ -58,6 +58,28 @@ func TestLRUDedup_Race(t *testing.T) {
 	wg.Wait()
 }
 
+func TestLRUDedup_Remove(t *testing.T) {
+	d, err := NewLRUDedup(100)
+	require.NoError(t, err)
+
+	// Mark an ID seen, then remove it: a subsequent SeenOrAdd must treat it as
+	// new (false), proving the speculative mark was rolled back.
+	require.False(t, d.SeenOrAdd("id-1"))
+	require.True(t, d.SeenOrAdd("id-1"), "precondition: id-1 is marked seen")
+	d.Remove("id-1")
+	assert.False(t, d.SeenOrAdd("id-1"), "after Remove, id-1 must be treated as new")
+}
+
+func TestLRUDedup_RemoveAbsentIsNoOp(t *testing.T) {
+	d, err := NewLRUDedup(100)
+	require.NoError(t, err)
+
+	// Removing an ID that was never added must not panic or affect other IDs.
+	d.Remove("never-added")
+	require.False(t, d.SeenOrAdd("id-2"))
+	assert.True(t, d.SeenOrAdd("id-2"), "unrelated IDs unaffected by removing an absent one")
+}
+
 func BenchmarkSeenOrAdd(b *testing.B) {
 	d, err := NewLRUDedup(100_000)
 	require.NoError(b, err)

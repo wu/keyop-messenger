@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -255,4 +256,44 @@ func TestKeygenInspect_NotPEM(t *testing.T) {
 	out, err := runCmd("keygen", "inspect", junk)
 	require.Error(t, err)
 	assert.Contains(t, out+err.Error(), "no PEM block")
+}
+
+func TestDescribeExpiry(t *testing.T) {
+	now := time.Now()
+	tests := []struct {
+		name     string
+		notAfter time.Time
+		want     string
+	}{
+		{"days in future", now.Add(10 * 24 * time.Hour), "expires in 9 day(s)"},
+		{"within a day", now.Add(2 * time.Hour), "expires in 2h0m0s"},
+		{"expired days ago", now.Add(-10 * 24 * time.Hour), "EXPIRED 10 day(s) ago"},
+		{"expired within a day", now.Add(-2 * time.Hour), "EXPIRED 2h0m0s ago"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Contains(t, describeExpiry(tc.notAfter), tc.want)
+		})
+	}
+}
+
+func TestExtKeyUsageLabel(t *testing.T) {
+	tests := []struct {
+		usage x509.ExtKeyUsage
+		want  string
+	}{
+		{x509.ExtKeyUsageAny, "any"},
+		{x509.ExtKeyUsageServerAuth, "serverAuth"},
+		{x509.ExtKeyUsageClientAuth, "clientAuth"},
+		{x509.ExtKeyUsageCodeSigning, "codeSigning"},
+		{x509.ExtKeyUsageEmailProtection, "emailProtection"},
+		{x509.ExtKeyUsageTimeStamping, "timeStamping"},
+		{x509.ExtKeyUsageOCSPSigning, "ocspSigning"},
+		{x509.ExtKeyUsageIPSECTunnel, "eku(6)"}, // niche EKU falls through to default
+	}
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			assert.Equal(t, tc.want, extKeyUsageLabel(tc.usage))
+		})
+	}
 }

@@ -419,6 +419,65 @@ func TestHotReloadTLS(t *testing.T) {
 	t.Fatal("TLS config was not reloaded within 1 second")
 }
 
+// ---- ExtractLocalCN ----------------------------------------------------------
+
+func TestExtractLocalCN(t *testing.T) {
+	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
+	require.NoError(t, err)
+	certPEM, keyPEM, err := tlsutil.GenerateInstance(caCertPEM, caKeyPEM, "hub-cn", 90)
+	require.NoError(t, err)
+
+	cert, err := tls.X509KeyPair(certPEM, keyPEM)
+	require.NoError(t, err)
+
+	cn, err := tlsutil.ExtractLocalCN(&tls.Config{Certificates: []tls.Certificate{cert}}) //nolint:gosec // MinVersion irrelevant: not used for a handshake
+	require.NoError(t, err)
+	assert.Equal(t, "hub-cn", cn)
+}
+
+func TestExtractLocalCN_NilConfig(t *testing.T) {
+	_, err := tlsutil.ExtractLocalCN(nil)
+	assert.Error(t, err)
+}
+
+func TestExtractLocalCN_NoCertificates(t *testing.T) {
+	_, err := tlsutil.ExtractLocalCN(&tls.Config{}) //nolint:gosec // MinVersion irrelevant: not used for a handshake
+	assert.Error(t, err)
+}
+
+func TestExtractLocalCN_NoDERBytes(t *testing.T) {
+	cfg := &tls.Config{Certificates: []tls.Certificate{{}}} //nolint:gosec // MinVersion irrelevant: not used for a handshake
+	_, err := tlsutil.ExtractLocalCN(cfg)
+	assert.Error(t, err)
+}
+
+func TestExtractLocalCN_UnparseableDER(t *testing.T) {
+	cfg := &tls.Config{ //nolint:gosec // MinVersion irrelevant: not used for a handshake
+		Certificates: []tls.Certificate{{Certificate: [][]byte{[]byte("not-a-cert")}}},
+	}
+	_, err := tlsutil.ExtractLocalCN(cfg)
+	assert.Error(t, err)
+}
+
+func TestExtractLocalCN_EmptyCN(t *testing.T) {
+	// Build a self-signed cert with an empty Common Name to exercise the
+	// "empty CN" branch that GenerateInstance can never produce.
+	key, err := ecdsa.GenerateKey(elliptic.P256(), randReader())
+	require.NoError(t, err)
+	tmpl := &x509.Certificate{
+		SerialNumber: mustSerial(t),
+		Subject:      pkixName(""), // empty CN
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(randReader(), tmpl, tmpl, &key.PublicKey, key)
+	require.NoError(t, err)
+
+	cfg := &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}}}} //nolint:gosec // MinVersion irrelevant: not used for a handshake
+	_, err = tlsutil.ExtractLocalCN(cfg)
+	assert.Error(t, err)
+}
+
 func TestHotReloadTLSClose(t *testing.T) {
 	dir := t.TempDir()
 	caCertPEM, caKeyPEM, err := tlsutil.GenerateCA(365)
