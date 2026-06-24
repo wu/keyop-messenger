@@ -1,3 +1,10 @@
+## [1.17.0](https://github.com/wu/keyop-messenger/compare/v1.16.0...v1.17.0) (2026-06-24)
+
+### Features
+
+* **federation:** add inbound hub-side metrics to Stats() ([7bea19f](https://github.com/wu/keyop-messenger/commit/7bea19fb89c3b93e60068ae5604ec5cd4c552e97))
+* **federation:** declare client publish channels to the hub ([8440e40](https://github.com/wu/keyop-messenger/commit/8440e407d0b0dcbce5f58a99d2c9a33d50606bcc))
+
 ## [1.16.0](https://github.com/wu/keyop-messenger/compare/v1.15.1...v1.16.0) (2026-06-23)
 
 ### Features
