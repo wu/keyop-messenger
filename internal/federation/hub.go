@@ -49,6 +49,37 @@ type logger interface {
 
 const wireVersion = "1"
 
+// mdPublishChannelsKey is the gRPC metadata header on a Publish stream that
+// carries the channels a client declares it publishes. It is advisory: the hub
+// records it for observability but continues to enforce the configured publish
+// allowlist on every message.
+const mdPublishChannelsKey = "x-federation-publish-channels"
+
+// publishChannelsFromContext extracts the publish channels a client declared via
+// the mdPublishChannelsKey metadata header. It returns nil when the peer did not
+// declare any (for example an older client), so callers can fall back to the
+// configured allowlist.
+func publishChannelsFromContext(ctx context.Context) []string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return nil
+	}
+	vals := md.Get(mdPublishChannelsKey)
+	if len(vals) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(vals))
+	for _, v := range vals {
+		if v != "" {
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // Hub accepts incoming gRPC connections and enforces the allowlist and receive
 // policy. Hub-to-peer delivery uses a file-reader pull model: one channelReader
 // goroutine per (peer, channel) reads segment files and delivers batches via a
@@ -310,11 +341,19 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 	policy := NewAtomicPolicy(ForwardPolicy{Receive: pubChannels})
 	peerAddr := peerAddrFromContext(stream.Context())
 
+	// Report the channels the client declared it publishes; fall back to the
+	// configured allowlist when the peer declared none (e.g. an older client).
+	// Enforcement above is unaffected — it always uses the allowlist.
+	reportedPubChannels := publishChannelsFromContext(stream.Context())
+	if len(reportedPubChannels) == 0 {
+		reportedPubChannels = pubChannels
+	}
+
 	_ = h.auditL.Log(audit.Event{
 		Event:    audit.EventClientConnected,
 		Peer:     peerName,
 		PeerAddr: peerAddr,
-		Detail:   connDetail(peerAddr, nil, pubChannels),
+		Detail:   connDetail(peerAddr, nil, reportedPubChannels),
 	})
 	h.log.Info("federation: hub accepted publish connection", "peer", peerName, "addr", peerAddr)
 

@@ -17,6 +17,7 @@ import (
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // fakeAuditLogger2 for client tests (unexported; used across client test files).
@@ -311,6 +312,50 @@ func TestClient_Publish_DeliversFromChannelFile(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	assert.ElementsMatch(t, sentIDs, received[:len(sentIDs)])
+}
+
+// TestClient_Publish_DeclaresChannels verifies that a client attaches its
+// configured publish channels as metadata on the Publish stream so the hub can
+// record them.
+func TestClient_Publish_DeclaresChannels(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+
+	gotCh := make(chan []string, 1)
+	srv := &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			md, _ := metadata.FromIncomingContext(stream.Context())
+			select {
+			case gotCh <- md.Get("x-federation-publish-channels"):
+			default:
+			}
+			for {
+				if _, err := stream.Recv(); err != nil {
+					return nil
+				}
+			}
+		},
+	}
+	addr := startMockServer(t, srv)
+
+	dd, _ := dedup.NewLRUDedup(100)
+	client := NewClient(
+		"test-client", nil, NewAtomicPolicy(ForwardPolicy{}),
+		nil, nil, dd, &fakeAuditLogger2{}, log,
+		65536,
+		500*time.Millisecond, 60*time.Second, 0.2,
+		nil, []string{"events", "orders"}, "",
+	)
+	defer client.Close()
+
+	require.NoError(t, client.Dial(addr))
+
+	select {
+	case declared := <-gotCh:
+		assert.ElementsMatch(t, []string{"events", "orders"}, declared)
+	case <-time.After(2 * time.Second):
+		t.Fatal("hub did not receive publish-channel declaration")
+	}
 }
 
 func TestClient_PeerConnected_AuditEvent(t *testing.T) {

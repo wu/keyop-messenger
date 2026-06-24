@@ -136,9 +136,18 @@ func (c *Client) dial(hubAddr string) error {
 	stub := federationv1.NewFederationServiceClient(conn)
 	outMD := metadata.Pairs("x-federation-instance", c.instanceName)
 
-	// Open the Publish stream.
+	// Open the Publish stream, declaring the channels this client publishes so the
+	// hub can record and surface them. This is advisory metadata; the hub still
+	// enforces its own allowlist per message.
+	pubMD := outMD
+	if len(c.publishChannels) > 0 {
+		pubMD = outMD.Copy()
+		for _, ch := range c.publishChannels {
+			pubMD.Append(mdPublishChannelsKey, ch)
+		}
+	}
 	pubCtx, pubCancel := context.WithCancel(c.stopCtx)
-	pubStream, err := stub.Publish(metadata.NewOutgoingContext(pubCtx, outMD))
+	pubStream, err := stub.Publish(metadata.NewOutgoingContext(pubCtx, pubMD))
 	if err != nil {
 		pubCancel()
 		return fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, err)

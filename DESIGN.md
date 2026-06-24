@@ -286,6 +286,7 @@ service FederationService {
 - Client streams `PublishBatch` frames (one or more serialised envelopes per frame).
 - Hub streams `PublishAck` frames back, one per received batch.
 - The hub extracts the client's identity from the TLS peer certificate CN. For plain (test-only) connections, identity falls back to the `x-federation-instance` gRPC metadata key.
+- The client declares the channels it publishes via the `x-federation-publish-channels` gRPC metadata header (one value per channel), set from its configured `publish` list. This is **advisory** — used by the hub for observability (audit detail and hub stats), not for enforcement. The header is optional: a client that omits it (e.g. an older build) is reported using the hub's `publish` allowlist instead. Because the stock client only builds outbound readers for its configured `publish` channels, the declared set always equals the set it actually forwards; the two cannot drift for a conforming client.
 
 **Subscribe RPC** — carries messages from hub to client:
 - The client sends a single `SubscribeRequest` as the first frame, declaring the channel list it wants to receive. Client identity is carried in the `x-federation-instance` gRPC metadata header (same as Publish) and validated against the TLS cert CN; it is not part of the request body.
@@ -358,6 +359,8 @@ hub:
 An empty `subscribe` list means the peer may request any channel. An empty `publish` list means the peer may send messages on any channel. Non-empty lists act as allowlists; the hub silently restricts to the intersection.
 
 The `publish` allowlist is an inbound filter: if a peer sends a message on a channel not in the list, the message is discarded and recorded in the audit log as a policy violation. This is a defense-in-depth measure against peer misconfiguration.
+
+The `publish` allowlist is the **sole** authority for what the hub accepts. The client's `x-federation-publish-channels` declaration (see §6.2) is never used for enforcement: a message on a channel the client did not declare is still accepted if and only if the `publish` allowlist permits it. A non-conforming client could therefore publish an undeclared-but-allowlisted channel, in which case the declaration understates actual traffic; this is an observability inaccuracy, not an authorization gap. Enforcing the declaration (rejecting undeclared channels, or failing fast when the declared set and the allowlist are disjoint) is intentionally **not** done today.
 
 #### 6.5.3 General Notes
 
