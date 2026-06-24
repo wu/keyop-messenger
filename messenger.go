@@ -118,6 +118,9 @@ type DiagnosticStats struct {
 	UnmarshalSkipped int64 // lines that failed envelope.Unmarshal (offset still advanced)
 	DecodeSkipped    int64 // payloads that failed reg.Decode (offset still advanced)
 	OversizedSkipped int64 // records larger than maxLineSize (offset still advanced)
+	CompactionDrops  int64 // messages permanently dropped by retention before delivery (data loss)
+	RetryLaterPauses int64 // delivery pauses because the downstream handler asked to retry later (backpressure)
+	StartupSkipped   int64 // bytes skipped on startup because the stored offset predated retention (informational)
 	CurrentOffset    int64 // subscriber's in-memory cursor
 	FlushedOffset    int64 // subscriber's on-disk cursor
 }
@@ -150,6 +153,9 @@ func (m *Messenger) DiagnosticStats(channel, subscriberID string) DiagnosticStat
 		UnmarshalSkipped: subStats.UnmarshalSkipped,
 		DecodeSkipped:    subStats.DecodeSkipped,
 		OversizedSkipped: subStats.OversizedSkipped,
+		CompactionDrops:  subStats.CompactionDrops,
+		RetryLaterPauses: subStats.RetryLaterPauses,
+		StartupSkipped:   subStats.StartupSkippedBytes,
 		CurrentOffset:    subStats.CurrentOffset,
 		FlushedOffset:    subStats.FlushedOffset,
 	}
@@ -765,7 +771,19 @@ func (m *Messenger) Stats() Stats {
 			if lag < 0 {
 				lag = 0
 			}
-			subs = append(subs, SubscriberStats{ID: id, LagBytes: lag})
+			// When the subscriber is behind, read the timestamp of the record it is
+			// parked on to expose time-based lag (byte lag alone hides a slow or
+			// stalled consumer on a low-rate channel). Best-effort: log and skip on error.
+			var oldestMs int64
+			if off < streamEnd {
+				if ts, ok, terr := storage.OldestPendingTimestamp(m.channelDir(name), off); terr != nil {
+					m.log.Warn("stats: read oldest pending timestamp",
+						"channel", name, "subscriber", id, "err", terr)
+				} else if ok {
+					oldestMs = ts.UnixMilli()
+				}
+			}
+			subs = append(subs, SubscriberStats{ID: id, LagBytes: lag, OldestPendingUnixMs: oldestMs})
 		}
 		cs.mu.RUnlock()
 

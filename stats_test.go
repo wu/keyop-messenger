@@ -2,6 +2,7 @@ package messenger
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,11 +79,72 @@ func TestStats_SubscriberLagAfterDelivery(t *testing.T) {
 		s := m.Stats()
 		for _, c := range s.Channels {
 			if c.Channel == "events" && len(c.Subscribers) == 1 {
-				return c.Subscribers[0].LagBytes == 0
+				// A caught-up subscriber has no byte lag and no oldest-pending record.
+				return c.Subscribers[0].LagBytes == 0 && c.Subscribers[0].OldestPendingUnixMs == 0
 			}
 		}
 		return false
 	}, 2*time.Second, 10*time.Millisecond, "subscriber lag should reach zero after delivery")
+}
+
+// TestStats_OldestPendingWhileBehind verifies that a subscriber parked on an
+// undelivered message reports that message's publish timestamp as the oldest
+// pending, so time-based lag is observable even when byte lag is small.
+func TestStats_OldestPendingWhileBehind(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// The handler parks on the first message so the subscriber's offset never
+	// advances; release is closed in cleanup so Close() does not hang.
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+
+	entered := make(chan struct{}, 1)
+	require.NoError(t, m.Subscribe(context.Background(), "events", "sub1",
+		func(_ context.Context, _ Message) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		}))
+
+	before := time.Now().UnixMilli()
+	require.NoError(t, m.Publish(context.Background(), "events", "test.E", map[string]any{"v": 1}))
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler not entered within 2s")
+	}
+	after := time.Now().UnixMilli()
+
+	// While the handler is parked the subscriber stays behind.
+	require.Eventually(t, func() bool {
+		for _, c := range m.Stats().Channels {
+			if c.Channel == "events" && len(c.Subscribers) == 1 {
+				return c.Subscribers[0].LagBytes > 0
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "subscriber should be behind while handler is parked")
+
+	var sub *SubscriberStats
+	for _, c := range m.Stats().Channels {
+		if c.Channel == "events" && len(c.Subscribers) == 1 {
+			s := c.Subscribers[0]
+			sub = &s
+		}
+	}
+	require.NotNil(t, sub)
+	assert.GreaterOrEqual(t, sub.OldestPendingUnixMs, before,
+		"oldest pending should be at or after the publish time")
+	assert.LessOrEqual(t, sub.OldestPendingUnixMs, after,
+		"oldest pending should be at or before the handler entered")
 }
 
 func TestStats_MultipleChannels(t *testing.T) {

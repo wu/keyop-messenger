@@ -2,6 +2,8 @@ package messenger
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,4 +72,39 @@ func TestDiagnosticStats_HappyPath(t *testing.T) {
 	assert.GreaterOrEqual(t, stats.NotifySent, int64(1))
 	assert.GreaterOrEqual(t, stats.CurrentOffset, stats.FlushedOffset,
 		"in-memory cursor should be at or ahead of the on-disk cursor")
+
+	// A clean delivery loses nothing and skips nothing.
+	assert.Zero(t, stats.CompactionDrops, "no messages should be dropped by retention")
+	assert.Zero(t, stats.StartupSkipped, "nothing should be skipped on a fresh subscriber")
+}
+
+// TestDiagnosticStats_RetryLaterPauses verifies the RetryLaterPauses counter is
+// plumbed from the storage subscriber through to the public snapshot when the
+// handler signals a transient downstream failure.
+func TestDiagnosticStats_RetryLaterPauses(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	const failTimes = 2
+	var calls atomic.Int64
+	require.NoError(t, m.Subscribe(context.Background(), "orders", "sub1",
+		func(_ context.Context, _ Message) error {
+			if calls.Add(1) <= failTimes {
+				// Transient failure (wrapped, to prove errors.Is works through the stack).
+				return fmt.Errorf("downstream unavailable: %w", ErrRetryLater)
+			}
+			return nil
+		}))
+
+	require.NoError(t, m.Publish(context.Background(), "orders", "test.Evt",
+		map[string]any{"x": 1}))
+
+	var stats DiagnosticStats
+	require.Eventually(t, func() bool {
+		stats = m.DiagnosticStats("orders", "sub1")
+		return stats.RetryLaterPauses >= int64(failTimes) && stats.Dispatched >= 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"RetryLaterPauses did not surface in the snapshot: %+v", stats)
 }

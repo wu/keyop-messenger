@@ -35,6 +35,13 @@ type SubscriberStats struct {
 	// LagBytes is the number of unread bytes between this subscriber's current
 	// position and the end of the channel stream.
 	LagBytes int64
+	// OldestPendingUnixMs is the publish timestamp (Unix milliseconds, UTC) of the
+	// oldest message this subscriber has not yet consumed — the record sitting at
+	// its current offset. It is 0 when the subscriber is caught up, or when the
+	// timestamp could not be read. Callers compute the actual age as now minus this
+	// value; doing the subtraction at display time keeps it correct between polls
+	// and avoids baking hub/consumer clock skew into a server-side number.
+	OldestPendingUnixMs int64
 }
 
 // FederationStats holds metrics for federation: outbound hub connections and,

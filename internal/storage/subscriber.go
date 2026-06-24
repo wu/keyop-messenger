@@ -418,6 +418,56 @@ func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, 
 	return false, pos, nil
 }
 
+// OldestPendingTimestamp returns the publish timestamp of the single record at
+// the given global byte offset — the oldest message not yet consumed by a
+// subscriber parked there. ok is false when no record exists at offset: the
+// subscriber is caught up (offset == stream end) or the offset fell outside the
+// surviving segments after compaction. It is best-effort; a read or parse error
+// is returned so the caller can log and fall back to "unknown".
+func OldestPendingTimestamp(channelDir string, offset int64) (time.Time, bool, error) {
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	for _, seg := range segs {
+		// The record at `offset` lives in the segment whose half-open byte range
+		// [startOffset, startOffset+size) contains it.
+		if offset < seg.startOffset || offset >= seg.startOffset+seg.size {
+			continue
+		}
+		return readTimestampAt(seg, offset)
+	}
+	return time.Time{}, false, nil
+}
+
+// readTimestampAt reads the one record beginning at the given global offset
+// within seg and returns its envelope timestamp.
+func readTimestampAt(seg segmentInfo, offset int64) (time.Time, bool, error) {
+	f, err := os.Open(seg.path)
+	if err != nil {
+		return time.Time{}, false, err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := f.Seek(offset-seg.startOffset, io.SeekStart); err != nil {
+		return time.Time{}, false, err
+	}
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
+	scanner.Split(scanCompleteLines)
+	if scanner.Scan() {
+		env, uerr := envelope.Unmarshal(scanner.Bytes())
+		if uerr != nil {
+			return time.Time{}, false, uerr
+		}
+		return env.Ts, true, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return time.Time{}, false, err
+	}
+	return time.Time{}, false, nil // no complete record at offset
+}
+
 // processAvailable reads all complete lines across all segment files starting
 // from the subscriber's current global offset and dispatches them.
 func (s *Subscriber) processAvailable(handler HandlerFunc) {
