@@ -19,6 +19,7 @@ func TestStats_Empty(t *testing.T) {
 	s := m.Stats()
 	assert.Empty(t, s.Channels)
 	assert.Empty(t, s.Federation.Clients)
+	assert.Nil(t, s.Federation.Hub, "local-only instance should not report hub stats")
 }
 
 func TestStats_ChannelStreamBytes(t *testing.T) {

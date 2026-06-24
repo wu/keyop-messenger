@@ -47,3 +47,87 @@ func TestStats_FederationClients(t *testing.T) {
 	assert.True(t, cs.Connected)
 	assert.Zero(t, cs.ReconnectCount)
 }
+
+// TestStats_HubInbound verifies that a hub instance surfaces inbound, hub-side
+// metrics: an active publish stream, committed records, and accept counts.
+func TestStats_HubInbound(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			AllowedPeers: []AllowedPeer{{Name: "client-a"}},
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	// A hub with no connections still reports a non-nil, listening Hub snapshot.
+	pre := hubM.Stats()
+	require.NotNil(t, pre.Federation.Hub)
+	assert.True(t, pre.Federation.Hub.Listening)
+	assert.Empty(t, pre.Federation.Hub.Peers)
+
+	clientM := newClientMessengerWithPolicy(t, "client-a", dir, caFile,
+		certFor("client-a"), keyFor("client-a"), hubAddr,
+		nil, []string{"events"},
+	)
+
+	require.NoError(t, clientM.Publish(context.Background(), "events", "test.E", map[string]any{"v": 1}))
+
+	// The hub should register an inbound publish stream and commit the record.
+	require.Eventually(t, func() bool {
+		hub := hubM.Stats().Federation.Hub
+		return hub != nil && hub.PublishConns >= 1 && hub.RecordsReceived >= 1
+	}, 3*time.Second, 50*time.Millisecond, "hub did not record inbound publish")
+
+	hub := hubM.Stats().Federation.Hub
+	require.NotNil(t, hub)
+	assert.True(t, hub.Listening)
+	assert.Equal(t, hubM.HubAddr(), hub.Addr)
+	assert.GreaterOrEqual(t, hub.ConnectionsAccepted, int64(1))
+	assert.Zero(t, hub.ConnectionsRejected)
+	assert.GreaterOrEqual(t, hub.BatchesReceived, int64(1))
+
+	var found bool
+	for _, p := range hub.Peers {
+		if p.Peer == "client-a" && p.Kind == "publish" {
+			found = true
+			// The client declares its publish channels via metadata, so the hub
+			// reports them even though the hub has no publish allowlist for the peer.
+			assert.Equal(t, []string{"events"}, p.Channels)
+			assert.False(t, p.ConnectedAt.IsZero())
+		}
+	}
+	assert.True(t, found, "expected an inbound publish peer for client-a")
+}
+
+// TestStats_HubRejectsUnknownPeer verifies that a peer outside the allowlist
+// increments the hub's ConnectionsRejected counter.
+func TestStats_HubRejectsUnknownPeer(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "intruder")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			AllowedPeers: []AllowedPeer{{Name: "client-a"}}, // "intruder" not allowed
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	intruder := newClientMessengerWithPolicy(t, "intruder", dir, caFile,
+		certFor("intruder"), keyFor("intruder"), hubAddr,
+		nil, []string{"events"},
+	)
+	// The publish stream will be refused by the allowlist; the error surfaces
+	// asynchronously, so drive traffic and poll the reject counter.
+	_ = intruder.Publish(context.Background(), "events", "test.E", map[string]any{"v": 1})
+
+	require.Eventually(t, func() bool {
+		hub := hubM.Stats().Federation.Hub
+		return hub != nil && hub.ConnectionsRejected >= 1
+	}, 3*time.Second, 50*time.Millisecond, "hub did not record a rejected connection")
+
+	assert.Zero(t, hubM.Stats().Federation.Hub.PublishConns)
+}

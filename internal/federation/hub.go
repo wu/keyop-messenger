@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
@@ -123,6 +124,17 @@ type Hub struct {
 	// and skips Add(1), preventing the Add/Wait data race on the WaitGroup.
 	handlerGateMu     sync.Mutex
 	handlerGateClosed bool
+
+	// Inbound metrics for Stats(). connMu guards the active-connection registry;
+	// the counters are atomic and updated from the Publish/Subscribe handlers.
+	connMu     sync.Mutex
+	conns      map[int64]*hubConn
+	nextConnID int64
+
+	recordsReceived     atomic.Int64
+	batchesReceived     atomic.Int64
+	connectionsAccepted atomic.Int64
+	connectionsRejected atomic.Int64
 }
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
@@ -147,6 +159,7 @@ func NewHub(
 		maxBatchBytes:    maxBatchBytes,
 		dataDir:          dataDir,
 		notifyRegistry:   make(map[string][]*channelReader),
+		conns:            make(map[int64]*hubConn),
 		stop:             make(chan struct{}),
 	}
 }
@@ -332,6 +345,7 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 	h.mu.RUnlock()
 
 	if !cfg.IsPeerAllowed(peerName) {
+		h.connectionsRejected.Add(1)
 		_ = h.auditL.Log(audit.Event{Event: audit.EventClientRejected, Peer: peerName})
 		h.log.Warn("federation: hub rejected publish connection", "peer", peerName)
 		return status.Errorf(codes.PermissionDenied, "not in allowlist")
@@ -358,6 +372,16 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 	h.log.Info("federation: hub accepted publish connection", "peer", peerName, "addr", peerAddr)
 
 	connectedAt := time.Now()
+	h.connectionsAccepted.Add(1)
+	connID := h.registerConn(&hubConn{
+		peer:        peerName,
+		addr:        peerAddr,
+		kind:        "publish",
+		connectedAt: connectedAt,
+		channels:    reportedPubChannels,
+	})
+	defer h.deregisterConn(connID)
+
 	var lastErr error
 
 	for {
@@ -381,6 +405,9 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 			lastErr = commitErr
 			break
 		}
+
+		h.batchesReceived.Add(1)
+		h.recordsReceived.Add(int64(len(batch.Records)))
 
 		if sendErr := stream.Send(&federationv1.PublishAck{LastId: lastID}); sendErr != nil {
 			lastErr = sendErr
@@ -433,6 +460,7 @@ func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFr
 	h.mu.RUnlock()
 
 	if !cfg.IsPeerAllowed(peerName) {
+		h.connectionsRejected.Add(1)
 		_ = h.auditL.Log(audit.Event{Event: audit.EventClientRejected, Peer: peerName})
 		h.log.Warn("federation: hub rejected subscribe connection", "peer", peerName)
 		return status.Errorf(codes.PermissionDenied, "not in allowlist")
@@ -478,6 +506,15 @@ func (h *Hub) Subscribe(stream grpc.BidiStreamingServer[federationv1.SubscribeFr
 	}
 
 	connectedAt := time.Now()
+	h.connectionsAccepted.Add(1)
+	connID := h.registerConn(&hubConn{
+		peer:        peerName,
+		addr:        peerAddr,
+		kind:        "subscribe",
+		connectedAt: connectedAt,
+		channels:    subChannels,
+	})
+	defer h.deregisterConn(connID)
 
 	// Ack-reader goroutine: owns all reads on the Subscribe server stream.
 	// Forwards acks to the coordinator; closes ackCh when the stream ends.
@@ -559,6 +596,90 @@ func (h *Hub) buildChannelReaders(
 
 	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers)
 	return cc, nil
+}
+
+// hubConn is the registry entry for one active inbound peer stream.
+type hubConn struct {
+	peer        string
+	addr        string
+	kind        string // "publish" or "subscribe"
+	connectedAt time.Time
+	channels    []string
+}
+
+// HubPeerStats describes one currently-connected inbound peer stream.
+type HubPeerStats struct {
+	Peer        string
+	Addr        string
+	Kind        string // "publish" or "subscribe"
+	ConnectedAt time.Time
+	Channels    []string
+}
+
+// HubStats is a point-in-time snapshot of inbound, hub-side metrics.
+type HubStats struct {
+	Listening           bool
+	Addr                string
+	PublishConns        int
+	SubscribeConns      int
+	RecordsReceived     int64
+	BatchesReceived     int64
+	ConnectionsAccepted int64
+	ConnectionsRejected int64
+	Peers               []HubPeerStats
+}
+
+// registerConn records an active inbound stream and returns its registry id.
+func (h *Hub) registerConn(c *hubConn) int64 {
+	h.connMu.Lock()
+	defer h.connMu.Unlock()
+	id := h.nextConnID
+	h.nextConnID++
+	h.conns[id] = c
+	return id
+}
+
+// deregisterConn removes a previously registered inbound stream.
+func (h *Hub) deregisterConn(id int64) {
+	h.connMu.Lock()
+	delete(h.conns, id)
+	h.connMu.Unlock()
+}
+
+// Stats returns a snapshot of inbound hub-side metrics: active peer streams,
+// total records/batches received, and connection accept/reject counts. The
+// counters are cumulative since the hub started; the connection list and counts
+// reflect the moment of the call.
+func (h *Hub) Stats() HubStats {
+	addr := h.Addr()
+	s := HubStats{
+		Addr:                addr,
+		Listening:           addr != "",
+		RecordsReceived:     h.recordsReceived.Load(),
+		BatchesReceived:     h.batchesReceived.Load(),
+		ConnectionsAccepted: h.connectionsAccepted.Load(),
+		ConnectionsRejected: h.connectionsRejected.Load(),
+	}
+
+	h.connMu.Lock()
+	s.Peers = make([]HubPeerStats, 0, len(h.conns))
+	for _, c := range h.conns {
+		switch c.kind {
+		case "publish":
+			s.PublishConns++
+		case "subscribe":
+			s.SubscribeConns++
+		}
+		s.Peers = append(s.Peers, HubPeerStats{
+			Peer:        c.peer,
+			Addr:        c.addr,
+			Kind:        c.kind,
+			ConnectedAt: c.connectedAt,
+			Channels:    append([]string(nil), c.channels...),
+		})
+	}
+	h.connMu.Unlock()
+	return s
 }
 
 // runTTLSweep periodically deletes fed-*.offset files whose mtime is older

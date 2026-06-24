@@ -789,6 +789,31 @@ func (m *Messenger) Stats() Stats {
 		}
 	}
 
+	if m.hub != nil {
+		hs := m.hub.Stats()
+		peers := make([]HubPeerStats, 0, len(hs.Peers))
+		for _, p := range hs.Peers {
+			peers = append(peers, HubPeerStats{
+				Peer:        p.Peer,
+				Addr:        p.Addr,
+				Kind:        p.Kind,
+				ConnectedAt: p.ConnectedAt,
+				Channels:    p.Channels,
+			})
+		}
+		s.Federation.Hub = &HubStats{
+			Listening:           hs.Listening,
+			Addr:                hs.Addr,
+			PublishConns:        hs.PublishConns,
+			SubscribeConns:      hs.SubscribeConns,
+			RecordsReceived:     hs.RecordsReceived,
+			BatchesReceived:     hs.BatchesReceived,
+			ConnectionsAccepted: hs.ConnectionsAccepted,
+			ConnectionsRejected: hs.ConnectionsRejected,
+			Peers:               peers,
+		}
+	}
+
 	return s
 }
 
