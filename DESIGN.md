@@ -54,6 +54,7 @@ A single instance may simultaneously accept client connections (hub role) and di
 - Direct client-to-client connections
 - Automatic channel discovery or subscription propagation between hubs
 - Wildcard channel patterns in forwarding policy (exact channel names only)
+- **Multiple processes sharing a single `data_dir`.** Each data directory must be owned by exactly one running messenger process. The storage layer relies on a single in-process writer goroutine per channel and an in-process notifier to wake subscribers; it does not coordinate writers or wake subscribers across process boundaries. Running two processes against the same `data_dir` would interleave appends to the same segment files and leave cross-process subscribers dependent on the safety poll alone. To run multiple instances on one host, give each its own `data_dir` and connect them via federation.
 
 ---
 
@@ -211,19 +212,11 @@ Dead-letter channels are regular channels. They can be subscribed to for monitor
 
 ### 5.6 File Change Notification
 
-Subscribers use `fsnotify` (inotify on Linux, kqueue on macOS) to receive push notification when new data is appended to a channel file. On notification, the subscriber reads from its current offset to EOF in a single buffered read.
+Because each `data_dir` is owned by a single process (see §3.2), subscribers and publishers always share an address space, and wake-ups are delivered in-process rather than through the filesystem.
 
-**Same-process fast path:** Subscribers in the same process as the publisher receive notifications via a `LocalNotifier` — a capacity-1 `chan struct{}` that the writer goroutine signals directly after each successful write. This bypasses the filesystem watcher entirely for lower latency.
+**In-process notifier:** Subscribers are woken via a `LocalNotifier` — a capacity-1 `chan struct{}` that the writer goroutine signals directly after each successful write (or once per batch). On wake-up the subscriber reads from its current offset to EOF, so a single notification covers any number of records appended since the last read. The notifier never blocks the writer: it uses a non-blocking send, so multiple writes that arrive while the subscriber is mid-read coalesce into at most one pending wake-up.
 
-**Path normalisation:** All watched paths are resolved to their absolute form via `filepath.Abs` before registration. This ensures that a relative path and an absolute path referring to the same file share a single watch entry rather than creating duplicate goroutines.
-
-**Polling fallback:** A 100ms polling goroutine is started per path in two situations:
-1. `fsnotify.Add` fails at `Watch` time (e.g., inotify watch limit reached).
-2. A runtime error is received from the fsnotify backend (e.g., inotify queue overflow). In this case, polling is started for every currently-watched path that is not already being polled.
-
-The polling goroutine detects changes by comparing both `ModTime` **and** `Size` against their values at the previous tick. Checking size as well as mtime ensures changes are detected on filesystems with coarse mtime resolution (e.g., ext3 at 1-second granularity, some network shares) when multiple writes occur within the same second.
-
-Multiple notifications from overlapping sources (fsnotify and polling) are coalesced: the notification channel has a capacity of 1 and uses a non-blocking send, so the subscriber sees at most one pending wake-up regardless of how many events fire.
+**Safety poll:** The subscriber loop also wakes on a 1-second ticker. Because the notification channel has capacity 1, a burst of writes that occur while the subscriber is inside `processAvailable` leaves only one pending token; if the scanner happened to observe EOF just before the last write became visible, the periodic re-check guarantees the data is still delivered rather than waiting for the next write. `processAvailable` is idempotent — offset tracking skips already-delivered records — so the extra poll is cheap and never double-delivers. The poll is the upper bound on delivery latency in the (rare) lost-wake-up case; the notifier carries the common path.
 
 ### 5.7 File Rotation and Compaction
 
@@ -535,7 +528,7 @@ writer goroutine (one per channel)
   └─ retry on I/O error until success (see §5.3)
   └─ fsync if sync_interval_ms = 0
   └─ signal publisher: write confirmed
-  └─ signal waiting subscribers via fsnotify or internal channel
+  └─ signal waiting subscribers via the in-process LocalNotifier (see §5.6)
 ```
 
 `Publish()` always blocks until the write is confirmed. There is no in-memory queue and no separate timeout or drop path — if the disk is unavailable, the publisher waits indefinitely (see §5.3 for backpressure propagation to federated senders).
@@ -557,7 +550,7 @@ See §5.2 for the batch durability contract and segment-boundary handling.
 ### 9.2 Read Path
 
 ```
-fsnotify event on channel directory (or internal signal for same-process)
+in-process LocalNotifier signal (or 1s safety-poll tick)
   └─ subscriber goroutine wakes
   └─ list segment files in channel directory (sorted by start offset)
   └─ for each segment starting at or after subscriber's global offset:
@@ -568,7 +561,7 @@ fsnotify event on channel directory (or internal signal for same-process)
        → on write failure: log error, leave in-memory offset unchanged
 ```
 
-Subscribers within the same process use an internal notification channel bypassing the filesystem watcher for lower latency. The per-line scanner buffer is capped at `maxLineSize` (10 MiB). A record larger than this cannot be returned by the scanner, so it is skipped rather than wedging delivery: an error is logged, the offset is advanced past it (its end located by reading to the record's terminating newline), and the `OversizedSkipped` subscriber stat is incremented. An oversized record not yet terminated by a newline is treated as an in-flight write and left in place until it completes, so a message mid-flight is never skipped.
+Subscribers are woken by the in-process `LocalNotifier` (see §5.6), backstopped by a 1-second safety poll. The per-line scanner buffer is capped at `maxLineSize` (10 MiB). A record larger than this cannot be returned by the scanner, so it is skipped rather than wedging delivery: an error is logged, the offset is advanced past it (its end located by reading to the record's terminating newline), and the `OversizedSkipped` subscriber stat is incremented. An oversized record not yet terminated by a newline is treated as an in-flight write and left in place until it completes, so a message mid-flight is never skipped.
 
 ### 9.3 Serialization
 

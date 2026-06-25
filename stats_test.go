@@ -35,6 +35,8 @@ func TestStats_ChannelStreamBytes(t *testing.T) {
 	require.Len(t, s.Channels, 1)
 	assert.Equal(t, "orders", s.Channels[0].Channel)
 	assert.Positive(t, s.Channels[0].StreamBytes)
+	// With nothing compacted, the on-disk footprint equals the stream end.
+	assert.Equal(t, s.Channels[0].StreamBytes, s.Channels[0].DiskBytes)
 	assert.Equal(t, int64(1), s.Channels[0].MessageCount)
 	assert.Empty(t, s.Channels[0].Subscribers)
 }

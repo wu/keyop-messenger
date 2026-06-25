@@ -75,6 +75,22 @@ func ChannelStreamEnd(channelDir string) (int64, error) {
 	return last.startOffset + last.size, nil
 }
 
+// ChannelDiskBytes returns the channel's current on-disk footprint: the sum of
+// the sizes of its surviving segment files. Unlike ChannelStreamEnd (which is
+// monotonic), this shrinks when compaction removes consumed segments. Returns 0
+// if no segments exist yet.
+func ChannelDiskBytes(channelDir string) (int64, error) {
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, seg := range segs {
+		total += seg.size
+	}
+	return total, nil
+}
+
 // listSegments returns all segment files in channelDir sorted by start offset.
 // os.ReadDir returns entries in name order, and since names are zero-padded
 // decimal offsets lexicographic == numeric order.

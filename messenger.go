@@ -762,6 +762,10 @@ func (m *Messenger) Stats() Stats {
 		if err != nil {
 			m.log.Warn("stats: read channel stream end", "channel", name, "err", err)
 		}
+		diskBytes, err := storage.ChannelDiskBytes(m.channelDir(name))
+		if err != nil {
+			m.log.Warn("stats: read channel disk bytes", "channel", name, "err", err)
+		}
 
 		cs.mu.RLock()
 		subs := make([]SubscriberStats, 0, len(cs.subs))
@@ -790,6 +794,7 @@ func (m *Messenger) Stats() Stats {
 		s.Channels = append(s.Channels, ChannelStats{
 			Channel:      name,
 			StreamBytes:  streamEnd,
+			DiskBytes:    diskBytes,
 			MessageCount: cs.publishCount.Load(),
 			Subscribers:  subs,
 		})

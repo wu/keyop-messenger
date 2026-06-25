@@ -243,7 +243,7 @@ func NewSubscriber(
 }
 
 // Start launches the subscriber goroutine. notifyC should come from
-// ChannelWatcher.Watch or LocalNotifier.C(). Call Stop to wait for exit.
+// LocalNotifier.C(). Call Stop to wait for exit.
 func (s *Subscriber) Start(notifyC <-chan struct{}, handler HandlerFunc) {
 	go s.run(notifyC, handler)
 }

@@ -21,6 +21,10 @@ type ChannelStats struct {
 	// the total bytes ever appended, which is monotonically increasing. This value
 	// does not decrease when compaction removes consumed segments.
 	StreamBytes int64
+	// DiskBytes is the channel's current on-disk footprint: the sum of the sizes
+	// of its surviving segment files. Unlike StreamBytes, this shrinks when
+	// compaction removes consumed segments, so it reflects actual disk usage.
+	DiskBytes int64
 	// MessageCount is the number of messages published to this channel since the
 	// Messenger was started. This counter resets on process restart.
 	MessageCount int64

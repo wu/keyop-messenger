@@ -162,8 +162,9 @@ func (f *FakeChannelWriter) IsClosed() bool {
 
 // ---- FakeChannelWatcher -----------------------------------------------------
 
-// FakeChannelWatcher implements ChannelWatcher for tests. Call Notify(path) to
-// manually push a notification to all subscribers watching that path.
+// FakeChannelWatcher hands out per-path notification channels for tests. Call
+// Notify(path) to manually push a notification to all subscribers watching that
+// path. It is a test helper for driving subscriber wake-ups deterministically.
 type FakeChannelWatcher struct {
 	mu   sync.Mutex
 	subs map[string][]chan struct{}
