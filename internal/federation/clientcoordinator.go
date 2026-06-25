@@ -3,6 +3,7 @@ package federation
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -29,6 +30,9 @@ type clientCoordinator struct {
 	log           logger
 	readers       []*channelReader
 	requestCh     chan sendReq
+	// recordAckRTT reports each batch's hub→peer send→ack round-trip time to the
+	// owning Hub, which accumulates it hub-wide.
+	recordAckRTT func(time.Duration)
 
 	stop chan struct{}
 	done chan struct{}
@@ -48,6 +52,7 @@ func newClientCoordinator(
 	maxBatchBytes int,
 	log logger,
 	readers []*channelReader,
+	recordAckRTT func(time.Duration),
 ) *clientCoordinator {
 	requestCh := make(chan sendReq, 1)
 	cc := &clientCoordinator{
@@ -56,6 +61,7 @@ func newClientCoordinator(
 		maxBatchBytes: maxBatchBytes,
 		log:           log,
 		readers:       readers,
+		recordAckRTT:  recordAckRTT,
 		requestCh:     requestCh,
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
@@ -112,6 +118,7 @@ func (cc *clientCoordinator) run() {
 // sendBatch sends one EnvelopeBatch to the peer and waits for the ack.
 // Returns a non-nil error on stream or ack failure; run() exits on error.
 func (cc *clientCoordinator) sendBatch(req sendReq) error {
+	sendStart := time.Now()
 	if err := cc.stream.Send(&federationv1.HubBatch{
 		Payload: &federationv1.HubBatch_Batch{
 			Batch: &federationv1.EnvelopeBatch{Records: req.rawLines},
@@ -124,6 +131,11 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 	case _, ok := <-cc.ackCh:
 		if !ok {
 			return errors.New("clientCoordinator: ack channel closed (stream ended)")
+		}
+		// Record hub→peer delivery RTT only on a successful ack; the serial send
+		// loop means this RTT belongs to exactly this batch.
+		if cc.recordAckRTT != nil {
+			cc.recordAckRTT(time.Since(sendStart))
 		}
 		close(req.doneCh)
 		return nil

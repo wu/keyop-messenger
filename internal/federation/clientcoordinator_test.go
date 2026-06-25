@@ -79,7 +79,7 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
 	cc.start()
 	defer cc.close()
 
@@ -124,7 +124,7 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 8)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
 	cc.start()
 	defer cc.close()
 
@@ -185,7 +185,7 @@ func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
 	cc.start()
 
 	cc.close()
@@ -200,7 +200,7 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
 	cc.start()
 
 	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
@@ -244,7 +244,7 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	reader, err := newChannelReader("peer1", "feed", channelDir, offsetDir, "fed-", 65536, placeholder, log)
 	require.NoError(t, err)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader})
+	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil)
 	cc.start()
 	defer cc.close()
 

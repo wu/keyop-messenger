@@ -85,6 +85,66 @@ func TestStats_FederationAckRTT(t *testing.T) {
 	assert.Positive(t, cs.PublishRTT.SumNanos, "ack RTT should have a positive duration")
 }
 
+// TestStats_HubSubscribeRTT verifies that when the hub delivers a message to a
+// subscribing peer over the Subscribe stream, the hub records the send→ack
+// round-trip in its SubscribeRTT aggregate. Topology: client-a publishes to the
+// hub, the hub forwards to client-b which subscribes.
+func TestStats_HubSubscribeRTT(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a", "client-b")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			AllowedPeers: []AllowedPeer{
+				{Name: "client-a"},
+				{Name: "client-b"},
+			},
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	clientA := newClientMessengerWithPolicy(t, "client-a", dir, caFile,
+		certFor("client-a"), keyFor("client-a"), hubAddr,
+		nil, []string{"events"}, // publishes only
+	)
+	clientB := newClientMessengerWithPolicy(t, "client-b", dir, caFile,
+		certFor("client-b"), keyFor("client-b"), hubAddr,
+		[]string{"events"}, nil, // subscribes only
+	)
+
+	received := make(chan Message, 4)
+	require.NoError(t, clientB.Subscribe(context.Background(), "events", "client-b-sub",
+		func(_ context.Context, msg Message) error {
+			received <- msg
+			return nil
+		}))
+
+	// Let both streams establish before publishing.
+	require.Eventually(t, func() bool {
+		hub := hubM.Stats().Federation.Hub
+		return hub != nil && hub.SubscribeConns >= 1 && hub.PublishConns >= 1
+	}, 3*time.Second, 50*time.Millisecond, "hub did not register both peer streams")
+
+	require.NoError(t, clientA.Publish(context.Background(), "events", "test.E",
+		map[string]any{"v": 1}))
+
+	select {
+	case <-received:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client-b did not receive the forwarded message within 3s")
+	}
+
+	// The hub records the RTT after client-b acks; poll until it lands.
+	var hub *HubStats
+	require.Eventually(t, func() bool {
+		hub = hubM.Stats().Federation.Hub
+		return hub != nil && hub.SubscribeRTT.Count >= 1
+	}, 3*time.Second, 50*time.Millisecond, "hub subscribe RTT sample was not recorded")
+
+	assert.Positive(t, hub.SubscribeRTT.SumNanos, "subscribe RTT should have a positive duration")
+}
+
 // TestStats_HubInbound verifies that a hub instance surfaces inbound, hub-side
 // metrics: an active publish stream, committed records, and accept counts.
 func TestStats_HubInbound(t *testing.T) {

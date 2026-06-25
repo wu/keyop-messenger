@@ -957,6 +957,7 @@ func (m *Messenger) Stats() Stats {
 			BatchesReceived:     hs.BatchesReceived,
 			ConnectionsAccepted: hs.ConnectionsAccepted,
 			ConnectionsRejected: hs.ConnectionsRejected,
+			SubscribeRTT:        LatencyStage{Count: hs.SubscribeRTTCount, SumNanos: hs.SubscribeRTTSumNanos},
 			Peers:               peers,
 		}
 	}

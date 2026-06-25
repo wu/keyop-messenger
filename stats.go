@@ -152,6 +152,12 @@ type HubStats struct {
 	// ConnectionsRejected is the cumulative number of peer streams refused by the
 	// allowlist.
 	ConnectionsRejected int64
+	// SubscribeRTT is the hub→peer delivery latency aggregate: the running count
+	// and summed duration of Subscribe-stream batch send→ack round-trips, measured
+	// hub-wide on the hub's own clock (free of cross-host skew). It is the inbound
+	// counterpart to ClientStats.PublishRTT. Like the Latency stages, the mean is
+	// SumNanos/Count and the values reset on restart.
+	SubscribeRTT LatencyStage
 	// Peers contains one entry per currently connected inbound peer stream.
 	Peers []HubPeerStats
 }
