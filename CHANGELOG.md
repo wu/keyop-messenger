@@ -1,3 +1,18 @@
+## [1.19.0](https://github.com/wu/keyop-messenger/compare/v1.18.0...v1.19.0) (2026-06-25)
+
+### Features
+
+* **storage:** reserve dead-letter channels and bound their growth ([7e4d384](https://github.com/wu/keyop-messenger/commit/7e4d384798c07471edf592e9309349a2719d7043))
+
+### Bug Fixes
+
+* **federation:** make coordinator/reader close idempotent under concurrency ([e68ff4f](https://github.com/wu/keyop-messenger/commit/e68ff4f589c14ed4a444da7b7c1ab27502560c49))
+
+### Refactoring
+
+* remove unused fsnotify watcher and update design doc ([a30c3bd](https://github.com/wu/keyop-messenger/commit/a30c3bd24e5b06cc1a08b27719a69a10739bbe77))
+* **storage:** drop advisory flock from the write path ([6f4fd10](https://github.com/wu/keyop-messenger/commit/6f4fd10e8d4cef7f785edb14f8055b3f52c13114))
+
 ## [1.18.0](https://github.com/wu/keyop-messenger/compare/v1.17.0...v1.18.0) (2026-06-25)
 
 ### Features
