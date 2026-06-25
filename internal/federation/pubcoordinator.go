@@ -35,6 +35,10 @@ type pubCoordinator struct {
 	// recordAckRTT reports each batch's send→ack round-trip time to the owning
 	// Client, which accumulates it across reconnects.
 	recordAckRTT func(time.Duration)
+	// recordSendFail reports an in-flight batch that failed to be acked because
+	// the stream broke (not a deliberate shutdown), so the Client can surface a
+	// delivery-failure count.
+	recordSendFail func()
 
 	ackCh   chan struct{}
 	ackDone chan struct{}
@@ -56,19 +60,21 @@ func newPubCoordinator(
 	log logger,
 	readers []*channelReader,
 	recordAckRTT func(time.Duration),
+	recordSendFail func(),
 ) *pubCoordinator {
 	requestCh := make(chan sendReq, 1)
 	pc := &pubCoordinator{
-		stream:       stream,
-		streamCancel: streamCancel,
-		log:          log,
-		readers:      readers,
-		recordAckRTT: recordAckRTT,
-		requestCh:    requestCh,
-		ackCh:        make(chan struct{}, 1),
-		ackDone:      make(chan struct{}),
-		stop:         make(chan struct{}),
-		done:         make(chan struct{}),
+		stream:         stream,
+		streamCancel:   streamCancel,
+		log:            log,
+		readers:        readers,
+		recordAckRTT:   recordAckRTT,
+		recordSendFail: recordSendFail,
+		requestCh:      requestCh,
+		ackCh:          make(chan struct{}, 1),
+		ackDone:        make(chan struct{}),
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 	for _, r := range readers {
 		r.requestCh = requestCh
@@ -137,12 +143,14 @@ func (pc *pubCoordinator) run() {
 func (pc *pubCoordinator) sendBatch(req sendReq) error {
 	sendStart := time.Now()
 	if err := pc.stream.Send(&federationv1.PublishBatch{Records: req.rawLines}); err != nil {
+		pc.sendFailed()
 		return err
 	}
 
 	select {
 	case _, ok := <-pc.ackCh:
 		if !ok {
+			pc.sendFailed()
 			return errors.New("pubCoordinator: ack channel closed (stream ended)")
 		}
 		// Record client→hub transit RTT only on a successful ack, so a stalled or
@@ -154,9 +162,20 @@ func (pc *pubCoordinator) sendBatch(req sendReq) error {
 		close(req.doneCh)
 		return nil
 	case <-pc.stop:
+		// Deliberate shutdown, not a delivery failure — do not count it.
 		return errors.New("pubCoordinator: stopped while waiting for ack")
 	case <-pc.stream.Context().Done():
+		pc.sendFailed()
 		return pc.stream.Context().Err()
+	}
+}
+
+// sendFailed reports one in-flight batch that did not complete with an ack
+// because the stream broke. The serial send loop fails at most one batch per
+// disconnect, so this counts delivery disruptions, not idle reconnects.
+func (pc *pubCoordinator) sendFailed() {
+	if pc.recordSendFail != nil {
+		pc.recordSendFail()
 	}
 }
 

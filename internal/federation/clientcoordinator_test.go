@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -79,7 +80,7 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
 	cc.start()
 	defer cc.close()
 
@@ -124,7 +125,7 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 8)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
 	cc.start()
 	defer cc.close()
 
@@ -185,7 +186,7 @@ func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
 	cc.start()
 
 	cc.close()
@@ -200,7 +201,7 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
 	cc.start()
 
 	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
@@ -228,6 +229,47 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	cc.close()
 }
 
+// TestClientCoordinator_SendFailureCounted verifies that an in-flight batch lost
+// to a broken stream (ackCh closed) reports exactly one send failure.
+func TestClientCoordinator_SendFailureCounted(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
+
+	var failures atomic.Int64
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil,
+		func() { failures.Add(1) })
+	cc.start()
+
+	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
+	doneCh := make(chan struct{})
+	go func() {
+		cc.requestCh <- sendReq{
+			channel: "ch", rawLines: [][]byte{rawLine},
+			newOffset: int64(len(rawLine) + 1), doneCh: doneCh,
+		}
+	}()
+
+	// Wait for the batch to reach the stream, then break it by closing ackCh.
+	select {
+	case <-stream.sendCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("batch never sent")
+	}
+	close(ackCh)
+
+	select {
+	case <-cc.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("coordinator did not exit after ackCh closed")
+	}
+	cc.close()
+
+	assert.Equal(t, int64(1), failures.Load(), "a broken in-flight batch should count one send failure")
+}
+
 // TestClientCoordinator_WithReaders verifies integration with channelReader.
 func TestClientCoordinator_WithReaders(t *testing.T) {
 	t.Parallel()
@@ -244,7 +286,7 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	reader, err := newChannelReader("peer1", "feed", channelDir, offsetDir, "fed-", 65536, placeholder, log)
 	require.NoError(t, err)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil, nil)
 	cc.start()
 	defer cc.close()
 

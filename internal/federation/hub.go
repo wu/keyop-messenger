@@ -141,6 +141,18 @@ type Hub struct {
 	// free of cross-host skew. Hub-wide across all subscribing peers.
 	subscribeRTTSumNs atomic.Int64
 	subscribeRTTCount atomic.Int64
+
+	// subscribeSendFailures counts in-flight hub→peer batches that failed to be
+	// acked because the Subscribe stream broke (excluding deliberate shutdown).
+	// A rising value signals delivery disruption to subscribers. Hub-wide.
+	subscribeSendFailures atomic.Int64
+}
+
+// recordSubscribeSendFailure increments the hub→peer delivery-failure count.
+// Called by a clientCoordinator when an in-flight batch is lost to a broken
+// Subscribe stream.
+func (h *Hub) recordSubscribeSendFailure() {
+	h.subscribeSendFailures.Add(1)
 }
 
 // recordSubscribeRTT adds one hub→peer delivery round-trip sample (the
@@ -608,7 +620,7 @@ func (h *Hub) buildChannelReaders(
 		readers = append(readers, r)
 	}
 
-	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers, h.recordSubscribeRTT)
+	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers, h.recordSubscribeRTT, h.recordSubscribeSendFailure)
 	return cc, nil
 }
 
@@ -644,7 +656,10 @@ type HubStats struct {
 	// stream (summed nanoseconds and sample count), hub-wide.
 	SubscribeRTTSumNanos int64
 	SubscribeRTTCount    int64
-	Peers                []HubPeerStats
+	// SubscribeSendFailures counts in-flight hub→peer batches lost to a broken
+	// Subscribe stream, hub-wide.
+	SubscribeSendFailures int64
+	Peers                 []HubPeerStats
 }
 
 // registerConn records an active inbound stream and returns its registry id.
@@ -671,14 +686,15 @@ func (h *Hub) deregisterConn(id int64) {
 func (h *Hub) Stats() HubStats {
 	addr := h.Addr()
 	s := HubStats{
-		Addr:                 addr,
-		Listening:            addr != "",
-		RecordsReceived:      h.recordsReceived.Load(),
-		BatchesReceived:      h.batchesReceived.Load(),
-		ConnectionsAccepted:  h.connectionsAccepted.Load(),
-		ConnectionsRejected:  h.connectionsRejected.Load(),
-		SubscribeRTTSumNanos: h.subscribeRTTSumNs.Load(),
-		SubscribeRTTCount:    h.subscribeRTTCount.Load(),
+		Addr:                  addr,
+		Listening:             addr != "",
+		RecordsReceived:       h.recordsReceived.Load(),
+		BatchesReceived:       h.batchesReceived.Load(),
+		ConnectionsAccepted:   h.connectionsAccepted.Load(),
+		ConnectionsRejected:   h.connectionsRejected.Load(),
+		SubscribeRTTSumNanos:  h.subscribeRTTSumNs.Load(),
+		SubscribeRTTCount:     h.subscribeRTTCount.Load(),
+		SubscribeSendFailures: h.subscribeSendFailures.Load(),
 	}
 
 	h.connMu.Lock()

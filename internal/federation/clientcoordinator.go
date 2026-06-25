@@ -33,6 +33,10 @@ type clientCoordinator struct {
 	// recordAckRTT reports each batch's hub→peer send→ack round-trip time to the
 	// owning Hub, which accumulates it hub-wide.
 	recordAckRTT func(time.Duration)
+	// recordSendFail reports an in-flight batch that failed to be acked because
+	// the Subscribe stream broke (not a deliberate shutdown), so the Hub can
+	// surface a delivery-failure count.
+	recordSendFail func()
 
 	stop chan struct{}
 	done chan struct{}
@@ -53,18 +57,20 @@ func newClientCoordinator(
 	log logger,
 	readers []*channelReader,
 	recordAckRTT func(time.Duration),
+	recordSendFail func(),
 ) *clientCoordinator {
 	requestCh := make(chan sendReq, 1)
 	cc := &clientCoordinator{
-		stream:        stream,
-		ackCh:         ackCh,
-		maxBatchBytes: maxBatchBytes,
-		log:           log,
-		readers:       readers,
-		recordAckRTT:  recordAckRTT,
-		requestCh:     requestCh,
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
+		stream:         stream,
+		ackCh:          ackCh,
+		maxBatchBytes:  maxBatchBytes,
+		log:            log,
+		readers:        readers,
+		recordAckRTT:   recordAckRTT,
+		recordSendFail: recordSendFail,
+		requestCh:      requestCh,
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 	for _, r := range readers {
 		r.requestCh = requestCh
@@ -124,12 +130,14 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 			Batch: &federationv1.EnvelopeBatch{Records: req.rawLines},
 		},
 	}); err != nil {
+		cc.sendFailed()
 		return err
 	}
 
 	select {
 	case _, ok := <-cc.ackCh:
 		if !ok {
+			cc.sendFailed()
 			return errors.New("clientCoordinator: ack channel closed (stream ended)")
 		}
 		// Record hub→peer delivery RTT only on a successful ack; the serial send
@@ -140,8 +148,19 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 		close(req.doneCh)
 		return nil
 	case <-cc.stop:
+		// Deliberate shutdown, not a delivery failure — do not count it.
 		return errors.New("clientCoordinator: stopped while waiting for ack")
 	case <-cc.stream.Context().Done():
+		cc.sendFailed()
 		return cc.stream.Context().Err()
+	}
+}
+
+// sendFailed reports one in-flight batch that did not complete with an ack
+// because the Subscribe stream broke. The serial send loop fails at most one
+// batch per disconnect, so this counts delivery disruptions, not idle reconnects.
+func (cc *clientCoordinator) sendFailed() {
+	if cc.recordSendFail != nil {
+		cc.recordSendFail()
 	}
 }

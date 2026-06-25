@@ -158,6 +158,10 @@ type HubStats struct {
 	// counterpart to ClientStats.PublishRTT. Like the Latency stages, the mean is
 	// SumNanos/Count and the values reset on restart.
 	SubscribeRTT LatencyStage
+	// SubscribeSendFailures is the number of hub→peer batches that failed to be
+	// acked because the Subscribe stream broke (excluding deliberate shutdown),
+	// hub-wide since the hub started. It is the error counterpart to SubscribeRTT.
+	SubscribeSendFailures int64
 	// Peers contains one entry per currently connected inbound peer stream.
 	Peers []HubPeerStats
 }
@@ -194,4 +198,10 @@ type ClientStats struct {
 	// client's own clock (free of cross-host clock skew). Like the Latency
 	// stages, the mean is SumNanos/Count and the values reset on restart.
 	PublishRTT LatencyStage
+	// PublishSendFailures is the number of outbound batches that failed to be
+	// acked because the stream broke (excluding deliberate shutdown), since this
+	// client started. It is the error counterpart to PublishRTT: PublishRTT
+	// measures successful deliveries, this counts disrupted ones. A rising value
+	// indicates trouble reaching the hub.
+	PublishSendFailures int64
 }

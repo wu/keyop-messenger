@@ -65,6 +65,12 @@ type Client struct {
 	ackRTTSumNs atomic.Int64
 	ackRTTCount atomic.Int64
 
+	// publishSendFailures counts in-flight outbound batches that failed to be
+	// acked because the stream broke (excluding deliberate shutdown). A rising
+	// value signals delivery disruption to the hub. Accumulated on the Client so
+	// it survives reconnects.
+	publishSendFailures atomic.Int64
+
 	mu          sync.Mutex
 	coordinator *pubCoordinator
 	receiver    *PeerReceiver
@@ -166,7 +172,7 @@ func (c *Client) dial(hubAddr string) error {
 		pubCancel()
 		return fmt.Errorf("federation: client build outbound readers: %w", err)
 	}
-	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT)
+	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT, c.recordPublishSendFailure)
 	coordinator.start()
 
 	// Open the Subscribe stream if this client subscribes to channels.
@@ -428,6 +434,18 @@ func (c *Client) recordAckRTT(d time.Duration) {
 // The mean is sumNanos/count (guard count == 0).
 func (c *Client) AckRTT() (sumNanos, count int64) {
 	return c.ackRTTSumNs.Load(), c.ackRTTCount.Load()
+}
+
+// recordPublishSendFailure increments the outbound delivery-failure count.
+// Called by the pubCoordinator when an in-flight batch is lost to a broken stream.
+func (c *Client) recordPublishSendFailure() {
+	c.publishSendFailures.Add(1)
+}
+
+// PublishSendFailures returns the number of outbound batches that failed to be
+// acked because the stream broke, since this Client started.
+func (c *Client) PublishSendFailures() int64 {
+	return c.publishSendFailures.Load()
 }
 
 // UnackedBytes returns the total bytes published locally on this client's

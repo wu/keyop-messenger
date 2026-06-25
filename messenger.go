@@ -927,11 +927,12 @@ func (m *Messenger) Stats() Stats {
 		for _, c := range m.clients {
 			rttSum, rttCount := c.AckRTT()
 			s.Federation.Clients = append(s.Federation.Clients, ClientStats{
-				HubAddr:        c.HubAddr(),
-				Connected:      c.Connected(),
-				ReconnectCount: c.ReconnectCount(),
-				UnackedBytes:   c.UnackedBytes(),
-				PublishRTT:     LatencyStage{Count: rttCount, SumNanos: rttSum},
+				HubAddr:             c.HubAddr(),
+				Connected:           c.Connected(),
+				ReconnectCount:      c.ReconnectCount(),
+				UnackedBytes:        c.UnackedBytes(),
+				PublishRTT:          LatencyStage{Count: rttCount, SumNanos: rttSum},
+				PublishSendFailures: c.PublishSendFailures(),
 			})
 		}
 	}
@@ -949,16 +950,17 @@ func (m *Messenger) Stats() Stats {
 			})
 		}
 		s.Federation.Hub = &HubStats{
-			Listening:           hs.Listening,
-			Addr:                hs.Addr,
-			PublishConns:        hs.PublishConns,
-			SubscribeConns:      hs.SubscribeConns,
-			RecordsReceived:     hs.RecordsReceived,
-			BatchesReceived:     hs.BatchesReceived,
-			ConnectionsAccepted: hs.ConnectionsAccepted,
-			ConnectionsRejected: hs.ConnectionsRejected,
-			SubscribeRTT:        LatencyStage{Count: hs.SubscribeRTTCount, SumNanos: hs.SubscribeRTTSumNanos},
-			Peers:               peers,
+			Listening:             hs.Listening,
+			Addr:                  hs.Addr,
+			PublishConns:          hs.PublishConns,
+			SubscribeConns:        hs.SubscribeConns,
+			RecordsReceived:       hs.RecordsReceived,
+			BatchesReceived:       hs.BatchesReceived,
+			ConnectionsAccepted:   hs.ConnectionsAccepted,
+			ConnectionsRejected:   hs.ConnectionsRejected,
+			SubscribeRTT:          LatencyStage{Count: hs.SubscribeRTTCount, SumNanos: hs.SubscribeRTTSumNanos},
+			SubscribeSendFailures: hs.SubscribeSendFailures,
+			Peers:                 peers,
 		}
 	}
 
