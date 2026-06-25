@@ -183,4 +183,9 @@ type ClientStats struct {
 	// client's outbound channels that have not yet been acknowledged by the hub.
 	// Computed from the per-channel offset files against the channel stream end.
 	UnackedBytes int64
+	// PublishRTT is the client→hub transit latency aggregate: the running count
+	// and summed duration of PublishBatch send→ack round-trips, measured on this
+	// client's own clock (free of cross-host clock skew). Like the Latency
+	// stages, the mean is SumNanos/Count and the values reset on restart.
+	PublishRTT LatencyStage
 }

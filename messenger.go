@@ -925,11 +925,13 @@ func (m *Messenger) Stats() Stats {
 	if len(m.clients) > 0 {
 		s.Federation.Clients = make([]ClientStats, 0, len(m.clients))
 		for _, c := range m.clients {
+			rttSum, rttCount := c.AckRTT()
 			s.Federation.Clients = append(s.Federation.Clients, ClientStats{
 				HubAddr:        c.HubAddr(),
 				Connected:      c.Connected(),
 				ReconnectCount: c.ReconnectCount(),
 				UnackedBytes:   c.UnackedBytes(),
+				PublishRTT:     LatencyStage{Count: rttCount, SumNanos: rttSum},
 			})
 		}
 	}

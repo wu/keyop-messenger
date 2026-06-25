@@ -58,6 +58,13 @@ type Client struct {
 	hubAddr        string       // set once in ConnectWithReconnect before the reconnect goroutine starts
 	reconnectCount atomic.Int64 // incremented on each successful reconnect (not the initial dial)
 
+	// publish ack round-trip latency aggregate (client→hub transit): summed
+	// send→ack durations and the sample count, measured on the client's own
+	// clock so it is free of cross-host clock skew. Accumulated here on the
+	// Client (not the pubCoordinator) so the totals survive reconnects.
+	ackRTTSumNs atomic.Int64
+	ackRTTCount atomic.Int64
+
 	mu          sync.Mutex
 	coordinator *pubCoordinator
 	receiver    *PeerReceiver
@@ -159,7 +166,7 @@ func (c *Client) dial(hubAddr string) error {
 		pubCancel()
 		return fmt.Errorf("federation: client build outbound readers: %w", err)
 	}
-	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers)
+	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT)
 	coordinator.start()
 
 	// Open the Subscribe stream if this client subscribes to channels.
@@ -407,6 +414,21 @@ func (c *Client) Connected() bool {
 // ReconnectCount returns the number of successful reconnections after the
 // initial dial. The first connection is not counted.
 func (c *Client) ReconnectCount() int64 { return c.reconnectCount.Load() }
+
+// recordAckRTT adds one publish ack round-trip sample (the send→ack elapsed
+// time) to the client's running aggregate. Called by the pubCoordinator after
+// each PublishBatch is acknowledged by the hub.
+func (c *Client) recordAckRTT(d time.Duration) {
+	c.ackRTTSumNs.Add(int64(d))
+	c.ackRTTCount.Add(1)
+}
+
+// AckRTT returns the running publish ack round-trip aggregate for this hub
+// connection: the summed send→ack duration in nanoseconds and the sample count.
+// The mean is sumNanos/count (guard count == 0).
+func (c *Client) AckRTT() (sumNanos, count int64) {
+	return c.ackRTTSumNs.Load(), c.ackRTTCount.Load()
+}
 
 // UnackedBytes returns the total bytes published locally on this client's
 // outbound channels that have not yet been acknowledged by the hub. It is

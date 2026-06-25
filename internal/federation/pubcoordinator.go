@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,6 +32,9 @@ type pubCoordinator struct {
 	log          logger
 	readers      []*channelReader
 	requestCh    chan sendReq
+	// recordAckRTT reports each batch's send→ack round-trip time to the owning
+	// Client, which accumulates it across reconnects.
+	recordAckRTT func(time.Duration)
 
 	ackCh   chan struct{}
 	ackDone chan struct{}
@@ -51,6 +55,7 @@ func newPubCoordinator(
 	streamCancel context.CancelFunc,
 	log logger,
 	readers []*channelReader,
+	recordAckRTT func(time.Duration),
 ) *pubCoordinator {
 	requestCh := make(chan sendReq, 1)
 	pc := &pubCoordinator{
@@ -58,6 +63,7 @@ func newPubCoordinator(
 		streamCancel: streamCancel,
 		log:          log,
 		readers:      readers,
+		recordAckRTT: recordAckRTT,
 		requestCh:    requestCh,
 		ackCh:        make(chan struct{}, 1),
 		ackDone:      make(chan struct{}),
@@ -129,6 +135,7 @@ func (pc *pubCoordinator) run() {
 // channelReader sleeps on its sendReq.doneCh; on success it persists the new
 // offset and reads the next batch.
 func (pc *pubCoordinator) sendBatch(req sendReq) error {
+	sendStart := time.Now()
 	if err := pc.stream.Send(&federationv1.PublishBatch{Records: req.rawLines}); err != nil {
 		return err
 	}
@@ -137,6 +144,12 @@ func (pc *pubCoordinator) sendBatch(req sendReq) error {
 	case _, ok := <-pc.ackCh:
 		if !ok {
 			return errors.New("pubCoordinator: ack channel closed (stream ended)")
+		}
+		// Record client→hub transit RTT only on a successful ack, so a stalled or
+		// failed batch does not contribute a spuriously large sample. Serial send
+		// loop means this RTT is for exactly this batch.
+		if pc.recordAckRTT != nil {
+			pc.recordAckRTT(time.Since(sendStart))
 		}
 		close(req.doneCh)
 		return nil

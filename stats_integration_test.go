@@ -48,6 +48,43 @@ func TestStats_FederationClients(t *testing.T) {
 	assert.Zero(t, cs.ReconnectCount)
 }
 
+// TestStats_FederationAckRTT verifies that once a published message is forwarded
+// to the hub and acknowledged, the client's PublishRTT aggregate records the
+// send→ack round-trip.
+func TestStats_FederationAckRTT(t *testing.T) {
+	dir := t.TempDir()
+	caFile, certFor, keyFor := integrationTLS(t, dir, "localhost", "client-a")
+
+	hubM := newHubMessenger(t, "hub", filepath.Join(dir, "hub"), caFile,
+		certFor("localhost"), keyFor("localhost"),
+		HubConfig{
+			AllowedPeers: []AllowedPeer{{Name: "client-a"}},
+		},
+	)
+	hubAddr := hubLocalAddr(t, hubM)
+
+	clientM := newClientMessengerWithPolicy(t, "client-a", dir, caFile,
+		certFor("client-a"), keyFor("client-a"), hubAddr,
+		nil, []string{"events"},
+	)
+
+	require.NoError(t, clientM.Publish(context.Background(), "events", "test.E", map[string]any{"v": 1}))
+
+	// The message is read from the local channel file, sent to the hub, and
+	// acked asynchronously; poll until the RTT sample is recorded.
+	var cs ClientStats
+	require.Eventually(t, func() bool {
+		s := clientM.Stats()
+		if len(s.Federation.Clients) != 1 {
+			return false
+		}
+		cs = s.Federation.Clients[0]
+		return cs.PublishRTT.Count >= 1
+	}, 3*time.Second, 50*time.Millisecond, "publish ack RTT sample was not recorded")
+
+	assert.Positive(t, cs.PublishRTT.SumNanos, "ack RTT should have a positive duration")
+}
+
 // TestStats_HubInbound verifies that a hub instance surfaces inbound, hub-side
 // metrics: an active publish stream, committed records, and accept counts.
 func TestStats_HubInbound(t *testing.T) {
