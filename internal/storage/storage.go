@@ -1,8 +1,8 @@
 // Package storage implements the per-channel file writer and related storage
-// primitives. All file I/O is serialized through a single goroutine per channel
-// so the OS O_APPEND guarantee covers records under PIPE_BUF; larger records
-// are additionally protected by an advisory flock. This package targets POSIX
-// systems (Linux, macOS) only.
+// primitives. All file I/O is serialized through a single goroutine per channel,
+// and each data_dir is owned by a single process, so the OS O_APPEND guarantee
+// plus serial single-goroutine access covers records of any size without
+// additional locking. This package targets POSIX systems (Linux, macOS) only.
 package storage
 
 import (

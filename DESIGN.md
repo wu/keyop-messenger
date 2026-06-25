@@ -142,7 +142,7 @@ All writes to a `.jsonl` file are serialized through a single writer goroutine p
 
 Multiple goroutines calling `Publish()` concurrently on the same channel serialize through the writer goroutine; each blocks on the rendezvous until its own write is confirmed before returning.
 
-The writer appends with `O_APPEND` and issues a single `write()` syscall per record, which is atomic for records under `PIPE_BUF` on POSIX systems. For larger records, the writer holds an advisory `flock` for the duration of the write.
+The writer appends with `O_APPEND` and issues a single `write()` syscall per record. Because each `data_dir` is owned by a single process (§3.2) and every append to a channel is serialized through this one writer goroutine, no cross-writer locking is needed regardless of record size — there is never a second writer to interleave with.
 
 What "write confirmed" means depends on `sync_interval_ms`:
 
@@ -153,7 +153,7 @@ What "write confirmed" means depends on `sync_interval_ms`:
 
 For `sync_interval_ms=0`, an fsync failure is returned as an error to the caller. For `sync_interval_ms>0`, fsync failures are logged as warnings and retried on the next timer tick; `Publish()` is not affected.
 
-**Batched writes.** The writer also accepts a *batch* request (`WriteBatch`) carrying multiple records. The batch is a single rendezvous request handled atomically with respect to other writes: each record is appended in order through the same single-record write path (with the same `PIPE_BUF`/`flock` rule per record), but **one `fsync` and one subscriber notification cover the whole batch** when `sync_interval_ms=0`. This amortises the per-record fsync — the dominant write cost — across the batch while keeping strict durability. The fsync is the cost being amortised; the per-record `write()` syscalls are not coalesced.
+**Batched writes.** The writer also accepts a *batch* request (`WriteBatch`) carrying multiple records. The batch is a single rendezvous request handled atomically with respect to other writes: each record is appended in order through the same single-record write path, but **one `fsync` and one subscriber notification cover the whole batch** when `sync_interval_ms=0`. This amortises the per-record fsync — the dominant write cost — across the batch while keeping strict durability. The fsync is the cost being amortised; the per-record `write()` syscalls are not coalesced.
 
 `WriteBatch` follows the same written/not-written contract as a single write: it returns `nil` only after the entire batch is durably committed (fsynced, when `sync_interval_ms=0`), and a non-nil error means the batch was **not** fully committed and may be safely retried. An empty batch is a no-op. Crucially, the batch's confirmation is never returned ahead of the commit — the same invariant that single writes uphold, extended to the group.
 

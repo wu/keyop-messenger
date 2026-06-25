@@ -45,7 +45,6 @@ func (f *fakeFile) Write(b []byte) (int, error) {
 }
 func (f *fakeFile) Sync() error  { f.syncCount.Add(1); return nil }
 func (f *fakeFile) Close() error { f.mu.Lock(); defer f.mu.Unlock(); f.closed = true; return nil }
-func (f *fakeFile) Fd() uintptr  { return 0 }
 
 func (f *fakeFile) FailsDone() int {
 	f.mu.Lock()
@@ -422,7 +421,6 @@ func (f *recoverableFailWriteFile) Write(b []byte) (int, error) {
 }
 func (f *recoverableFailWriteFile) Sync() error  { return nil }
 func (f *recoverableFailWriteFile) Close() error { return nil }
-func (f *recoverableFailWriteFile) Fd() uintptr  { return 0 }
 func (f *recoverableFailWriteFile) heal() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -436,7 +434,6 @@ type alwaysFailWriteFile struct{ writes atomic.Int64 }
 func (f *alwaysFailWriteFile) Write(_ []byte) (int, error) { f.writes.Add(1); return 0, syscall.ENOSPC }
 func (f *alwaysFailWriteFile) Sync() error                 { return nil }
 func (f *alwaysFailWriteFile) Close() error                { return nil }
-func (f *alwaysFailWriteFile) Fd() uintptr                 { return 0 }
 
 // syncFailFile is a fileWriter whose Write succeeds but Sync always fails.
 type syncFailFile struct {
@@ -451,7 +448,6 @@ func (f *syncFailFile) Write(b []byte) (int, error) {
 }
 func (f *syncFailFile) Sync() error  { return errors.New("fsync error") }
 func (f *syncFailFile) Close() error { return nil }
-func (f *syncFailFile) Fd() uintptr  { return 0 }
 
 // fixedFileFactory is a segmentFactory that returns the same fileWriter for
 // every openSegment and createSegment call.

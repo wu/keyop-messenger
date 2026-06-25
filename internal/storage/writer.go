@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -39,17 +38,12 @@ type ChannelWriter interface {
 // ErrWriterClosed is returned by Write after Close has been called.
 var ErrWriterClosed = errors.New("channel writer is closed")
 
-// pipeBuf is the conservative POSIX PIPE_BUF floor used to decide whether an
-// advisory flock is needed to guarantee write atomicity.
-const pipeBuf = 4096
-
 // fileWriter is the minimal interface the writer goroutine requires.
 // *os.File satisfies it; tests may inject a fake.
 type fileWriter interface {
 	Write(b []byte) (int, error)
 	Sync() error
 	Close() error
-	Fd() uintptr
 }
 
 // segmentFactory abstracts creating and opening segment files so tests can
@@ -354,28 +348,20 @@ func (w *channelWriter) rollIfNeeded(f fileWriter, segStart, segSize int64, recL
 	return newF, newStart, 0, nil
 }
 
-// writeRecord appends data to f with retry-on-error (backpressure) and an
-// advisory flock for records larger than PIPE_BUF. It performs no fsync or
-// notify — callers batch those so a multi-record write shares one fsync.
+// writeRecord appends data to f with retry-on-error (backpressure). It performs
+// no fsync or notify — callers batch those so a multi-record write shares one
+// fsync. Each data_dir is owned by a single process and every append to a
+// channel is serialized through this one writer goroutine, so no cross-writer
+// locking is needed: the OS O_APPEND guarantee plus single-goroutine serial
+// access is sufficient regardless of record size.
 //
 // A non-nil error means the record was NOT written: either Close() was called
 // or the caller's ctx was cancelled while retrying a transient write error
 // (disk full, I/O). In both cases write(2) never succeeded, so the caller's
 // "not written" contract holds.
 func (w *channelWriter) writeRecord(ctx context.Context, f fileWriter, data []byte) error {
-	needLock := len(data) > pipeBuf
 	for {
-		if needLock {
-			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-				w.log.Warn("flock LOCK_EX failed", "err", err)
-			}
-		}
 		_, err := f.Write(data)
-		if needLock {
-			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
-				w.log.Warn("flock LOCK_UN failed", "err", err)
-			}
-		}
 		if err == nil {
 			return nil
 		}
