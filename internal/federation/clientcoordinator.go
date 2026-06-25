@@ -2,6 +2,7 @@ package federation
 
 import (
 	"errors"
+	"sync"
 
 	"google.golang.org/grpc"
 
@@ -31,6 +32,8 @@ type clientCoordinator struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	closeOnce sync.Once
 }
 
 // newClientCoordinator constructs a clientCoordinator. The coordinator does not
@@ -72,17 +75,16 @@ func (cc *clientCoordinator) start() {
 }
 
 // close stops the coordinator send goroutine and all channel readers, then
-// waits for everything to exit.
+// waits for everything to exit. Safe to call multiple times and concurrently:
+// the teardown runs exactly once and every caller blocks until it finishes.
 func (cc *clientCoordinator) close() {
-	select {
-	case <-cc.stop:
-	default:
+	cc.closeOnce.Do(func() {
 		close(cc.stop)
-	}
-	<-cc.done
-	for _, r := range cc.readers {
-		r.close()
-	}
+		<-cc.done
+		for _, r := range cc.readers {
+			r.close()
+		}
+	})
 }
 
 func (cc *clientCoordinator) run() {

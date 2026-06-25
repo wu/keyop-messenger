@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,6 +37,8 @@ type pubCoordinator struct {
 
 	stop chan struct{}
 	done chan struct{}
+
+	closeOnce sync.Once
 }
 
 // newPubCoordinator constructs a pubCoordinator and wires its requestCh into
@@ -78,20 +81,20 @@ func (pc *pubCoordinator) start() {
 
 // close stops the send goroutine and all channel readers, cancels the stream
 // context so the ack-reader's blocking Recv unblocks, and waits for everything
-// to exit. Safe to call once.
+// to exit. Safe to call multiple times and concurrently — the Client's reconnect
+// loop and Client.Close can both reach this path when a disconnect and a shutdown
+// race. The teardown runs exactly once; concurrent callers block until it finishes.
 func (pc *pubCoordinator) close() {
-	select {
-	case <-pc.stop:
-	default:
+	pc.closeOnce.Do(func() {
 		close(pc.stop)
-	}
-	<-pc.done
-	// Cancel the stream context so ackReader's blocking Recv returns.
-	pc.streamCancel()
-	<-pc.ackDone
-	for _, r := range pc.readers {
-		r.close()
-	}
+		<-pc.done
+		// Cancel the stream context so ackReader's blocking Recv returns.
+		pc.streamCancel()
+		<-pc.ackDone
+		for _, r := range pc.readers {
+			r.close()
+		}
+	})
 }
 
 // Done returns a channel that is closed when the send goroutine exits, either

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/storage"
@@ -91,8 +92,9 @@ type channelReader struct {
 	// reader goroutine so no mutex is required.
 	offset int64
 
-	stop chan struct{}
-	done chan struct{}
+	stop      chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // newChannelReader constructs a channelReader and initialises its byte offset.
@@ -179,14 +181,14 @@ func (cr *channelReader) start() {
 	go cr.run()
 }
 
-// close stops the reader goroutine and waits for it to exit. Safe to call once.
+// close stops the reader goroutine and waits for it to exit. Safe to call
+// multiple times and concurrently: the teardown runs exactly once and every
+// caller blocks until the goroutine has exited.
 func (cr *channelReader) close() {
-	select {
-	case <-cr.stop:
-	default:
+	cr.closeOnce.Do(func() {
 		close(cr.stop)
-	}
-	<-cr.done
+		<-cr.done
+	})
 }
 
 func (cr *channelReader) run() {
