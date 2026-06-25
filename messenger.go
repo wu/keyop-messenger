@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,13 @@ var (
 	// 255 bytes, or contains characters outside [a-zA-Z0-9._-].
 	ErrInvalidChannelName = errors.New("invalid channel name")
 
+	// ErrReservedChannelName is returned by Publish and PublishBatch when the
+	// target channel uses the reserved ".dead-letter" suffix. Dead-letter
+	// channels are written only by the messenger itself when a handler exhausts
+	// its retry budget; applications may subscribe to them for monitoring or
+	// reprocessing but must not publish to them directly.
+	ErrReservedChannelName = errors.New("reserved channel name")
+
 	// ErrMessengerClosed is returned when an operation is attempted on a
 	// Messenger after Close has been called.
 	ErrMessengerClosed = errors.New("messenger is closed")
@@ -48,6 +56,18 @@ var (
 )
 
 // ----- Channel name validation -----------------------------------------------
+
+// deadLetterSuffix is the reserved channel-name suffix for dead-letter channels.
+// A subscriber routes a message to "{channel}.dead-letter" after its handler
+// exhausts the retry budget. Applications must not publish to a channel with
+// this suffix; see ErrReservedChannelName.
+const deadLetterSuffix = ".dead-letter"
+
+// defaultDeadLetterRetention bounds dead-letter channel growth when no global
+// storage retention is configured. Failed messages are kept this long for
+// inspection or reprocessing, after which the compactor force-deletes the
+// oldest sealed segments. See channelRetention.
+const defaultDeadLetterRetention = 7 * 24 * time.Hour
 
 var channelNameRE = regexp.MustCompile(`^[a-zA-Z0-9._\-]+$`)
 
@@ -428,6 +448,9 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	if err := ValidateChannelName(channel); err != nil {
 		return err
 	}
+	if strings.HasSuffix(channel, deadLetterSuffix) {
+		return fmt.Errorf("%w: %q: the %q suffix is reserved", ErrReservedChannelName, channel, deadLetterSuffix)
+	}
 	if m.isClosed() {
 		return ErrMessengerClosed
 	}
@@ -502,6 +525,9 @@ type BatchMessage struct {
 func (m *Messenger) PublishBatch(ctx context.Context, channel string, msgs []BatchMessage) error {
 	if err := ValidateChannelName(channel); err != nil {
 		return err
+	}
+	if strings.HasSuffix(channel, deadLetterSuffix) {
+		return fmt.Errorf("%w: %q: the %q suffix is reserved", ErrReservedChannelName, channel, deadLetterSuffix)
 	}
 	if m.isClosed() {
 		return ErrMessengerClosed
@@ -578,7 +604,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 	}
 
 	// Ensure a dead-letter channel writer is ready.
-	dlState, err := m.getOrCreateChannelState(channel + ".dead-letter")
+	dlState, err := m.getOrCreateChannelState(channel + deadLetterSuffix)
 	if err != nil {
 		return fmt.Errorf("subscribe %q: dead-letter channel: %w", channel, err)
 	}
@@ -852,6 +878,32 @@ func (m *Messenger) channelDir(channel string) string {
 	return filepath.Join(m.dataDir, "channels", channel)
 }
 
+// channelRetention returns the retention age the compactor should enforce for
+// channel. Regular channels use the configured storage.retention (0 = keep
+// until consumed). Dead-letter channels fall back to defaultDeadLetterRetention
+// when no global retention is configured, so undrained dead letters cannot grow
+// without bound; when a global retention IS configured, dead-letter channels
+// inherit it like any other channel.
+func (m *Messenger) channelRetention(channel string) time.Duration {
+	retention := m.cfg.Storage.RetentionAge.Duration
+	if retention == 0 && strings.HasSuffix(channel, deadLetterSuffix) {
+		return defaultDeadLetterRetention
+	}
+	return retention
+}
+
+// channelRollThreshold returns the segment roll size in bytes for channel.
+// Dead-letter channels use the smaller storage.dead_letter_compaction_threshold_mb
+// so their active segment seals sooner and age-based retention can reclaim it;
+// all other channels use storage.compaction_threshold_mb.
+func (m *Messenger) channelRollThreshold(channel string) int64 {
+	mb := m.cfg.Storage.CompactionThresholdMB
+	if strings.HasSuffix(channel, deadLetterSuffix) {
+		mb = m.cfg.Storage.DeadLetterCompactionThresholdMB
+	}
+	return int64(mb) * 1024 * 1024
+}
+
 func (m *Messenger) offsetDir(channel string) string {
 	return filepath.Join(m.dataDir, "subscribers", channel)
 }
@@ -878,7 +930,7 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 		compactor: storage.NewCompactor(
 			m.offsetDir(channel),
 			int64(m.cfg.Storage.MaxChannelSizeMB)*1024*1024,
-			m.cfg.Storage.RetentionAge.Duration,
+			m.channelRetention(channel),
 			m.log,
 		),
 	}
@@ -890,7 +942,7 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 	var err error
 	cs.writer, err = storage.NewChannelWriter(
 		m.channelDir(channel),
-		int64(m.cfg.Storage.CompactionThresholdMB)*1024*1024,
+		m.channelRollThreshold(channel),
 		m.cfg.Storage.SyncIntervalMS,
 		notifyFn,
 		m.log,

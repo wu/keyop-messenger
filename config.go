@@ -69,6 +69,15 @@ type StorageConfig struct {
 	// subscribers) portion of a channel file exceeds this size. Default: 256.
 	CompactionThresholdMB int `yaml:"compaction_threshold_mb"`
 
+	// DeadLetterCompactionThresholdMB is the segment roll size for dead-letter
+	// channels ("{channel}.dead-letter"), the dead-letter counterpart of
+	// CompactionThresholdMB. It is intentionally smaller so a dead-letter
+	// channel's active segment seals sooner, letting age-based retention (see
+	// RetentionAge and the default dead-letter retention) actually reclaim it on
+	// a low-volume channel instead of holding everything in one never-rolled
+	// active segment. Default: 64.
+	DeadLetterCompactionThresholdMB int `yaml:"dead_letter_compaction_threshold_mb"`
+
 	// MaxChannelSizeMB caps the on-disk size of a single channel's retained segment
 	// files. When the total exceeds this, the compactor force-deletes the oldest
 	// sealed segments — including ones a lagging subscriber has not yet consumed —
@@ -263,6 +272,10 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) ApplyDefaults() {
 	if c.Storage.CompactionThresholdMB == 0 {
 		c.Storage.CompactionThresholdMB = 256
+	}
+
+	if c.Storage.DeadLetterCompactionThresholdMB == 0 {
+		c.Storage.DeadLetterCompactionThresholdMB = 64
 	}
 
 	if c.Subscribers.MaxRetries == nil {

@@ -204,6 +204,83 @@ func TestPublishBatch_Guards(t *testing.T) {
 		[]BatchMessage{{PayloadType: "test.T", Payload: 1}}), ErrMessengerClosed)
 }
 
+// TestPublishToDeadLetterRejected verifies the reserved ".dead-letter" suffix is
+// rejected on the publish paths but still subscribable for monitoring.
+func TestPublishToDeadLetterRejected(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	ctx := context.Background()
+
+	require.ErrorIs(t, m.Publish(ctx, "orders.dead-letter", "test.T", 1),
+		ErrReservedChannelName)
+	require.ErrorIs(t, m.PublishBatch(ctx, "orders.dead-letter",
+		[]BatchMessage{{PayloadType: "test.T", Payload: 1}}), ErrReservedChannelName)
+
+	// A nested suffix is rejected too.
+	require.ErrorIs(t, m.Publish(ctx, "a.b.dead-letter", "test.T", 1),
+		ErrReservedChannelName)
+
+	// Publishing to a normal channel is unaffected.
+	require.NoError(t, m.Publish(ctx, "orders", "test.T", 1))
+
+	// Subscribing to a dead-letter channel (for monitoring/reprocessing) is allowed.
+	require.NoError(t, m.Subscribe(ctx, "orders.dead-letter", "dlq-monitor",
+		func(context.Context, Message) error { return nil }))
+}
+
+// TestChannelRetention verifies dead-letter channels get a bounded default
+// retention when none is globally configured, and otherwise inherit the
+// configured storage retention like any other channel.
+func TestChannelRetention(t *testing.T) {
+	// No global retention: regular channels keep until consumed (0); dead-letter
+	// channels fall back to the bounded default.
+	m, err := newForTest(t.TempDir())
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	assert.Equal(t, time.Duration(0), m.channelRetention("orders"))
+	assert.Equal(t, defaultDeadLetterRetention, m.channelRetention("orders.dead-letter"))
+
+	// Global retention configured: every channel, dead-letter included, inherits it.
+	cfg := testConfig(t.TempDir())
+	cfg.Storage.RetentionAge = Duration{48 * time.Hour}
+	m2, err := New(cfg, WithTestIdentity("test-instance"))
+	require.NoError(t, err)
+	defer func() { _ = m2.Close() }()
+
+	assert.Equal(t, 48*time.Hour, m2.channelRetention("orders"))
+	assert.Equal(t, 48*time.Hour, m2.channelRetention("orders.dead-letter"))
+}
+
+// TestChannelRollThreshold verifies dead-letter channels roll at the smaller
+// dead-letter segment size while regular channels use the main threshold, and
+// that both honour explicit config.
+func TestChannelRollThreshold(t *testing.T) {
+	const mb = 1024 * 1024
+
+	// Defaults: 256 MB regular, 64 MB dead-letter.
+	m, err := newForTest(t.TempDir())
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	assert.Equal(t, int64(256*mb), m.channelRollThreshold("orders"))
+	assert.Equal(t, int64(64*mb), m.channelRollThreshold("orders.dead-letter"))
+
+	// Explicit config is honoured for both channel kinds.
+	cfg := testConfig(t.TempDir())
+	cfg.Storage.CompactionThresholdMB = 32
+	cfg.Storage.DeadLetterCompactionThresholdMB = 8
+	m2, err := New(cfg, WithTestIdentity("test-instance"))
+	require.NoError(t, err)
+	defer func() { _ = m2.Close() }()
+
+	assert.Equal(t, int64(32*mb), m2.channelRollThreshold("orders"))
+	assert.Equal(t, int64(8*mb), m2.channelRollThreshold("orders.dead-letter"))
+}
+
 // TestAtLeastOnce verifies that a restarted subscriber resumes from its
 // persisted offset and does not replay already-delivered messages.
 func TestAtLeastOnce(t *testing.T) {

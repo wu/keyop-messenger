@@ -145,6 +145,7 @@ func TestApplyDefaults(t *testing.T) {
 
 		assert.Equal(t, 0, c.Storage.SyncIntervalMS)
 		assert.Equal(t, 256, c.Storage.CompactionThresholdMB)
+		assert.Equal(t, 64, c.Storage.DeadLetterCompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 5, *c.Subscribers.MaxRetries)
 		assert.Equal(t, 30, c.TLS.ExpiryWarnDays)
@@ -161,8 +162,9 @@ func TestApplyDefaults(t *testing.T) {
 	t.Run("explicit values are not overwritten", func(t *testing.T) {
 		c := Config{
 			Storage: StorageConfig{
-				SyncIntervalMS:        999,
-				CompactionThresholdMB: 512,
+				SyncIntervalMS:                  999,
+				CompactionThresholdMB:           512,
+				DeadLetterCompactionThresholdMB: 128,
 			},
 			Subscribers: SubscribersConfig{MaxRetries: intPtr(10)},
 			TLS:         TLSConfig{ExpiryWarnDays: 60},
@@ -180,6 +182,7 @@ func TestApplyDefaults(t *testing.T) {
 
 		assert.Equal(t, 999, c.Storage.SyncIntervalMS)
 		assert.Equal(t, 512, c.Storage.CompactionThresholdMB)
+		assert.Equal(t, 128, c.Storage.DeadLetterCompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 10, *c.Subscribers.MaxRetries)
 		assert.Equal(t, 60, c.TLS.ExpiryWarnDays)
