@@ -1,3 +1,9 @@
+## [1.18.0](https://github.com/wu/keyop-messenger/compare/v1.17.0...v1.18.0) (2026-06-25)
+
+### Features
+
+* **stats:** expose dropped/paused counters and oldest-pending latency ([d09c769](https://github.com/wu/keyop-messenger/commit/d09c76940e656fbdae8ad44e0f852a1e13b46469))
+
 ## [1.17.0](https://github.com/wu/keyop-messenger/compare/v1.16.0...v1.17.0) (2026-06-24)
 
 ### Features
