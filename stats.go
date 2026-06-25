@@ -9,8 +9,45 @@ type Stats struct {
 	// Channels contains one entry per known channel, including dead-letter channels.
 	// Order is not guaranteed.
 	Channels []ChannelStats
+	// Totals holds instance-wide aggregates pre-summed from Channels, so metrics
+	// exporters (Graphite, etc.) don't have to walk per-channel/subscriber data.
+	Totals Totals
 	// Federation contains stats for each configured outbound hub connection.
 	Federation FederationStats
+}
+
+// Totals holds instance-wide aggregates derived from the per-channel stats in a
+// Stats snapshot. They are pre-summed so callers shipping metrics to systems
+// like Graphite don't need to re-sum the per-channel and per-subscriber data.
+// Dead-letter channels are excluded from the non-dead-letter totals and reported
+// separately as the error signal. All values are point-in-time, matching the
+// Channels slice they were computed from.
+type Totals struct {
+	// Channels is the count of non-dead-letter channels. (gauge)
+	Channels int
+	// Subscribers is the count of active subscribers across all non-dead-letter
+	// channels. (gauge)
+	Subscribers int
+	// MessagesPublished is the sum of MessageCount over non-dead-letter channels.
+	// Like the per-channel counter, it resets on process restart. (traffic)
+	MessagesPublished int64
+	// StreamBytes is the sum of StreamBytes over non-dead-letter channels — a
+	// monotonic byte-throughput counter that, unlike DiskBytes, does not drop
+	// when compaction removes consumed segments. (traffic)
+	StreamBytes int64
+	// DiskBytes is the sum of DiskBytes over non-dead-letter channels: the
+	// instance's current on-disk footprint for live message data. (saturation)
+	DiskBytes int64
+	// LagBytes is the sum of LagBytes over every subscriber on non-dead-letter
+	// channels — the total unread backlog. This is the primary saturation signal:
+	// a rising value means consumers are falling behind. (saturation)
+	LagBytes int64
+	// DeadLetterMessages is the sum of MessageCount over dead-letter channels.
+	// Like other message counters it resets on process restart. (errors)
+	DeadLetterMessages int64
+	// DeadLetterBytes is the sum of DiskBytes over dead-letter channels: the
+	// current on-disk footprint of dead-lettered messages. (errors)
+	DeadLetterBytes int64
 }
 
 // ChannelStats holds metrics for one channel.

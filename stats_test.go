@@ -2,6 +2,8 @@ package messenger
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -207,4 +209,84 @@ func TestStats_MessageCountIncludesFederated(t *testing.T) {
 	s := m.Stats()
 	require.Len(t, s.Channels, 1)
 	assert.Equal(t, int64(2), s.Channels[0].MessageCount)
+}
+
+// TestStats_Totals verifies the instance-wide aggregates: regular-channel traffic
+// and saturation sums, plus the dead-letter error totals reported separately.
+func TestStats_Totals(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	ctx := context.Background()
+
+	// Two regular channels, each with a subscriber. "alpha" gets two messages;
+	// "beta" gets one. Subscribers consume so lag settles to zero.
+	consumed := make(chan struct{}, 16)
+	okHandler := func(_ context.Context, _ Message) error {
+		consumed <- struct{}{}
+		return nil
+	}
+	require.NoError(t, m.Subscribe(ctx, "alpha", "alpha-sub", okHandler))
+	require.NoError(t, m.Publish(ctx, "alpha", "test.E", map[string]any{"v": 1}))
+	require.NoError(t, m.Publish(ctx, "alpha", "test.E", map[string]any{"v": 2}))
+
+	// "beta" has a handler that always fails with no retries, so its single
+	// message is dead-lettered.
+	require.NoError(t, m.Subscribe(ctx, "beta", "beta-sub",
+		func(_ context.Context, _ Message) error {
+			consumed <- struct{}{}
+			return fmt.Errorf("always fail")
+		},
+		WithMaxRetries(0),
+	))
+	require.NoError(t, m.Publish(ctx, "beta", "test.E", map[string]any{"v": 3}))
+
+	// Wait until the dead-letter has been written and lag has settled.
+	require.Eventually(t, func() bool {
+		return m.Stats().Totals.DeadLetterMessages == 1
+	}, 2*time.Second, 10*time.Millisecond, "beta message should be dead-lettered")
+
+	var s Stats
+	require.Eventually(t, func() bool {
+		s = m.Stats()
+		return s.Totals.LagBytes == 0
+	}, 2*time.Second, 10*time.Millisecond, "subscriber lag should settle to zero")
+
+	tot := s.Totals
+	// Two non-dead-letter channels (alpha, beta); the beta.dead-letter channel is
+	// excluded from these gauges and rolled into the dead-letter totals.
+	assert.Equal(t, 2, tot.Channels, "non-dead-letter channel count")
+	assert.Equal(t, 2, tot.Subscribers, "active subscriber count")
+	assert.Equal(t, int64(3), tot.MessagesPublished, "alpha(2) + beta(1)")
+	assert.Positive(t, tot.StreamBytes)
+	assert.Positive(t, tot.DiskBytes)
+
+	// Dead-letter error signal: beta's one failed message.
+	assert.Equal(t, int64(1), tot.DeadLetterMessages)
+	assert.Positive(t, tot.DeadLetterBytes)
+
+	// The totals must equal the sum of the per-channel stats they aggregate.
+	var wantMsgs, wantStream, wantDisk, wantDLMsgs, wantDLBytes int64
+	var wantSubs, wantChans int
+	for _, ch := range s.Channels {
+		if strings.HasSuffix(ch.Channel, ".dead-letter") {
+			wantDLMsgs += ch.MessageCount
+			wantDLBytes += ch.DiskBytes
+			continue
+		}
+		wantChans++
+		wantSubs += len(ch.Subscribers)
+		wantMsgs += ch.MessageCount
+		wantStream += ch.StreamBytes
+		wantDisk += ch.DiskBytes
+	}
+	assert.Equal(t, wantChans, tot.Channels)
+	assert.Equal(t, wantSubs, tot.Subscribers)
+	assert.Equal(t, wantMsgs, tot.MessagesPublished)
+	assert.Equal(t, wantStream, tot.StreamBytes)
+	assert.Equal(t, wantDisk, tot.DiskBytes)
+	assert.Equal(t, wantDLMsgs, tot.DeadLetterMessages)
+	assert.Equal(t, wantDLBytes, tot.DeadLetterBytes)
 }

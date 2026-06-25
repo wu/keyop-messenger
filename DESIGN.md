@@ -208,7 +208,7 @@ The dead-letter envelope payload:
 
 Dead-letter channels are regular channels in their storage layout. They can be subscribed to for monitoring or reprocessing. Dead-letter channels are not themselves subject to dead-lettering (a failing dead-letter handler is logged and the offset advanced).
 
-**Reserved suffix.** The `.dead-letter` suffix is reserved for the messenger. `Publish` and `PublishBatch` reject any channel name ending in `.dead-letter` with `ErrReservedChannelName`, so a dead-letter channel only ever contains messenger-generated dead-letter envelopes and never application traffic that happens to collide with the naming convention. Subscribing to a dead-letter channel is still permitted — that is how monitoring and reprocessing consumers read it. The internal dead-letter write path does not go through `Publish`; the subscriber writes the dead-letter envelope directly to the channel's writer, so the reserved-suffix guard does not impede it.
+**Reserved suffix.** The `.dead-letter` suffix is reserved for the messenger. `Publish` and `PublishBatch` reject any channel name ending in `.dead-letter` with `ErrReservedChannelName`, so a dead-letter channel only ever contains messenger-generated dead-letter envelopes and never application traffic that happens to collide with the naming convention. Subscribing to a dead-letter channel is still permitted — that is how monitoring and reprocessing consumers read it. The internal dead-letter write path does not go through `Publish`; the subscriber writes the dead-letter envelope directly to the channel's writer, so the reserved-suffix guard does not impede it. Because that write bypasses `Publish`, the subscriber's dead-letter writer is wrapped so each write still increments the dead-letter channel's message counter — without the wrapper a dead-letter channel's `MessageCount` (and the `DeadLetterMessages` total in §12) would stay at zero even as envelopes accumulate.
 
 **Default retention.** An undrained dead-letter channel — one with no reprocessing consumer — would otherwise grow without bound, since consumption-based compaction never reclaims segments no subscriber has read. To bound this, dead-letter channels are given a default retention of **7 days** when no global `storage.retention` is configured: the compactor force-deletes sealed dead-letter segments older than that even though nothing consumed them (see §5.7). When a global `storage.retention` *is* configured, dead-letter channels inherit it like any other channel.
 
@@ -809,3 +809,47 @@ All goroutines are tracked in `EphemeralClient.wg`; `Close()` cancels all stream
 | Subscriber offset | Durable offset file per subscriber | No offset file |
 | Audit log | Full hub events | No audit log on client side |
 | Dedup | Shared instance-wide LRU (100k IDs) | Small per-connection LRU (1024 IDs, defense-in-depth) |
+
+## 12. Observability
+
+`Messenger.Stats()` returns a point-in-time `Stats` snapshot of runtime metrics. Reads are best-effort and the snapshot is not atomic across channels — a counter may advance between the moment one channel is read and the next. It is the intended source for shipping metrics to external systems (Graphite, Prometheus, etc.).
+
+### 12.1 Snapshot Structure
+
+A `Stats` value has three parts:
+
+- **`Channels []ChannelStats`** — one entry per known channel, dead-letter channels included. Each carries `StreamBytes` (monotonic total bytes ever appended — does not drop on compaction), `DiskBytes` (current on-disk footprint of surviving segments — shrinks on compaction), `MessageCount` (messages published since process start; resets on restart), and `Subscribers []SubscriberStats`. Each subscriber reports `LagBytes` (unread bytes between its offset and the stream end) and `OldestPendingUnixMs` (publish timestamp of the record it is parked on, or 0 when caught up — callers compute age as `now − OldestPendingUnixMs` at display time so it stays correct between polls and does not bake in clock skew).
+- **`Totals`** — instance-wide aggregates, described below.
+- **`Federation FederationStats`** — outbound `Clients` (per configured hub: `Connected`, `ReconnectCount`, `UnackedBytes`) and, when this instance runs a hub listener, an inbound `Hub` (`RecordsReceived`, `BatchesReceived`, `ConnectionsAccepted`/`ConnectionsRejected`, active `PublishConns`/`SubscribeConns`, and per-`Peer` detail).
+
+### 12.2 Totals and Golden Signals
+
+`Stats.Totals` pre-sums the per-channel and per-subscriber data so a metrics exporter does not have to walk the `Channels` tree itself. Dead-letter channels are excluded from the non-dead-letter aggregates and reported separately, keeping the error signal clean. Each total is computed in the same `Stats()` pass that builds `Channels`, at no extra I/O cost, so it always equals the sum of the snapshot it accompanies. The fields cover **three of the four** golden signals — Traffic, Saturation, and Errors. The fourth, **Latency**, is not yet measured here; see §12.3.
+
+The table below classifies each total on two independent axes. **Golden signal** is which of the four SRE signals the field serves (`—` for fields that are operational inventory rather than a golden signal). **Type** is how to graph it: a *counter* is start-relative and resets to zero on restart (graph as a rate, e.g. Graphite `nonNegativeDerivative`, which absorbs the reset), whereas a *gauge* is an instantaneous level read fresh each snapshot.
+
+| Field | Golden signal | Type | Meaning |
+|---|---|---|---|
+| `MessagesPublished` | Traffic | counter | Sum of `MessageCount` over non-dead-letter channels |
+| `StreamBytes` | Traffic | counter | Sum of `StreamBytes` over non-dead-letter channels (byte throughput; survives compaction) |
+| `DiskBytes` | Saturation | gauge | Sum of `DiskBytes` over non-dead-letter channels — current live-data footprint |
+| `LagBytes` | Saturation | gauge | Sum of every subscriber's `LagBytes` — total unread backlog; the primary "consumers falling behind" signal |
+| `DeadLetterMessages` | Errors | counter | Sum of `MessageCount` over dead-letter channels |
+| `DeadLetterBytes` | Errors | gauge | Sum of `DiskBytes` over dead-letter channels |
+| `Channels` | — | gauge | Count of non-dead-letter channels (inventory) |
+| `Subscribers` | — | gauge | Count of active subscribers across non-dead-letter channels (inventory) |
+
+Two notes on the classification:
+
+- There is deliberately **no Latency total**. The per-subscriber `OldestPendingUnixMs` is sometimes mistaken for latency, but it measures **backlog age** — how stale the single oldest *un*consumed message is — which is a saturation-adjacent indicator, not the latency golden signal. True latency (how long a publish takes to reach disk, how long consumers take to process a message, how long a message takes to move between a client and a hub) is a distribution over *delivered* operations, not a max/min over pending timestamps, and is not yet measured. See §12.3.
+- `DeadLetterMessages` (a counter) depends on the dead-letter write counter described in §5.5 and so resets on restart, whereas `DeadLetterBytes` (a gauge) is read straight from disk and is therefore durable across restarts — the two error totals recover differently after a bounce.
+
+### 12.3 Latency (planned)
+
+Latency is the one golden signal `Stats()` does not yet report. It is not a single number but a set of per-stage distributions:
+
+- **Publish→disk** — time from a `Publish`/`PublishBatch` call to the message being durably written (fsync), measured on the writer's own clock.
+- **Consume** — time from publish to a subscriber's handler completing successfully, plus the handler's own execution time.
+- **Client↔hub transit** — time for a message to move from a federation client to its hub, best measured as an ack round-trip on the client's clock so it is free of cross-host clock skew.
+
+Because these are durations rather than sums, they do not fit the counter/gauge `Totals` model. The planned approach is to expose, per stage, a running **count + summed duration** (so exporters can derive an average over any interval, matching the existing count/sum style), and later fixed-bucket histograms for percentiles/tails. Until that lands, end-to-end age can be approximated externally from `OldestPendingUnixMs`, with the clock-skew caveat noted in §12.1.

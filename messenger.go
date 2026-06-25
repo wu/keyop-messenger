@@ -191,6 +191,35 @@ type channelState struct {
 	publishCount atomic.Int64
 }
 
+// countingWriter wraps a ChannelWriter to increment a publish counter on each
+// successful write. It is used for the dead-letter writer handed to subscribers:
+// their writes go straight to the writer and bypass the Publish path that
+// normally maintains a channel's publishCount, so without this wrapper a
+// dead-letter channel's MessageCount (and any total derived from it) would stay
+// at zero. The federation path (writeLocalEnvelope) increments publishCount
+// itself, so the dead-letter channelState's own writer is left unwrapped to
+// avoid double counting.
+type countingWriter struct {
+	storage.ChannelWriter
+	count *atomic.Int64
+}
+
+func (w countingWriter) Write(ctx context.Context, env *envelope.Envelope) error {
+	if err := w.ChannelWriter.Write(ctx, env); err != nil {
+		return err
+	}
+	w.count.Add(1)
+	return nil
+}
+
+func (w countingWriter) WriteBatch(ctx context.Context, envs []*envelope.Envelope) error {
+	if err := w.ChannelWriter.WriteBatch(ctx, envs); err != nil {
+		return err
+	}
+	w.count.Add(int64(len(envs)))
+	return nil
+}
+
 // broadcastNotify sends a non-blocking notification to every subscriber for
 // this channel. Called from the channel writer's notifyFn goroutine.
 func (cs *channelState) broadcastNotify() {
@@ -634,7 +663,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		m.offsetDir(channel),
 		m.reg,
 		maxRetries,
-		dlState.writer,
+		countingWriter{ChannelWriter: dlState.writer, count: &dlState.publishCount},
 		m.log,
 		time.Duration(m.cfg.Storage.OffsetFlushIntervalMS)*time.Millisecond,
 	)
@@ -810,7 +839,11 @@ func (m *Messenger) Stats() Stats {
 			m.log.Warn("stats: read channel disk bytes", "channel", name, "err", err)
 		}
 
+		isDeadLetter := strings.HasSuffix(name, deadLetterSuffix)
+		msgCount := cs.publishCount.Load()
+
 		cs.mu.RLock()
+		var channelLag int64
 		subs := make([]SubscriberStats, 0, len(cs.subs))
 		for id, entry := range cs.subs {
 			off := entry.sub.Offset()
@@ -818,6 +851,7 @@ func (m *Messenger) Stats() Stats {
 			if lag < 0 {
 				lag = 0
 			}
+			channelLag += lag
 			// When the subscriber is behind, read the timestamp of the record it is
 			// parked on to expose time-based lag (byte lag alone hides a slow or
 			// stalled consumer on a low-rate channel). Best-effort: log and skip on error.
@@ -838,9 +872,21 @@ func (m *Messenger) Stats() Stats {
 			Channel:      name,
 			StreamBytes:  streamEnd,
 			DiskBytes:    diskBytes,
-			MessageCount: cs.publishCount.Load(),
+			MessageCount: msgCount,
 			Subscribers:  subs,
 		})
+
+		if isDeadLetter {
+			s.Totals.DeadLetterMessages += msgCount
+			s.Totals.DeadLetterBytes += diskBytes
+		} else {
+			s.Totals.Channels++
+			s.Totals.Subscribers += len(subs)
+			s.Totals.MessagesPublished += msgCount
+			s.Totals.StreamBytes += streamEnd
+			s.Totals.DiskBytes += diskBytes
+			s.Totals.LagBytes += channelLag
+		}
 	}
 
 	if len(m.clients) > 0 {
