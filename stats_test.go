@@ -290,3 +290,77 @@ func TestStats_Totals(t *testing.T) {
 	assert.Equal(t, wantDLMsgs, tot.DeadLetterMessages)
 	assert.Equal(t, wantDLBytes, tot.DeadLetterBytes)
 }
+
+// TestStats_LatencyAggregates verifies the per-stage latency aggregates: a
+// publish records a publish-to-disk sample, and a successful consume records a
+// consume-age sample and a handler-latency sample whose summed duration reflects
+// the time the handler spent.
+func TestStats_LatencyAggregates(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	ctx := context.Background()
+
+	const handlerDelay = 20 * time.Millisecond
+	delivered := make(chan struct{}, 4)
+	require.NoError(t, m.Subscribe(ctx, "events", "sub",
+		func(_ context.Context, _ Message) error {
+			time.Sleep(handlerDelay)
+			delivered <- struct{}{}
+			return nil
+		}))
+
+	require.NoError(t, m.Publish(ctx, "events", "test.E", map[string]any{"v": 1}))
+
+	select {
+	case <-delivered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("message not delivered within 2s")
+	}
+
+	// The handler signals before dispatch records the sample and advances the
+	// offset, so poll until the consume sample lands.
+	var s Stats
+	require.Eventually(t, func() bool {
+		s = m.Stats()
+		return s.Latency.Consume.Count == 1
+	}, 2*time.Second, 10*time.Millisecond, "consume latency sample should be recorded")
+
+	lat := s.Latency
+
+	// Publish-to-disk: one write op, positive duration.
+	assert.Equal(t, int64(1), lat.PublishToDisk.Count)
+	assert.Positive(t, lat.PublishToDisk.SumNanos)
+
+	// Handler latency: one sample, at least the artificial handler delay.
+	assert.Equal(t, int64(1), lat.Handler.Count)
+	assert.GreaterOrEqual(t, lat.Handler.SumNanos, int64(handlerDelay),
+		"handler latency should be at least the handler's sleep")
+
+	// Consume age (publish -> handler done) includes the handler time, so it is
+	// at least as large as the handler latency.
+	assert.Equal(t, int64(1), lat.Consume.Count)
+	assert.GreaterOrEqual(t, lat.Consume.SumNanos, lat.Handler.SumNanos,
+		"consume age should be >= handler latency")
+}
+
+// TestStats_LatencyBatchCountsOnce verifies a PublishBatch records a single
+// publish-to-disk sample regardless of how many messages it carries.
+func TestStats_LatencyBatchCountsOnce(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	require.NoError(t, m.PublishBatch(context.Background(), "events", []BatchMessage{
+		{PayloadType: "test.E", Payload: map[string]any{"v": 1}},
+		{PayloadType: "test.E", Payload: map[string]any{"v": 2}},
+		{PayloadType: "test.E", Payload: map[string]any{"v": 3}},
+	}))
+
+	lat := m.Stats().Latency
+	assert.Equal(t, int64(1), lat.PublishToDisk.Count, "a batch is one write operation")
+	assert.Positive(t, lat.PublishToDisk.SumNanos)
+}

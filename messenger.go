@@ -253,6 +253,20 @@ type Messenger struct {
 	stop      chan struct{}
 	closeOnce sync.Once
 	wg        sync.WaitGroup
+
+	// publish-to-disk latency aggregate (Latency.PublishToDisk): summed write
+	// durations and the operation count, accumulated across every write site
+	// (Publish, PublishBatch, federation writeLocalEnvelope).
+	writeLatencySumNs atomic.Int64
+	writeLatencyCount atomic.Int64
+}
+
+// recordWriteLatency adds one publish-to-disk sample (the elapsed time since
+// start) to the instance-wide write-latency aggregate. Called after a writer
+// Write/WriteBatch returns success.
+func (m *Messenger) recordWriteLatency(start time.Time) {
+	m.writeLatencySumNs.Add(int64(time.Since(start)))
+	m.writeLatencyCount.Add(1)
 }
 
 // New constructs and starts a Messenger. It creates the required directory
@@ -505,9 +519,11 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 	// recognised as already seen and not re-delivered locally.
 	m.dedup.SeenOrAdd(env.ID)
 
+	writeStart := time.Now()
 	if err := cs.writer.Write(ctx, &env); err != nil {
 		return fmt.Errorf("publish %q: write: %w", channel, err)
 	}
+	m.recordWriteLatency(writeStart)
 	cs.publishCount.Add(1)
 
 	// Notify hub channel readers that new data is available for this channel.
@@ -592,9 +608,11 @@ func (m *Messenger) PublishBatch(ctx context.Context, channel string, msgs []Bat
 		envs = append(envs, &env)
 	}
 
+	writeStart := time.Now()
 	if err := cs.writer.WriteBatch(ctx, envs); err != nil {
 		return fmt.Errorf("publish batch %q: write: %w", channel, err)
 	}
+	m.recordWriteLatency(writeStart)
 	cs.publishCount.Add(int64(len(envs)))
 
 	// One notification per batch wakes local subscribers and outbound readers;
@@ -852,6 +870,16 @@ func (m *Messenger) Stats() Stats {
 				lag = 0
 			}
 			channelLag += lag
+
+			// Fold this subscriber's latency aggregates into the consume/handler
+			// stages. Both stages sum across every subscriber, dead-letter ones
+			// included — a dead-letter monitor is still a consumer.
+			caSum, caCount := entry.sub.ConsumeAgeAggregate()
+			s.Latency.Consume.SumNanos += caSum
+			s.Latency.Consume.Count += caCount
+			hlSum, hlCount := entry.sub.HandlerLatencyAggregate()
+			s.Latency.Handler.SumNanos += hlSum
+			s.Latency.Handler.Count += hlCount
 			// When the subscriber is behind, read the timestamp of the record it is
 			// parked on to expose time-based lag (byte lag alone hides a slow or
 			// stalled consumer on a low-rate channel). Best-effort: log and skip on error.
@@ -888,6 +916,11 @@ func (m *Messenger) Stats() Stats {
 			s.Totals.LagBytes += channelLag
 		}
 	}
+
+	// Publish-to-disk latency is instance-wide, accumulated at the write sites
+	// rather than derived from the per-channel snapshot.
+	s.Latency.PublishToDisk.SumNanos = m.writeLatencySumNs.Load()
+	s.Latency.PublishToDisk.Count = m.writeLatencyCount.Load()
 
 	if len(m.clients) > 0 {
 		s.Federation.Clients = make([]ClientStats, 0, len(m.clients))
@@ -1028,9 +1061,11 @@ func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
 	if err != nil {
 		return err
 	}
+	writeStart := time.Now()
 	if err := cs.writer.Write(context.Background(), env); err != nil {
 		return err
 	}
+	m.recordWriteLatency(writeStart)
 	cs.publishCount.Add(1)
 
 	// Notify hub channel readers that new data is available for this channel.
@@ -1071,9 +1106,11 @@ func (m *Messenger) writeLocalEnvelopeBatch(envs []*envelope.Envelope) error {
 		if err != nil {
 			return err
 		}
+		writeStart := time.Now()
 		if err := cs.writer.WriteBatch(context.Background(), group); err != nil {
 			return err
 		}
+		m.recordWriteLatency(writeStart)
 		cs.publishCount.Add(int64(len(group)))
 
 		if m.hub != nil {

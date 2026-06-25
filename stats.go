@@ -12,8 +12,43 @@ type Stats struct {
 	// Totals holds instance-wide aggregates pre-summed from Channels, so metrics
 	// exporters (Graphite, etc.) don't have to walk per-channel/subscriber data.
 	Totals Totals
+	// Latency holds per-stage latency aggregates — the fourth golden signal.
+	Latency Latency
 	// Federation contains stats for each configured outbound hub connection.
 	Federation FederationStats
+}
+
+// Latency holds running latency aggregates for each pipeline stage. Latency is
+// a distribution, not a sum, so rather than a single number each stage exposes a
+// sample count and the summed duration; an exporter derives the average over an
+// interval as Δ(SumNanos)/Δ(Count) — matching the count/sum style of Totals. All
+// values are start-relative counters that reset to zero on process restart, so
+// graph the deltas (e.g. Graphite nonNegativeDerivative), not the absolute level.
+type Latency struct {
+	// PublishToDisk measures the time from a Publish/PublishBatch (or a
+	// federation-received write) to the message being durably written (fsync),
+	// on the writing host's own clock. One sample per write operation: a batch
+	// counts once, with the whole batch's commit time.
+	PublishToDisk LatencyStage
+	// Consume measures the end-to-end delivery age of successfully consumed
+	// messages: the time from publish (the envelope timestamp) to a subscriber's
+	// handler returning success. It spans the publisher and consumer clocks, so
+	// across federated hosts it carries clock skew (clamped to >= 0).
+	Consume LatencyStage
+	// Handler measures the time spent inside subscriber handlers for successfully
+	// consumed messages, on the consumer's own clock. Unlike Consume it excludes
+	// queue wait, isolating handler cost from delivery delay.
+	Handler LatencyStage
+}
+
+// LatencyStage is one stage's running aggregate: the number of samples observed
+// and their summed duration in nanoseconds. The mean is SumNanos/Count (guard
+// against Count == 0).
+type LatencyStage struct {
+	// Count is the number of samples observed since process start.
+	Count int64
+	// SumNanos is the summed duration of all samples, in nanoseconds.
+	SumNanos int64
 }
 
 // Totals holds instance-wide aggregates derived from the per-channel stats in a

@@ -147,6 +147,15 @@ type Subscriber struct {
 	startupSkipped   atomic.Int64
 	oversizedSkipped atomic.Int64
 
+	// Latency aggregates for successfully consumed messages (Option B: running
+	// count + summed nanos, so callers derive an average). consumeAge is the
+	// end-to-end delivery age (now − envelope timestamp); handlerLatency is the
+	// time spent in the handler alone. Recorded once per successful dispatch.
+	consumeAgeSumNs     atomic.Int64
+	consumeAgeCount     atomic.Int64
+	handlerLatencySumNs atomic.Int64
+	handlerLatencyCount atomic.Int64
+
 	// maxAge, when > 0, enables one-time startup freshness filtering: on first
 	// start the subscriber fast-forwards its offset past buffered messages older
 	// than maxAge. Set via SetMaxAge before Start; read only from the subscriber
@@ -280,6 +289,20 @@ func (s *Subscriber) Offset() int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.offset
+}
+
+// ConsumeAgeAggregate returns the running latency aggregate for end-to-end
+// delivery age of successfully consumed messages: the summed age in nanoseconds
+// and the sample count. The mean is sumNanos/count (guard count == 0).
+func (s *Subscriber) ConsumeAgeAggregate() (sumNanos, count int64) {
+	return s.consumeAgeSumNs.Load(), s.consumeAgeCount.Load()
+}
+
+// HandlerLatencyAggregate returns the running latency aggregate for time spent
+// inside the handler for successfully consumed messages: the summed duration in
+// nanoseconds and the sample count.
+func (s *Subscriber) HandlerLatencyAggregate() (sumNanos, count int64) {
+	return s.handlerLatencySumNs.Load(), s.handlerLatencyCount.Load()
 }
 
 // Stop signals the goroutine to exit and blocks until it does.
@@ -728,8 +751,18 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 				}
 			}
 		}
+		handlerStart := time.Now()
 		lastErr = s.callHandler(handler, env, payload)
 		if lastErr == nil {
+			// Record latency only for successfully consumed messages, so failed
+			// and retried attempts don't skew the average. Consume age spans the
+			// publisher and consumer clocks; clamp skew-induced negatives to zero.
+			s.handlerLatencySumNs.Add(int64(time.Since(handlerStart)))
+			s.handlerLatencyCount.Add(1)
+			if age := time.Since(env.Ts); age > 0 {
+				s.consumeAgeSumNs.Add(int64(age))
+			}
+			s.consumeAgeCount.Add(1)
 			s.advanceOffset(nextOffset)
 			return false
 		}
