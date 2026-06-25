@@ -112,7 +112,50 @@ type SubscribersConfig struct {
 	// Use a pointer so that an explicit value of 0 (fail immediately to the dead-letter
 	// channel) is distinguishable from "not set" when loading from YAML. A nil value
 	// is replaced with the default of 5 by [Config.ApplyDefaults].
+	//
+	// In-order delivery and retries: retries run inline in the subscriber's own
+	// delivery goroutine (with exponential backoff — 100ms, doubling, capped at 5s per
+	// attempt), so the subscriber does not advance to any later message until the
+	// current one succeeds or is dead-lettered. For an ordered stream of state-change
+	// events this head-of-line blocking is usually the desired behaviour: message N+1
+	// must not be applied before N. The cost is latency — a consistently-failing
+	// message stalls this subscriber for the whole retry window (~3.1s at the default of
+	// 5; higher values add up to the 5s-per-attempt cap) before it dead-letters. The
+	// stall is per subscriber: each has its own goroutine and offset, so other
+	// subscribers on the same channel keep delivering independently.
+	//
+	// Tune to the workload. A latency-sensitive channel that tolerates reordering can
+	// lower max_retries to dead-letter sooner; an ordered channel that must ride out a
+	// downstream restart can widen the window (see RetryBackoffBaseMS / RetryBackoffMaxMS).
+	// Where dropping a message is unacceptable, prefer returning [ErrRetryLater] from the
+	// handler over any finite budget: it pauses delivery without dead-lettering (and is
+	// not counted against this budget), preserving order indefinitely instead of
+	// eventually advancing past the failed message and leaving a gap.
+	//
+	// These are instance-wide defaults. Any single subscriber can override both the
+	// retry count and the backoff schedule with [WithMaxRetries] and [WithRetryBackoff],
+	// so two subscribers — even on the same channel — can each get the retry window that
+	// suits them (e.g. an ordered consumer with a wide window and a latency-sensitive one
+	// that dead-letters quickly).
 	MaxRetries *int `yaml:"max_retries"`
+
+	// RetryBackoffBaseMS is the first retry delay in milliseconds; each subsequent
+	// retry doubles it, capped at RetryBackoffMaxMS. Default: 100.
+	//
+	// Together with MaxRetries this sets the total retry window before a failing
+	// message is dead-lettered. Widen it (raise the base, the cap, or MaxRetries) for
+	// channels whose handler should ride out a downstream restart/failover (typically
+	// 10–60s) before giving up — at the defaults the window is only ~3.1s, which rides
+	// out a brief blip but not a restart. A wider window also lengthens the in-order
+	// stall for the affected subscriber (see MaxRetries) — usually acceptable, since for
+	// an ordered channel holding position is the point. Where dropping a message is
+	// unacceptable, prefer [ErrRetryLater] over a large budget: it never dead-letters,
+	// so it cannot advance past a failed message and leave an ordering gap.
+	RetryBackoffBaseMS int `yaml:"retry_backoff_base_ms"`
+
+	// RetryBackoffMaxMS caps the per-attempt retry delay in milliseconds, so the
+	// backoff stops doubling once it reaches this value. Default: 5000.
+	RetryBackoffMaxMS int `yaml:"retry_backoff_max_ms"`
 }
 
 // AllowedPeer is an instance that is permitted to connect to this hub.
@@ -283,6 +326,13 @@ func (c *Config) ApplyDefaults() {
 		c.Subscribers.MaxRetries = &n
 	}
 
+	if c.Subscribers.RetryBackoffBaseMS == 0 {
+		c.Subscribers.RetryBackoffBaseMS = 100
+	}
+	if c.Subscribers.RetryBackoffMaxMS == 0 {
+		c.Subscribers.RetryBackoffMaxMS = 5000
+	}
+
 	if c.TLS.ExpiryWarnDays == 0 {
 		c.TLS.ExpiryWarnDays = 30
 	}
@@ -352,6 +402,13 @@ func (c *Config) Validate() error {
 
 	if c.Subscribers.MaxRetries != nil && *c.Subscribers.MaxRetries < 0 {
 		errs = append(errs, errors.New("subscribers.max_retries must be non-negative"))
+	}
+
+	if c.Subscribers.RetryBackoffBaseMS < 0 {
+		errs = append(errs, errors.New("subscribers.retry_backoff_base_ms must be non-negative"))
+	}
+	if c.Subscribers.RetryBackoffMaxMS < 0 {
+		errs = append(errs, errors.New("subscribers.retry_backoff_max_ms must be non-negative"))
 	}
 
 	if c.Hub.Enabled && c.Hub.ListenAddr == "" {

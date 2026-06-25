@@ -598,6 +598,22 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		opt(&so)
 	}
 
+	// Effective retry policy: instance config by default, overridable per
+	// subscription via WithMaxRetries / WithRetryBackoff.
+	maxRetries := *m.cfg.Subscribers.MaxRetries
+	if so.maxRetries != nil {
+		maxRetries = *so.maxRetries
+		if maxRetries < 0 {
+			maxRetries = 0
+		}
+	}
+	retryBase := time.Duration(m.cfg.Subscribers.RetryBackoffBaseMS) * time.Millisecond
+	retryMax := time.Duration(m.cfg.Subscribers.RetryBackoffMaxMS) * time.Millisecond
+	if so.retryBackoffSet {
+		retryBase = so.retryBase
+		retryMax = so.retryMax
+	}
+
 	cs, err := m.getOrCreateChannelState(channel)
 	if err != nil {
 		return fmt.Errorf("subscribe %q: %w", channel, err)
@@ -617,7 +633,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		m.channelDir(channel),
 		m.offsetDir(channel),
 		m.reg,
-		*m.cfg.Subscribers.MaxRetries,
+		maxRetries,
 		dlState.writer,
 		m.log,
 		time.Duration(m.cfg.Storage.OffsetFlushIntervalMS)*time.Millisecond,
@@ -627,6 +643,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		return fmt.Errorf("subscribe %q/%q: %w", channel, subscriberID, err)
 	}
 	sub.SetMaxAge(so.maxAge)
+	sub.SetRetryBackoff(retryBase, retryMax)
 
 	entry := &subscriberEntry{sub: sub, notifier: notifier, cancel: cancel}
 

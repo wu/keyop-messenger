@@ -976,3 +976,55 @@ func TestScanCompleteLines_ScannerResumesAfterMoreData(t *testing.T) {
 	require.NoError(t, s2.Err())
 	assert.Equal(t, []string{"line1", "line2-completed"}, got)
 }
+
+// TestRetryBackoff_Schedule verifies the exponential schedule, the per-attempt
+// cap, and that a large attempt count cannot overflow into a negative delay.
+func TestRetryBackoff_Schedule(t *testing.T) {
+	base := 100 * time.Millisecond
+	maxDelay := 5 * time.Second
+	cases := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{0, base}, // attempt < 1 is treated as 1
+		{1, 100 * time.Millisecond},
+		{2, 200 * time.Millisecond},
+		{3, 400 * time.Millisecond},
+		{4, 800 * time.Millisecond},
+		{5, 1600 * time.Millisecond},
+		{6, 3200 * time.Millisecond},
+		{7, maxDelay}, // 6400ms capped to 5s
+		{8, maxDelay},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, retryBackoff(base, maxDelay, c.attempt), "attempt %d", c.attempt)
+	}
+	// A very large attempt count must stay capped, never overflow negative.
+	assert.Equal(t, maxDelay, retryBackoff(base, maxDelay, 1000))
+}
+
+// TestMakeRetryDelay_DefaultsAndOverrides verifies non-positive base/cap fall
+// back to the package defaults and explicit values are honoured.
+func TestMakeRetryDelay_DefaultsAndOverrides(t *testing.T) {
+	def := makeRetryDelay(0, 0)
+	assert.Equal(t, defaultRetryBase, def(1), "zero base falls back to default")
+	assert.Equal(t, defaultRetryMax, def(100), "zero cap falls back to default and caps")
+
+	custom := makeRetryDelay(50*time.Millisecond, time.Second)
+	assert.Equal(t, 50*time.Millisecond, custom(1))
+	assert.Equal(t, 200*time.Millisecond, custom(3))
+	assert.Equal(t, time.Second, custom(10), "capped at the configured max")
+}
+
+// TestSetRetryBackoff_OverridesSchedule verifies SetRetryBackoff swaps the
+// subscriber's delay function.
+func TestSetRetryBackoff_OverridesSchedule(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "ch")
+	offsetDir := filepath.Join(dir, "offsets")
+	sub, _, _ := newTestSub(t, "s", channelDir, offsetDir, 5)
+
+	sub.SetRetryBackoff(10*time.Millisecond, 40*time.Millisecond)
+	assert.Equal(t, 10*time.Millisecond, sub.retryDelay(1))
+	assert.Equal(t, 40*time.Millisecond, sub.retryDelay(5), "capped at the configured max")
+}

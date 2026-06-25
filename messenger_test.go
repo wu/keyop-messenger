@@ -281,6 +281,44 @@ func TestChannelRollThreshold(t *testing.T) {
 	assert.Equal(t, int64(8*mb), m2.channelRollThreshold("orders.dead-letter"))
 }
 
+// TestSubscribe_PerSubscriptionRetryOverride verifies WithMaxRetries overrides the
+// instance default for a single subscription: with WithMaxRetries(0) the failing
+// handler is invoked exactly once, whereas the instance default of 5 would invoke
+// it again after the first backoff (~100ms).
+func TestSubscribe_PerSubscriptionRetryOverride(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir) // instance default max_retries = 5
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+
+	ctx := context.Background()
+	calls := make(chan struct{}, 16)
+
+	require.NoError(t, m.Subscribe(ctx, "events", "sub",
+		func(_ context.Context, _ Message) error {
+			calls <- struct{}{}
+			return fmt.Errorf("always fail")
+		},
+		WithMaxRetries(0),
+	))
+
+	require.NoError(t, m.Publish(ctx, "events", "test.T", map[string]any{"n": 1}))
+
+	// First (and, with WithMaxRetries(0), only) attempt.
+	select {
+	case <-calls:
+	case <-time.After(time.Second):
+		t.Fatal("handler was not invoked")
+	}
+
+	// The instance default of 5 would retry after ~100ms; the override must suppress it.
+	select {
+	case <-calls:
+		t.Fatal("handler was retried despite WithMaxRetries(0)")
+	case <-time.After(400 * time.Millisecond):
+	}
+}
+
 // TestAtLeastOnce verifies that a restarted subscriber resumes from its
 // persisted offset and does not replay already-delivered messages.
 func TestAtLeastOnce(t *testing.T) {

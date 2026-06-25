@@ -148,6 +148,8 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 64, c.Storage.DeadLetterCompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 5, *c.Subscribers.MaxRetries)
+		assert.Equal(t, 100, c.Subscribers.RetryBackoffBaseMS)
+		assert.Equal(t, 5000, c.Subscribers.RetryBackoffMaxMS)
 		assert.Equal(t, 30, c.TLS.ExpiryWarnDays)
 		assert.Equal(t, 500, c.Federation.ReconnectBaseMS)
 		assert.Equal(t, 60_000, c.Federation.ReconnectMaxMS)
@@ -166,7 +168,7 @@ func TestApplyDefaults(t *testing.T) {
 				CompactionThresholdMB:           512,
 				DeadLetterCompactionThresholdMB: 128,
 			},
-			Subscribers: SubscribersConfig{MaxRetries: intPtr(10)},
+			Subscribers: SubscribersConfig{MaxRetries: intPtr(10), RetryBackoffBaseMS: 250, RetryBackoffMaxMS: 10_000},
 			TLS:         TLSConfig{ExpiryWarnDays: 60},
 			Federation: FederationConfig{
 				ReconnectBaseMS:    1000,
@@ -185,6 +187,8 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 128, c.Storage.DeadLetterCompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 10, *c.Subscribers.MaxRetries)
+		assert.Equal(t, 250, c.Subscribers.RetryBackoffBaseMS)
+		assert.Equal(t, 10_000, c.Subscribers.RetryBackoffMaxMS)
 		assert.Equal(t, 60, c.TLS.ExpiryWarnDays)
 		assert.Equal(t, 1000, c.Federation.ReconnectBaseMS)
 		assert.Equal(t, 30_000, c.Federation.ReconnectMaxMS)

@@ -51,18 +51,43 @@ func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err 
 	return 0, nil, nil
 }
 
-// defaultRetryDelay returns exponential backoff delay for retry attempt n (1-based).
-// Starts at 100ms, doubles each attempt, capped at 5s.
-func defaultRetryDelay(attempt int) time.Duration {
-	const (
-		base       = 100 * time.Millisecond
-		maxBackoff = 5 * time.Second
-	)
-	d := time.Duration(float64(base) * math.Pow(2, float64(attempt-1)))
-	if d > maxBackoff {
-		return maxBackoff
+// Default exponential-backoff parameters used between handler retry attempts
+// when the messenger does not configure them explicitly.
+const (
+	defaultRetryBase = 100 * time.Millisecond
+	defaultRetryMax  = 5 * time.Second
+)
+
+// retryBackoff returns the delay before retry attempt n (1-based):
+// base * 2^(attempt-1), capped at max. The cap comparison is done in float space
+// before converting to a Duration, so a very large attempt count cannot overflow
+// int64 and wrap to a negative (immediate-retry) delay.
+func retryBackoff(base, maxDelay time.Duration, attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
 	}
-	return d
+	ns := float64(base) * math.Pow(2, float64(attempt-1))
+	if ns >= float64(maxDelay) {
+		return maxDelay
+	}
+	return time.Duration(ns)
+}
+
+// defaultRetryDelay is the backoff schedule used when no override is configured.
+func defaultRetryDelay(attempt int) time.Duration {
+	return retryBackoff(defaultRetryBase, defaultRetryMax, attempt)
+}
+
+// makeRetryDelay builds a backoff function from base and max; non-positive values
+// fall back to the package defaults (100ms base, 5s cap).
+func makeRetryDelay(base, maxDelay time.Duration) func(attempt int) time.Duration {
+	if base <= 0 {
+		base = defaultRetryBase
+	}
+	if maxDelay <= 0 {
+		maxDelay = defaultRetryMax
+	}
+	return func(attempt int) time.Duration { return retryBackoff(base, maxDelay, attempt) }
 }
 
 // HandlerFunc processes a decoded message. A non-nil return or a panic
@@ -270,6 +295,15 @@ func (s *Subscriber) Stop() {
 // backlog. Filtering happens only at startup — steady-state messages are never
 // skipped. Must be called before Start.
 func (s *Subscriber) SetMaxAge(d time.Duration) { s.maxAge = d }
+
+// SetRetryBackoff configures the exponential-backoff schedule applied between
+// handler retry attempts: delay = base * 2^(attempt-1), capped at max. Non-positive
+// values fall back to the defaults (100ms base, 5s cap). Must be called before Start.
+// A longer schedule widens the per-message retry window before the (order-breaking)
+// dead-letter; it also lengthens head-of-line blocking for this subscriber.
+func (s *Subscriber) SetRetryBackoff(base, maxDelay time.Duration) {
+	s.retryDelay = makeRetryDelay(base, maxDelay)
+}
 
 func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	defer close(s.doneCh)
@@ -665,6 +699,17 @@ func recordLenAt(path string, localOffset int64) (int64, error) {
 // dispatch calls handler with up to maxRetries+1 total attempts with
 // exponential backoff. If Stop is called during a backoff the function returns
 // immediately without advancing the offset (message re-delivered on restart).
+//
+// The retry loop — including the backoff sleeps — runs inline in this subscriber's
+// own delivery goroutine, so the subscriber does not advance to any later message on
+// the channel until the current one succeeds or is dead-lettered. For an ordered
+// stream of state-change events this head-of-line blocking is usually the desired
+// behaviour: N+1 is not processed before N. It is per subscriber — other subscribers
+// on the channel have their own goroutine and offset and are unaffected. The cost is
+// latency: a consistently-failing message stalls this subscriber for the whole retry
+// window (~3.1s at the default maxRetries of 5) before dead-lettering. See the
+// SubscribersConfig.MaxRetries docs and DESIGN §5.5 for tuning the window and the
+// ErrRetryLater alternative (which preserves order without ever dead-lettering).
 //
 // It returns retryLater=true when the handler signalled a transient downstream
 // failure via ErrRetryLater. In that case the message is neither retried to

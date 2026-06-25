@@ -103,3 +103,29 @@ func TestWithDataDirWithNilConfig(t *testing.T) {
 	_, err = os.Stat(filepath.Join(overrideDir, "channels", "events"))
 	assert.NoError(t, err, "channel dir should exist under the override data dir")
 }
+
+// TestWithMaxRetries_SetsOption verifies WithMaxRetries records an override,
+// including an explicit 0 (distinguished from "not set" by the pointer).
+func TestWithMaxRetries_SetsOption(t *testing.T) {
+	var so subscribeOptions
+	assert.Nil(t, so.maxRetries, "unset by default")
+
+	WithMaxRetries(0)(&so)
+	require.NotNil(t, so.maxRetries)
+	assert.Equal(t, 0, *so.maxRetries)
+
+	WithMaxRetries(9)(&so)
+	require.NotNil(t, so.maxRetries)
+	assert.Equal(t, 9, *so.maxRetries)
+}
+
+// TestWithRetryBackoff_SetsOption verifies WithRetryBackoff records the schedule.
+func TestWithRetryBackoff_SetsOption(t *testing.T) {
+	var so subscribeOptions
+	assert.False(t, so.retryBackoffSet, "unset by default")
+
+	WithRetryBackoff(250*time.Millisecond, 10*time.Second)(&so)
+	assert.True(t, so.retryBackoffSet)
+	assert.Equal(t, 250*time.Millisecond, so.retryBase)
+	assert.Equal(t, 10*time.Second, so.retryMax)
+}
