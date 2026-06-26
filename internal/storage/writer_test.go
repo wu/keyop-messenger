@@ -43,6 +43,12 @@ func (f *fakeFile) Write(b []byte) (int, error) {
 	}
 	return f.buf.Write(b)
 }
+func (f *fakeFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.buf.Truncate(int(size))
+	return nil
+}
 func (f *fakeFile) Sync() error  { f.syncCount.Add(1); return nil }
 func (f *fakeFile) Close() error { f.mu.Lock(); defer f.mu.Unlock(); f.closed = true; return nil }
 
@@ -195,6 +201,61 @@ func TestWriter_Backpressure(t *testing.T) {
 	var v map[string]any
 	require.NoError(t, json.Unmarshal([]byte(lines[0]), &v))
 	assert.Equal(t, failFirst, ff.FailsDone())
+}
+
+// TestWriter_PartialWriteTruncatedNotConcatenated reproduces the data-loss bug:
+// a transient error that lands a partial write must be rolled back by truncation
+// so the retry produces a single clean record, not [partial][full]\n. Before the
+// fix the on-disk buffer held the concatenation and the line failed to unmarshal.
+func TestWriter_PartialWriteTruncatedNotConcatenated(t *testing.T) {
+	f := &partialWriteFile{failFirst: 1, partial: 4}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: f}, 1000000, nil, nil)
+	require.NoError(t, w.Write(context.Background(), makeTestEnvelope(t, "ord-1")))
+	require.NoError(t, w.Close())
+
+	lines := f.Lines()
+	require.Len(t, lines, 1, "exactly one record on disk after partial write + retry")
+	var v map[string]any
+	require.NoError(t, json.Unmarshal([]byte(lines[0]), &v),
+		"record must be valid JSON, not concatenated [partial][full] garbage")
+	assert.Equal(t, 1, f.TruncCount(), "partial write must trigger exactly one truncation")
+}
+
+// TestWriter_WriteBatch_PartialWriteTruncated verifies the same rollback inside a
+// batch: a partial write on a mid-batch record is truncated so each record stays
+// a whole, unmarshalable line.
+func TestWriter_WriteBatch_PartialWriteTruncated(t *testing.T) {
+	f := &partialWriteFile{failFirst: 1, partial: 4}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: f}, 1000000, nil, nil)
+	envs := []*envelope.Envelope{
+		makeTestEnvelope(t, "ord-1"),
+		makeTestEnvelope(t, "ord-2"),
+		makeTestEnvelope(t, "ord-3"),
+	}
+	require.NoError(t, w.WriteBatch(context.Background(), envs))
+	require.NoError(t, w.Close())
+
+	lines := f.Lines()
+	require.Len(t, lines, 3, "all three records present after partial-write recovery")
+	for i, line := range lines {
+		var v map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &v), "record %d must be valid JSON", i)
+	}
+}
+
+// TestWriter_PartialWriteTruncateFailureIsFatal verifies that when truncation
+// cannot roll back a partial write, the failure is reported as a corrupt-segment
+// error and the writer goroutine exits cleanly rather than continuing to append
+// onto the corrupt tail. Close must not deadlock.
+func TestWriter_PartialWriteTruncateFailureIsFatal(t *testing.T) {
+	f := &partialWriteFile{failFirst: 1, partial: 4, truncFails: true}
+	w := newChannelWriterWithFactory("", 0, &fixedFileFactory{f: f}, 1000000, nil, nil)
+	err := w.Write(context.Background(), makeTestEnvelope(t, "ord-1"))
+	require.Error(t, err, "write must fail when the partial bytes cannot be rolled back")
+	require.ErrorIs(t, err, errCorruptSegment)
+
+	// Writer goroutine has exited; Close must not deadlock.
+	require.NoError(t, w.Close())
 }
 
 func TestWriter_NotifyFn(t *testing.T) {
@@ -419,6 +480,12 @@ func (f *recoverableFailWriteFile) Write(b []byte) (int, error) {
 	f.data = append(f.data, b...)
 	return len(b), nil
 }
+func (f *recoverableFailWriteFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.data = f.data[:size]
+	return nil
+}
 func (f *recoverableFailWriteFile) Sync() error  { return nil }
 func (f *recoverableFailWriteFile) Close() error { return nil }
 func (f *recoverableFailWriteFile) heal() {
@@ -432,8 +499,70 @@ func (f *recoverableFailWriteFile) heal() {
 type alwaysFailWriteFile struct{ writes atomic.Int64 }
 
 func (f *alwaysFailWriteFile) Write(_ []byte) (int, error) { f.writes.Add(1); return 0, syscall.ENOSPC }
+func (f *alwaysFailWriteFile) Truncate(_ int64) error      { return nil }
 func (f *alwaysFailWriteFile) Sync() error                 { return nil }
 func (f *alwaysFailWriteFile) Close() error                { return nil }
+
+// partialWriteFile simulates a transient I/O error (ENOSPC) that lands a partial
+// write: each of the first failFirst Write calls appends `partial` bytes of the
+// record and then returns the error; later calls succeed. It models a real
+// O_APPEND file (buf only grows; Truncate trims the tail), so a test can prove
+// writeRecord rolls back the partial bytes before retrying instead of
+// concatenating [partial][full] into one malformed line. truncFails makes
+// Truncate itself fail, exercising the corrupt-segment fatal path.
+type partialWriteFile struct {
+	mu         sync.Mutex
+	buf        bytes.Buffer
+	failFirst  int
+	failsDone  int
+	partial    int
+	truncFails bool
+	truncCount int
+}
+
+func (f *partialWriteFile) Write(b []byte) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failsDone < f.failFirst {
+		f.failsDone++
+		n := f.partial
+		if n > len(b) {
+			n = len(b)
+		}
+		f.buf.Write(b[:n])
+		return n, syscall.ENOSPC
+	}
+	return f.buf.Write(b)
+}
+func (f *partialWriteFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.truncCount++
+	if f.truncFails {
+		return errors.New("truncate failed")
+	}
+	f.buf.Truncate(int(size))
+	return nil
+}
+func (f *partialWriteFile) Sync() error  { return nil }
+func (f *partialWriteFile) Close() error { return nil }
+func (f *partialWriteFile) Lines() []string {
+	f.mu.Lock()
+	data := make([]byte, f.buf.Len())
+	copy(data, f.buf.Bytes())
+	f.mu.Unlock()
+	var lines []string
+	sc := bufio.NewScanner(bytes.NewReader(data))
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines
+}
+func (f *partialWriteFile) TruncCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.truncCount
+}
 
 // syncFailFile is a fileWriter whose Write succeeds but Sync always fails.
 type syncFailFile struct {
@@ -445,6 +574,12 @@ func (f *syncFailFile) Write(b []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.buf.Write(b)
+}
+func (f *syncFailFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.buf.Truncate(int(size))
+	return nil
 }
 func (f *syncFailFile) Sync() error  { return errors.New("fsync error") }
 func (f *syncFailFile) Close() error { return nil }

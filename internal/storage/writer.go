@@ -38,10 +38,19 @@ type ChannelWriter interface {
 // ErrWriterClosed is returned by Write after Close has been called.
 var ErrWriterClosed = errors.New("channel writer is closed")
 
+// errCorruptSegment signals that a partial write could not be rolled back by
+// truncation, so the active segment now ends in unrecoverable partial bytes.
+// The writer goroutine must exit on this error: continuing to append (O_APPEND)
+// would concatenate the next record onto the garbage. On restart, openActive ->
+// truncatePartialTrailing removes the trailing partial bytes and writing resumes
+// cleanly.
+var errCorruptSegment = errors.New("channel segment corrupt: partial write not rolled back")
+
 // fileWriter is the minimal interface the writer goroutine requires.
 // *os.File satisfies it; tests may inject a fake.
 type fileWriter interface {
 	Write(b []byte) (int, error)
+	Truncate(size int64) error
 	Sync() error
 	Close() error
 }
@@ -357,13 +366,31 @@ func (w *channelWriter) rollIfNeeded(f fileWriter, segStart, segSize int64, recL
 //
 // A non-nil error means the record was NOT written: either Close() was called
 // or the caller's ctx was cancelled while retrying a transient write error
-// (disk full, I/O). In both cases write(2) never succeeded, so the caller's
-// "not written" contract holds.
-func (w *channelWriter) writeRecord(ctx context.Context, f fileWriter, data []byte) error {
+// (disk full, I/O). In both cases the record is absent from the file, so the
+// caller's "not written" contract holds.
+//
+// origSize is the file's byte length before this record. A transient error may
+// arrive with a partial write — n bytes of data already on disk where
+// 0 < n < len(data). Because the segment is opened O_APPEND, a naive retry would
+// append the full slice again, producing a concatenated [partial][full]\n line.
+// A subscriber's bufio.Scanner reads that whole line, envelope.Unmarshal fails,
+// and the subscriber advances its offset past it — silently dropping the message
+// and breaking at-least-once delivery on a merely transient disk condition. So
+// on a partial write we truncate back to origSize before retrying, restoring the
+// record boundary. If truncation itself fails the segment is left corrupt and we
+// return errCorruptSegment, which makes the writer goroutine exit.
+func (w *channelWriter) writeRecord(ctx context.Context, f fileWriter, origSize int64, data []byte) error {
 	for {
-		_, err := f.Write(data)
+		n, err := f.Write(data)
 		if err == nil {
 			return nil
+		}
+		if n > 0 {
+			if truncErr := f.Truncate(origSize); truncErr != nil {
+				w.log.Error("truncate after partial write failed; segment corrupt",
+					"err", truncErr, "orig_size", origSize, "partial_bytes", n)
+				return fmt.Errorf("%w: truncate after %d-byte partial write: %v", errCorruptSegment, n, truncErr)
+			}
 		}
 		select {
 		case <-time.After(10 * time.Millisecond):
@@ -389,8 +416,13 @@ func (w *channelWriter) doWriteSingle(f fileWriter, segStart, segSize int64, req
 	}
 	f, segStart, segSize = nf, ns, nsz
 
-	if err := w.writeRecord(req.ctx, f, req.data); err != nil {
+	if err := w.writeRecord(req.ctx, f, segSize, req.data); err != nil {
 		req.done <- err
+		// A corrupt segment is fatal: the writer goroutine must exit so startup
+		// recovery can trim the trailing partial bytes before any further append.
+		if errors.Is(err, errCorruptSegment) {
+			return f, segStart, segSize, err
+		}
 		return f, segStart, segSize, nil
 	}
 	segSize += int64(len(req.data))
@@ -429,8 +461,14 @@ func (w *channelWriter) doWriteBatch(f fileWriter, segStart, segSize int64, req 
 		}
 		f, segStart, segSize = nf, ns, nsz
 
-		if err := w.writeRecord(req.ctx, f, rec); err != nil {
+		if err := w.writeRecord(req.ctx, f, segSize, rec); err != nil {
 			req.done <- err
+			// A corrupt segment is fatal: exit the writer goroutine so startup
+			// recovery can trim the trailing partial bytes before any further
+			// append (which would otherwise concatenate onto the garbage).
+			if errors.Is(err, errCorruptSegment) {
+				return f, segStart, segSize, err
+			}
 			return f, segStart, segSize, nil
 		}
 		segSize += int64(len(rec))
