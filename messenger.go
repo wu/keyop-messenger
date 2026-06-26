@@ -428,6 +428,20 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		}
 	}
 
+	// Reap outbound offset files for hubs no longer in the client config so a
+	// removed hub's fedout-*.offset cannot anchor compaction forever. Runs even
+	// when the client role is disabled (empty configured set orphans them all).
+	if cfg.Storage.DataDir != "" {
+		var configuredHubAddrs []string
+		if cfg.Client.Enabled {
+			configuredHubAddrs = make([]string, 0, len(cfg.Client.Hubs))
+			for _, ref := range cfg.Client.Hubs {
+				configuredHubAddrs = append(configuredHubAddrs, ref.Addr)
+			}
+		}
+		federation.ReapOrphanedOutboundOffsets(cfg.Storage.DataDir, configuredHubAddrs, log)
+	}
+
 	// Dial configured client hubs.
 	if cfg.Client.Enabled {
 		for _, ref := range cfg.Client.Hubs {
