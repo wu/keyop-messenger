@@ -1,4 +1,4 @@
-.PHONY: all build test test-integration test-fast coverage bench lint clean release help
+.PHONY: all build test test-integration test-fast coverage bench lint loc clean release help
 
 # Default target
 all: test build
@@ -37,6 +37,18 @@ bench:
 lint:
 	golangci-lint run ./...
 
+# Count lines of code by category (requires cloc).
+# Hand-written: Go files excluding tests and generated code.
+# Test: *_test.go files. Generated: the gen/ tree (protobuf output).
+loc:
+	@command -v cloc >/dev/null 2>&1 || { echo "cloc is not installed (e.g. 'brew install cloc')"; exit 1; }
+	@echo "== Hand-written code (Go, excludes tests and generated) =="
+	@cloc --quiet --include-lang=Go --fullpath --not-match-d='/gen/' --not-match-f='_test\.go$$' .
+	@echo "== Test code (*_test.go) =="
+	@cloc --quiet --include-lang=Go --match-f='_test\.go$$' .
+	@echo "== Generated code (gen/) =="
+	@cloc --quiet --include-lang=Go gen/
+
 # Run all checks required before a release
 release: test test-integration lint bench
 	@echo "All release checks passed!"
@@ -57,6 +69,7 @@ help:
 	@echo "  coverage         - Run tests and show coverage (excludes example and testutil)"
 	@echo "  bench            - Run benchmarks"
 	@echo "  lint             - Run golangci-lint"
+	@echo "  loc              - Count lines of code by category (requires cloc)"
 	@echo "  release          - Run all pre-release checks (test, test-integration, lint, bench)"
 	@echo "  clean            - Clean build artifacts and coverage files"
 	@echo "  help             - Show this help message"
