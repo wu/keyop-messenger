@@ -1,3 +1,9 @@
+## [1.21.0](https://github.com/wu/keyop-messenger/compare/v1.20.0...v1.21.0) (2026-06-26)
+
+### Features
+
+* add WindowCount to LatencyStage ([d6f7b7d](https://github.com/wu/keyop-messenger/commit/d6f7b7d4fee7e548fbd38ce7b1abba12eccec846))
+
 ## [1.20.0](https://github.com/wu/keyop-messenger/compare/v1.19.0...v1.20.0) (2026-06-26)
 
 ### Features
