@@ -4,10 +4,9 @@ import (
 	"sync/atomic"
 )
 
-// ForwardPolicy holds the channel allowlists for a single peer connection.
+// ForwardPolicy holds the receive channel allowlist for a single peer connection.
 // Reads are lock-free via AtomicPolicy.
 type ForwardPolicy struct {
-	Forward []string // channels this hub may send TO this peer
 	Receive []string // channels this hub may accept FROM this peer
 }
 
@@ -27,21 +26,6 @@ func NewAtomicPolicy(fp ForwardPolicy) *AtomicPolicy {
 // Store atomically replaces the current policy.
 func (a *AtomicPolicy) Store(fp ForwardPolicy) {
 	a.p.Store(&fp)
-}
-
-// AllowForward reports whether channel is in the Forward allowlist.
-// Returns false for an empty or nil list.
-func (a *AtomicPolicy) AllowForward(channel string) bool {
-	fp := a.p.Load()
-	if fp == nil {
-		return false
-	}
-	for _, ch := range fp.Forward {
-		if ch == channel {
-			return true
-		}
-	}
-	return false
 }
 
 // AllowReceive reports whether channel is in the Receive allowlist.

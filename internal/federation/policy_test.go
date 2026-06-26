@@ -11,15 +11,6 @@ import (
 
 // ---- AtomicPolicy -----------------------------------------------------------
 
-func TestAllowForwardExactMatch(t *testing.T) {
-	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{
-		Forward: []string{"orders", "billing"},
-	})
-	assert.True(t, ap.AllowForward("orders"))
-	assert.True(t, ap.AllowForward("billing"))
-	assert.False(t, ap.AllowForward("shipping"))
-}
-
 func TestAllowReceiveExactMatch(t *testing.T) {
 	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{
 		Receive: []string{"events"},
@@ -28,17 +19,15 @@ func TestAllowReceiveExactMatch(t *testing.T) {
 	assert.False(t, ap.AllowReceive("orders"))
 }
 
-func TestAllowForwardEmptyList(t *testing.T) {
+func TestAllowReceiveEmptyList(t *testing.T) {
 	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{})
-	// Forward: empty list means "don't forward to anyone".
-	assert.False(t, ap.AllowForward("anything"))
 	// Receive: empty list means "accept from anyone" (no allowlist = unrestricted).
 	assert.True(t, ap.AllowReceive("anything"))
 }
 
 func TestAtomicPolicySwapRace(_ *testing.T) {
 	ap := federation.NewAtomicPolicy(federation.ForwardPolicy{
-		Forward: []string{"ch1"},
+		Receive: []string{"ch1"},
 	})
 
 	const readers = 50
@@ -51,18 +40,18 @@ func TestAtomicPolicySwapRace(_ *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < iterations; i++ {
-			ap.Store(federation.ForwardPolicy{Forward: []string{"ch1", "ch2"}})
-			ap.Store(federation.ForwardPolicy{Forward: []string{"ch1"}})
+			ap.Store(federation.ForwardPolicy{Receive: []string{"ch1", "ch2"}})
+			ap.Store(federation.ForwardPolicy{Receive: []string{"ch1"}})
 		}
 	}()
 
-	// Readers: call AllowForward concurrently — must not race.
+	// Readers: call AllowReceive concurrently — must not race.
 	for i := 0; i < readers; i++ {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				_ = ap.AllowForward("ch1")
-				_ = ap.AllowForward("ch2")
+				_ = ap.AllowReceive("ch1")
+				_ = ap.AllowReceive("ch2")
 			}
 		}()
 	}

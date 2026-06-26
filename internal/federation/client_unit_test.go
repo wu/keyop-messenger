@@ -282,7 +282,6 @@ func TestClient_Policy_Provided(t *testing.T) {
 	auditL := &fakeAuditLogger{}
 	dedupL, _ := dedup.NewLRUDedup(100)
 	policy := NewAtomicPolicy(ForwardPolicy{
-		Forward: []string{"chan1"},
 		Receive: []string{"chan2"},
 	})
 

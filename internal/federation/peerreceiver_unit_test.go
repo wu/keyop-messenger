@@ -30,25 +30,6 @@ func TestPolicyAllowReceive_Restricted(t *testing.T) {
 	assert.False(t, policy.AllowReceive("other"))
 }
 
-// TestPolicyAllowForward_Empty verifies that an empty forward policy denies all channels.
-func TestPolicyAllowForward_Empty(t *testing.T) {
-	policy := federation.NewAtomicPolicy(federation.ForwardPolicy{})
-
-	assert.False(t, policy.AllowForward("any-channel"))
-	assert.False(t, policy.AllowForward("another-channel"))
-}
-
-// TestPolicyAllowForward_Restricted verifies forward policy enforcement.
-func TestPolicyAllowForward_Restricted(t *testing.T) {
-	policy := federation.NewAtomicPolicy(federation.ForwardPolicy{
-		Forward: []string{"forward1", "forward2"},
-	})
-
-	assert.True(t, policy.AllowForward("forward1"))
-	assert.True(t, policy.AllowForward("forward2"))
-	assert.False(t, policy.AllowForward("disallowed"))
-}
-
 // TestPolicyHotReload verifies that policy can be updated atomically.
 func TestPolicyHotReload(t *testing.T) {
 	policy := federation.NewAtomicPolicy(federation.ForwardPolicy{
