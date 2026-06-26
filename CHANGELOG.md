@@ -1,3 +1,22 @@
+## [1.22.0](https://github.com/wu/keyop-messenger/compare/v1.21.0...v1.22.0) (2026-06-26)
+
+### ⚠ BREAKING CHANGES
+
+* **registry:** An unregistered payload_type is no longer delivered to
+subscribers as map[string]any. Durable subscribers dead-letter such messages;
+ephemeral subscribers skip them with a warning. registry.New() no longer takes
+a logger argument.
+
+### Features
+
+* **registry:** drop support for unregistered payload types; dead-letter undecodable messages ([48dd495](https://github.com/wu/keyop-messenger/commit/48dd49562205c6d579481f55c2a30c543dce2c4e))
+
+### Bug Fixes
+
+* **federation:** validate inbound channel names to prevent path traversal ([d9fad8f](https://github.com/wu/keyop-messenger/commit/d9fad8fa6b02c8ab0fa58d9555df73702f708e46))
+* **storage,federation:** sanitize subscriber IDs and peer CNs in offset paths ([f98292a](https://github.com/wu/keyop-messenger/commit/f98292aa130b0aef5b00c82269a40930190b6a97))
+* **storage:** roll back partial writes to prevent log corruption and message loss ([4ebbe9c](https://github.com/wu/keyop-messenger/commit/4ebbe9c0fae25d91bf01589b235650c3adf11224))
+
 ## [1.21.0](https://github.com/wu/keyop-messenger/compare/v1.20.0...v1.21.0) (2026-06-26)
 
 ### Features
