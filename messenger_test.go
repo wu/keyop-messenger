@@ -12,6 +12,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wu/keyop-messenger/internal/envelope"
 )
 
 // testConfig returns a minimal valid Config for a temporary data directory.
@@ -540,6 +541,91 @@ func TestValidateChannelName(t *testing.T) {
 		assert.ErrorIs(t, ValidateChannelName(ch), ErrInvalidChannelName,
 			"expected invalid: %q", ch)
 	}
+}
+
+// TestWriteLocalEnvelope_RejectsInvalidChannel verifies the federation inbound
+// write path validates the (attacker-influenced) channel name before it becomes
+// a filesystem path via channelDir -> filepath.Join. The receive policy is not a
+// sufficient guard (an empty publish allowlist makes AllowReceive accept any
+// channel), so a buggy/compromised peer could otherwise traverse outside the
+// channel tree or inject into a reserved ".dead-letter" channel.
+func TestWriteLocalEnvelope_RejectsInvalidChannel(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	cases := []struct {
+		name    string
+		channel string
+		wantErr error
+	}{
+		{"path traversal", "../escape", ErrInvalidChannelName},
+		{"nested traversal", "../../etc/passwd", ErrInvalidChannelName},
+		{"slash", "a/b", ErrInvalidChannelName},
+		{"empty", "", ErrInvalidChannelName},
+		{"dead-letter suffix", "orders.dead-letter", ErrReservedChannelName},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env, nerr := envelope.NewEnvelope(tc.channel, "peer", "test.Evt", map[string]string{"k": "v"})
+			require.NoError(t, nerr)
+			writeErr := m.writeLocalEnvelope(&env)
+			require.Error(t, writeErr, "invalid channel must be rejected")
+			assert.ErrorIs(t, writeErr, tc.wantErr)
+		})
+	}
+
+	// "../escape" would resolve to dir/escape after filepath.Join cleaning; it
+	// must not have been created.
+	_, escErr := os.Stat(filepath.Join(dir, "escape"))
+	assert.True(t, os.IsNotExist(escErr), "path-traversal write must not escape the channel tree")
+	_, dlErr := os.Stat(filepath.Join(dir, "channels", "orders.dead-letter"))
+	assert.True(t, os.IsNotExist(dlErr), "dead-letter channel must not be created")
+}
+
+// TestWriteLocalEnvelopeBatch_SkipsInvalidGroupKeepsValid verifies that an
+// invalid channel name in a federated batch drops only that channel group and
+// does NOT fail the whole batch — failing would make the sender resend forever.
+// Valid groups in the same batch are still committed.
+func TestWriteLocalEnvelopeBatch_SkipsInvalidGroupKeepsValid(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	mk := func(channel, id string) *envelope.Envelope {
+		env, nerr := envelope.NewEnvelope(channel, "peer", "test.Evt", map[string]string{"id": id})
+		require.NoError(t, nerr)
+		return &env
+	}
+
+	// Federation batches arrive grouped by channel: one valid group followed by a
+	// path-traversal group and a dead-letter group.
+	envs := []*envelope.Envelope{
+		mk("good", "1"),
+		mk("good", "2"),
+		mk("../escape", "3"),
+		mk("orders.dead-letter", "4"),
+	}
+
+	require.NoError(t, m.writeLocalEnvelopeBatch(envs),
+		"batch with an invalid group must not fail the whole batch")
+
+	// Valid group landed.
+	_, goodErr := os.Stat(filepath.Join(dir, "channels", "good"))
+	require.NoError(t, goodErr, "valid channel must be written")
+	m.mu.RLock()
+	cs := m.channels["good"]
+	m.mu.RUnlock()
+	require.NotNil(t, cs, "valid channel state must exist")
+	assert.Equal(t, int64(2), cs.publishCount.Load(), "both valid records committed")
+
+	// Invalid groups created nothing.
+	_, escErr := os.Stat(filepath.Join(dir, "escape"))
+	assert.True(t, os.IsNotExist(escErr), "path-traversal channel must not be written")
+	_, dlErr := os.Stat(filepath.Join(dir, "channels", "orders.dead-letter"))
+	assert.True(t, os.IsNotExist(dlErr), "dead-letter channel must not be written")
 }
 
 // TestRegisterPayloadTypeDuplicate verifies the duplicate-registration error.

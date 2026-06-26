@@ -87,6 +87,26 @@ func ValidateChannelName(name string) error {
 	return nil
 }
 
+// validateInboundChannel applies the same channel-name rules as Publish to a
+// channel name that arrived over federation. A federated envelope's Channel is
+// attacker-influenced data that becomes a filesystem path via channelDir ->
+// filepath.Join(dataDir, "channels", channel). The receive policy is not a
+// sufficient guard: AtomicPolicy.AllowReceive treats an empty publish allowlist
+// as "accept all", so a buggy or compromised peer could otherwise smuggle a
+// "../.." path-traversal name (escaping the channel tree) or a reserved
+// ".dead-letter" name (corrupting local dead-letter semantics). The character
+// allowlist in ValidateChannelName rejects '/' and therefore traversal; the
+// suffix check blocks direct injection into dead-letter channels.
+func validateInboundChannel(channel string) error {
+	if err := ValidateChannelName(channel); err != nil {
+		return err
+	}
+	if strings.HasSuffix(channel, deadLetterSuffix) {
+		return fmt.Errorf("%w: %q: the %q suffix is reserved", ErrReservedChannelName, channel, deadLetterSuffix)
+	}
+	return nil
+}
+
 // ----- Public types ----------------------------------------------------------
 
 // Message is the decoded representation of a stored envelope delivered to a
@@ -1124,6 +1144,15 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 // outbound client peers. The LRU dedup catches any loop where a forwarded
 // message returns to its origin.
 func (m *Messenger) writeLocalEnvelope(env *envelope.Envelope) error {
+	if err := validateInboundChannel(env.Channel); err != nil {
+		// Drop the record rather than write outside the channel tree. The
+		// per-record receiver path logs this and advances its ack cursor past the
+		// envelope, so a buggy/compromised peer cannot wedge the stream by
+		// resending it.
+		m.log.Warn("federation: rejecting inbound envelope with invalid channel name",
+			"channel", env.Channel, "id", env.ID, "err", err)
+		return fmt.Errorf("federation inbound: %w", err)
+	}
 	cs, err := m.getOrCreateChannelState(env.Channel)
 	if err != nil {
 		return err
@@ -1168,6 +1197,17 @@ func (m *Messenger) writeLocalEnvelopeBatch(envs []*envelope.Envelope) error {
 			j++
 		}
 		group := envs[i:j]
+		i = j // advance up front so every path below (including the skip) moves on
+
+		if err := validateInboundChannel(channel); err != nil {
+			// Drop only this group; do NOT return an error, which would fail the
+			// whole batch and make the sender resend it forever. Skipping leaves the
+			// group's IDs marked seen and lets the batch be acked, so the malicious
+			// records are dropped exactly once.
+			m.log.Warn("federation: dropping inbound batch group with invalid channel name",
+				"channel", channel, "count", len(group), "err", err)
+			continue
+		}
 
 		cs, err := m.getOrCreateChannelState(channel)
 		if err != nil {
@@ -1188,7 +1228,6 @@ func (m *Messenger) writeLocalEnvelopeBatch(envs []*envelope.Envelope) error {
 				c.NotifyChannel(channel)
 			}
 		}
-		i = j
 	}
 	return nil
 }
