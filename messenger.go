@@ -997,12 +997,19 @@ var latencyPercentiles = []float64{0.5, 0.9, 0.99}
 // are zero.
 func latencyStage(sumNs, count int64, liveBuckets []int64) LatencyStage {
 	p := latencyhist.Quantiles(liveBuckets, latencyPercentiles)
+	// The window sample count is the population behind the percentiles: the sum
+	// of the live histogram buckets.
+	var windowCount int64
+	for _, c := range liveBuckets {
+		windowCount += c
+	}
 	return LatencyStage{
-		Count:    count,
-		SumNanos: sumNs,
-		P50Nanos: p[0],
-		P90Nanos: p[1],
-		P99Nanos: p[2],
+		Count:       count,
+		SumNanos:    sumNs,
+		WindowCount: windowCount,
+		P50Nanos:    p[0],
+		P90Nanos:    p[1],
+		P99Nanos:    p[2],
 	}
 }
 

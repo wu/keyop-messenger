@@ -349,6 +349,11 @@ func TestStats_LatencyAggregates(t *testing.T) {
 	assert.Positive(t, lat.Handler.P50Nanos)
 	assert.Positive(t, lat.PublishToDisk.P50Nanos)
 	assert.Positive(t, lat.Consume.P50Nanos)
+
+	// WindowCount is the population behind the percentiles: one sample each here.
+	assert.Equal(t, int64(1), lat.Handler.WindowCount)
+	assert.Equal(t, int64(1), lat.Consume.WindowCount)
+	assert.Equal(t, int64(1), lat.PublishToDisk.WindowCount)
 	// The single ~20ms handler sample lands in the (10ms, 25ms] bucket. Within a
 	// bucket the estimate is interpolated by the quantile fraction, so p50 < p99
 	// but both stay inside the bucket bounds.
@@ -392,8 +397,11 @@ func TestStats_LatencyPercentilesAcrossSubscribers(t *testing.T) {
 		return lat.Consume.Count == 2
 	}, 2*time.Second, 10*time.Millisecond, "both subscribers' consume samples should be recorded")
 
-	// Two samples merged from two subscribers; percentiles are non-zero.
+	// Two samples merged from two subscribers; percentiles are non-zero and the
+	// window count reflects the merged population.
 	assert.Equal(t, int64(2), lat.Handler.Count)
+	assert.Equal(t, int64(2), lat.Handler.WindowCount)
+	assert.Equal(t, int64(2), lat.Consume.WindowCount)
 	assert.Positive(t, lat.Consume.P90Nanos)
 	assert.Positive(t, lat.Handler.P90Nanos)
 }

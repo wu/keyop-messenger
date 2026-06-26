@@ -84,6 +84,7 @@ func TestStats_FederationAckRTT(t *testing.T) {
 
 	assert.Positive(t, cs.PublishRTT.SumNanos, "ack RTT should have a positive duration")
 	assert.Positive(t, cs.PublishRTT.P50Nanos, "ack RTT p50 should be populated")
+	assert.Positive(t, cs.PublishRTT.WindowCount, "ack RTT window count should be populated")
 }
 
 // TestStats_HubSubscribeRTT verifies that when the hub delivers a message to a
@@ -145,6 +146,7 @@ func TestStats_HubSubscribeRTT(t *testing.T) {
 
 	assert.Positive(t, hub.SubscribeRTT.SumNanos, "subscribe RTT should have a positive duration")
 	assert.Positive(t, hub.SubscribeRTT.P50Nanos, "subscribe RTT p50 should be populated")
+	assert.Positive(t, hub.SubscribeRTT.WindowCount, "subscribe RTT window count should be populated")
 }
 
 // TestStats_HubInbound verifies that a hub instance surfaces inbound, hub-side

@@ -54,6 +54,11 @@ type LatencyStage struct {
 	Count int64
 	// SumNanos is the summed duration of all samples, in nanoseconds.
 	SumNanos int64
+	// WindowCount is the number of samples in the trailing ~60-second window —
+	// the exact population the P50/P90/P99 estimates are computed from. Unlike
+	// Count (cumulative since start), it lines up with the percentiles, so a UI
+	// can show "N samples → pXX" coherently. It is 0 when the window is empty.
+	WindowCount int64
 	// P50Nanos, P90Nanos, P99Nanos are the 50th/90th/99th percentile latency
 	// estimates over the trailing ~60-second window, in nanoseconds.
 	P50Nanos int64
