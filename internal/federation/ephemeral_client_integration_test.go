@@ -5,6 +5,8 @@ package federation
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -215,4 +217,87 @@ func TestEphemeralClient_PublishConcurrent(t *testing.T) {
 	for i := 0; i < n; i++ {
 		assert.NoError(t, <-errs)
 	}
+}
+
+// TestEphemeralClient_WriteLoop_BoundsBatchBytes verifies that when many items
+// pile into the write queue, the write loop splits them into frames so that no
+// multi-record PublishBatch exceeds the configured MaxBatchBytes, and that no
+// item is dropped. Regression for ingest/egress ignoring MaxBatchBytes.
+func TestEphemeralClient_WriteLoop_BoundsBatchBytes(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+
+	const maxBatch = 1024
+
+	var mu sync.Mutex
+	var maxMultiRecordBytes int
+	totalRecords := atomic.Int64{}
+
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(stream grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			for {
+				batch, err := stream.Recv()
+				if err != nil {
+					return nil
+				}
+				sum := 0
+				for _, rec := range batch.Records {
+					sum += len(rec)
+				}
+				if len(batch.Records) > 1 {
+					mu.Lock()
+					if sum > maxMultiRecordBytes {
+						maxMultiRecordBytes = sum
+					}
+					mu.Unlock()
+				}
+				totalRecords.Add(int64(len(batch.Records)))
+				_ = stream.Send(&federationv1.PublishAck{})
+			}
+		},
+	})
+
+	ec := NewEphemeralClient(EphemeralClientConfig{
+		InstanceName:   "em-client",
+		MaxBatchBytes:  maxBatch,
+		WriteQueueSize: 100,
+	}, log)
+	defer ec.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, ec.Connect(ctx, addr))
+	time.Sleep(50 * time.Millisecond)
+
+	// Each record (~300-byte payload) is comfortably under maxBatch on its own,
+	// so the only way to exceed maxBatch is to pack several into one frame.
+	const n = 24
+	pad := strings.Repeat("x", 300)
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			env, err := envelope.NewEnvelope("test", "em-client", "test.Type",
+				map[string]any{"id": fmt.Sprintf("m-%d", i), "pad": pad})
+			if err != nil {
+				errs <- err
+				return
+			}
+			pubCtx, pubCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer pubCancel()
+			errs <- ec.Publish(pubCtx, &env)
+		}()
+	}
+
+	for i := 0; i < n; i++ {
+		assert.NoError(t, <-errs)
+	}
+
+	assert.Equal(t, int64(n), totalRecords.Load(), "every published item must be delivered")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.LessOrEqual(t, maxMultiRecordBytes, maxBatch,
+		"no multi-record batch may exceed MaxBatchBytes")
+	assert.Greater(t, maxMultiRecordBytes, 0,
+		"test must actually exercise multi-record batching")
 }

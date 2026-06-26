@@ -315,44 +315,89 @@ func (c *EphemeralClient) writeLoop(
 		}
 	}
 
+	// marshalItem encodes one queued item; on marshal failure it signals the
+	// waiter and returns ok=false so the caller drops it from the batch.
+	marshalItem := func(item ephemeralWriteItem) ([]byte, bool) {
+		data, merr := envelope.Marshal(*item.env)
+		if merr != nil {
+			c.log.Error("ephemeral: marshal envelope", "id", item.env.ID, "err", merr)
+			select {
+			case item.doneCh <- fmt.Errorf("ephemeral: marshal: %w", merr):
+			default:
+			}
+			return nil, false
+		}
+		return data, true
+	}
+
+	// pending holds an item pulled from writeQ that did not fit in the previous
+	// batch; it becomes the first item of the next batch (forward progress).
+	// If the loop returns (stop/connection loss) before it is sent, signal its
+	// waiter so the caller is not stranded — mirrors the in-flight batch on
+	// connDead. The caller's Publish also unblocks on c.stop independently.
+	var pending *ephemeralWriteItem
+	defer func() {
+		if pending != nil {
+			select {
+			case pending.doneCh <- ErrEphemeralConnLost:
+			default:
+			}
+		}
+	}()
+
 	for {
 		var first ephemeralWriteItem
-		select {
-		case <-c.stop:
-			return
-		case <-connDead:
-			return
-		case item := <-c.writeQ:
-			first = item
+		if pending != nil {
+			first = *pending
+			pending = nil
+		} else {
+			select {
+			case <-c.stop:
+				return
+			case <-connDead:
+				return
+			case item := <-c.writeQ:
+				first = item
+			}
 		}
 
-		batch := []ephemeralWriteItem{first}
+		batch := make([]ephemeralWriteItem, 0, 1)
+		records := make([][]byte, 0, 1)
+		totalBytes := 0
+
+		// Always include the first item even if it alone exceeds MaxBatchBytes:
+		// forward progress matters, and an oversized record is rejected by the
+		// gRPC frame limit on Send rather than wedging the queue.
+		if data, ok := marshalItem(first); ok {
+			batch = append(batch, first)
+			records = append(records, data)
+			totalBytes += len(data)
+		}
+
+		// Drain additional queued items into the batch, stopping before the
+		// configured MaxBatchBytes is exceeded. The overflow item is carried to
+		// the next iteration via pending so it is never dropped.
 	drainQ:
 		for {
 			select {
 			case item := <-c.writeQ:
+				data, ok := marshalItem(item)
+				if !ok {
+					continue
+				}
+				if c.maxBatchBytes > 0 && len(records) > 0 && totalBytes+len(data) > c.maxBatchBytes {
+					stash := item
+					pending = &stash
+					break drainQ
+				}
 				batch = append(batch, item)
+				records = append(records, data)
+				totalBytes += len(data)
 			default:
 				break drainQ
 			}
 		}
 
-		var validBatch []ephemeralWriteItem
-		records := make([][]byte, 0, len(batch))
-		for _, item := range batch {
-			data, merr := envelope.Marshal(*item.env)
-			if merr != nil {
-				c.log.Error("ephemeral: marshal envelope", "id", item.env.ID, "err", merr)
-				select {
-				case item.doneCh <- fmt.Errorf("ephemeral: marshal: %w", merr):
-				default:
-				}
-				continue
-			}
-			validBatch = append(validBatch, item)
-			records = append(records, data)
-		}
-		batch = validBatch
 		if len(records) == 0 {
 			continue
 		}

@@ -424,11 +424,12 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 			break
 		}
 
-		// Commit the batch durably (one fsync) before acking. maxBatchBytes is 0
-		// here: per-record size is already bounded by the gRPC receive frame
-		// limit, so the hub does not additionally skip by batch size on ingest.
+		// Commit the batch durably (one fsync) before acking. Pass the configured
+		// MaxBatchBytes so a client-to-hub record exceeding the application limit
+		// is skipped on ingest, symmetric with the inbound peer-receiver path. The
+		// gRPC receive frame limit is a coarser transport cap above this.
 		lastID, commitErr := commitInboundBatch(batch.Records, policy, h.dedup,
-			h.localBatchWriter, h.auditL, h.log, peerName, 0)
+			h.localBatchWriter, h.auditL, h.log, peerName, h.maxBatchBytes)
 		if commitErr != nil {
 			// Do not ack: the peer's offset stays put and it resends the batch.
 			h.log.Error("federation: hub batch commit failed; not acking, peer will resend",
