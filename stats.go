@@ -41,14 +41,24 @@ type Latency struct {
 	Handler LatencyStage
 }
 
-// LatencyStage is one stage's running aggregate: the number of samples observed
-// and their summed duration in nanoseconds. The mean is SumNanos/Count (guard
-// against Count == 0).
+// LatencyStage is one stage's latency aggregate. Count and SumNanos are
+// cumulative since process start (they reset on restart), so a consumer derives
+// a poll-windowed mean as Δ(SumNanos)/Δ(Count) — the same count/sum style as
+// Totals. P50/P90/P99 are percentile estimates over a trailing ~60-second
+// window, computed server-side from an internal fixed-bucket histogram; they are
+// self-contained (no diffing needed) and reflect recent latency rather than the
+// whole lifetime. They are 0 when the window has no samples, and saturate at the
+// histogram's largest bound (25s) for values beyond it.
 type LatencyStage struct {
 	// Count is the number of samples observed since process start.
 	Count int64
 	// SumNanos is the summed duration of all samples, in nanoseconds.
 	SumNanos int64
+	// P50Nanos, P90Nanos, P99Nanos are the 50th/90th/99th percentile latency
+	// estimates over the trailing ~60-second window, in nanoseconds.
+	P50Nanos int64
+	P90Nanos int64
+	P99Nanos int64
 }
 
 // Totals holds instance-wide aggregates derived from the per-channel stats in a

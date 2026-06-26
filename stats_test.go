@@ -344,6 +344,58 @@ func TestStats_LatencyAggregates(t *testing.T) {
 	assert.Equal(t, int64(1), lat.Consume.Count)
 	assert.GreaterOrEqual(t, lat.Consume.SumNanos, lat.Handler.SumNanos,
 		"consume age should be >= handler latency")
+
+	// Percentiles over the trailing window are populated for the recorded stages.
+	assert.Positive(t, lat.Handler.P50Nanos)
+	assert.Positive(t, lat.PublishToDisk.P50Nanos)
+	assert.Positive(t, lat.Consume.P50Nanos)
+	// The single ~20ms handler sample lands in the (10ms, 25ms] bucket. Within a
+	// bucket the estimate is interpolated by the quantile fraction, so p50 < p99
+	// but both stay inside the bucket bounds.
+	assert.LessOrEqual(t, lat.Handler.P50Nanos, lat.Handler.P99Nanos)
+	assert.GreaterOrEqual(t, lat.Handler.P50Nanos, int64(10*time.Millisecond))
+	assert.LessOrEqual(t, lat.Handler.P99Nanos, int64(25*time.Millisecond))
+}
+
+// TestStats_LatencyPercentilesAcrossSubscribers verifies consume/handler
+// percentiles are computed from the histogram merged across all subscribers,
+// not by averaging per-subscriber percentiles.
+func TestStats_LatencyPercentilesAcrossSubscribers(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	ctx := context.Background()
+	delivered := make(chan struct{}, 8)
+	for _, id := range []string{"sub-a", "sub-b"} {
+		require.NoError(t, m.Subscribe(ctx, "events", id,
+			func(_ context.Context, _ Message) error {
+				delivered <- struct{}{}
+				return nil
+			}))
+	}
+
+	require.NoError(t, m.Publish(ctx, "events", "test.E", map[string]any{"v": 1}))
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-delivered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("message not delivered to both subscribers")
+		}
+	}
+
+	var lat Latency
+	require.Eventually(t, func() bool {
+		lat = m.Stats().Latency
+		return lat.Consume.Count == 2
+	}, 2*time.Second, 10*time.Millisecond, "both subscribers' consume samples should be recorded")
+
+	// Two samples merged from two subscribers; percentiles are non-zero.
+	assert.Equal(t, int64(2), lat.Handler.Count)
+	assert.Positive(t, lat.Consume.P90Nanos)
+	assert.Positive(t, lat.Handler.P90Nanos)
 }
 
 // TestStats_LatencyBatchCountsOnce verifies a PublishBatch records a single

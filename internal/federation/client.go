@@ -19,6 +19,7 @@ import (
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/latencyhist"
 	"github.com/wu/keyop-messenger/internal/storage"
 )
 
@@ -61,9 +62,11 @@ type Client struct {
 	// publish ack round-trip latency aggregate (client→hub transit): summed
 	// send→ack durations and the sample count, measured on the client's own
 	// clock so it is free of cross-host clock skew. Accumulated here on the
-	// Client (not the pubCoordinator) so the totals survive reconnects.
+	// Client (not the pubCoordinator) so the totals survive reconnects. ackRTTWin
+	// is the sliding-window histogram feeding the recent percentiles.
 	ackRTTSumNs atomic.Int64
 	ackRTTCount atomic.Int64
+	ackRTTWin   *latencyhist.Window
 
 	// publishSendFailures counts in-flight outbound batches that failed to be
 	// acked because the stream broke (excluding deliberate shutdown). A rising
@@ -130,6 +133,7 @@ func NewClient(
 		stop:              make(chan struct{}),
 		stopCtx:           stopCtx,
 		stopCancel:        stopCancel,
+		ackRTTWin:         latencyhist.NewWindow(),
 	}
 }
 
@@ -427,6 +431,7 @@ func (c *Client) ReconnectCount() int64 { return c.reconnectCount.Load() }
 func (c *Client) recordAckRTT(d time.Duration) {
 	c.ackRTTSumNs.Add(int64(d))
 	c.ackRTTCount.Add(1)
+	c.ackRTTWin.Observe(d)
 }
 
 // AckRTT returns the running publish ack round-trip aggregate for this hub
@@ -434,6 +439,12 @@ func (c *Client) recordAckRTT(d time.Duration) {
 // The mean is sumNanos/count (guard count == 0).
 func (c *Client) AckRTT() (sumNanos, count int64) {
 	return c.ackRTTSumNs.Load(), c.ackRTTCount.Load()
+}
+
+// PublishRTTBuckets returns the publish ack round-trip histogram buckets over
+// the current trailing window, for computing recent percentiles.
+func (c *Client) PublishRTTBuckets() []int64 {
+	return c.ackRTTWin.LiveBuckets()
 }
 
 // recordPublishSendFailure increments the outbound delivery-failure count.

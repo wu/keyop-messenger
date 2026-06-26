@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/latencyhist"
 )
 
 // ErrRetryLater signals a transient downstream failure. When a HandlerFunc
@@ -147,14 +148,17 @@ type Subscriber struct {
 	startupSkipped   atomic.Int64
 	oversizedSkipped atomic.Int64
 
-	// Latency aggregates for successfully consumed messages (Option B: running
-	// count + summed nanos, so callers derive an average). consumeAge is the
-	// end-to-end delivery age (now − envelope timestamp); handlerLatency is the
-	// time spent in the handler alone. Recorded once per successful dispatch.
+	// Latency aggregates for successfully consumed messages (running count +
+	// summed nanos, so callers derive an average). consumeAge is the end-to-end
+	// delivery age (now − envelope timestamp); handlerLatency is the time spent in
+	// the handler alone. Recorded once per successful dispatch. The *Window
+	// histograms feed the recent p50/p90/p99 percentiles for the same two stages.
 	consumeAgeSumNs     atomic.Int64
 	consumeAgeCount     atomic.Int64
 	handlerLatencySumNs atomic.Int64
 	handlerLatencyCount atomic.Int64
+	consumeWindow       *latencyhist.Window
+	handlerWindow       *latencyhist.Window
 
 	// maxAge, when > 0, enables one-time startup freshness filtering: on first
 	// start the subscriber fast-forwards its offset past buffered messages older
@@ -271,6 +275,8 @@ func NewSubscriber(
 		doneCh:        make(chan struct{}),
 		retryDelay:    defaultRetryDelay,
 		writeOffsetFn: WriteOffset,
+		consumeWindow: latencyhist.NewWindow(),
+		handlerWindow: latencyhist.NewWindow(),
 	}
 	s.flushedOffset.Store(offset)
 	return s, nil
@@ -303,6 +309,19 @@ func (s *Subscriber) ConsumeAgeAggregate() (sumNanos, count int64) {
 // nanoseconds and the sample count.
 func (s *Subscriber) HandlerLatencyAggregate() (sumNanos, count int64) {
 	return s.handlerLatencySumNs.Load(), s.handlerLatencyCount.Load()
+}
+
+// ConsumeWindowBuckets returns this subscriber's consume-age histogram buckets
+// over the current trailing window, for merging across subscribers before
+// computing instance-wide percentiles.
+func (s *Subscriber) ConsumeWindowBuckets() []int64 {
+	return s.consumeWindow.LiveBuckets()
+}
+
+// HandlerWindowBuckets returns this subscriber's handler-latency histogram
+// buckets over the current trailing window.
+func (s *Subscriber) HandlerWindowBuckets() []int64 {
+	return s.handlerWindow.LiveBuckets()
 }
 
 // Stop signals the goroutine to exit and blocks until it does.
@@ -757,12 +776,17 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 			// Record latency only for successfully consumed messages, so failed
 			// and retried attempts don't skew the average. Consume age spans the
 			// publisher and consumer clocks; clamp skew-induced negatives to zero.
-			s.handlerLatencySumNs.Add(int64(time.Since(handlerStart)))
+			handlerDur := time.Since(handlerStart)
+			s.handlerLatencySumNs.Add(int64(handlerDur))
 			s.handlerLatencyCount.Add(1)
-			if age := time.Since(env.Ts); age > 0 {
-				s.consumeAgeSumNs.Add(int64(age))
+			s.handlerWindow.Observe(handlerDur)
+			age := time.Since(env.Ts)
+			if age < 0 {
+				age = 0
 			}
+			s.consumeAgeSumNs.Add(int64(age))
 			s.consumeAgeCount.Add(1)
+			s.consumeWindow.Observe(age)
 			s.advanceOffset(nextOffset)
 			return false
 		}

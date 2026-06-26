@@ -19,6 +19,7 @@ import (
 	"github.com/wu/keyop-messenger/internal/dedup"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/federation"
+	"github.com/wu/keyop-messenger/internal/latencyhist"
 	"github.com/wu/keyop-messenger/internal/registry"
 	"github.com/wu/keyop-messenger/internal/storage"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
@@ -254,19 +255,23 @@ type Messenger struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	// publish-to-disk latency aggregate (Latency.PublishToDisk): summed write
-	// durations and the operation count, accumulated across every write site
-	// (Publish, PublishBatch, federation writeLocalEnvelope).
-	writeLatencySumNs atomic.Int64
-	writeLatencyCount atomic.Int64
+	// publish-to-disk latency aggregate (Latency.PublishToDisk): cumulative
+	// summed write durations and the operation count, accumulated across every
+	// write site (Publish, PublishBatch, federation writeLocalEnvelope), plus a
+	// sliding-window histogram feeding the recent percentiles.
+	writeLatencySumNs  atomic.Int64
+	writeLatencyCount  atomic.Int64
+	writeLatencyWindow *latencyhist.Window
 }
 
 // recordWriteLatency adds one publish-to-disk sample (the elapsed time since
 // start) to the instance-wide write-latency aggregate. Called after a writer
 // Write/WriteBatch returns success.
 func (m *Messenger) recordWriteLatency(start time.Time) {
-	m.writeLatencySumNs.Add(int64(time.Since(start)))
+	d := time.Since(start)
+	m.writeLatencySumNs.Add(int64(d))
 	m.writeLatencyCount.Add(1)
+	m.writeLatencyWindow.Observe(d)
 }
 
 // New constructs and starts a Messenger. It creates the required directory
@@ -367,15 +372,16 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 	}
 
 	m = &Messenger{
-		cfg:      cfg,
-		name:     name,
-		log:      log,
-		dataDir:  cfg.Storage.DataDir,
-		reg:      reg,
-		dedup:    dd,
-		auditL:   auditL,
-		channels: make(map[string]*channelState),
-		stop:     make(chan struct{}),
+		cfg:                cfg,
+		name:               name,
+		log:                log,
+		dataDir:            cfg.Storage.DataDir,
+		reg:                reg,
+		dedup:              dd,
+		auditL:             auditL,
+		channels:           make(map[string]*channelState),
+		stop:               make(chan struct{}),
+		writeLatencyWindow: latencyhist.NewWindow(),
 	}
 
 	if tlsCfg != nil {
@@ -846,6 +852,17 @@ func (m *Messenger) Stats() Stats {
 	}
 	m.mu.RUnlock()
 
+	// Consume/Handler latency is per-subscriber but reported instance-wide, so
+	// accumulate the cumulative sum/count and merge each subscriber's window
+	// histogram buckets across the loop, then compute percentiles from the merged
+	// totals once (averaging per-subscriber percentiles would be wrong).
+	var (
+		consumeSum, consumeCount int64
+		handlerSum, handlerCount int64
+		consumeBuckets           []int64
+		handlerBuckets           []int64
+	)
+
 	s.Channels = make([]ChannelStats, 0, len(channels))
 	for name, cs := range channels {
 		streamEnd, err := storage.ChannelStreamEnd(m.channelDir(name))
@@ -875,11 +892,13 @@ func (m *Messenger) Stats() Stats {
 			// stages. Both stages sum across every subscriber, dead-letter ones
 			// included — a dead-letter monitor is still a consumer.
 			caSum, caCount := entry.sub.ConsumeAgeAggregate()
-			s.Latency.Consume.SumNanos += caSum
-			s.Latency.Consume.Count += caCount
+			consumeSum += caSum
+			consumeCount += caCount
+			consumeBuckets = mergeBuckets(consumeBuckets, entry.sub.ConsumeWindowBuckets())
 			hlSum, hlCount := entry.sub.HandlerLatencyAggregate()
-			s.Latency.Handler.SumNanos += hlSum
-			s.Latency.Handler.Count += hlCount
+			handlerSum += hlSum
+			handlerCount += hlCount
+			handlerBuckets = mergeBuckets(handlerBuckets, entry.sub.HandlerWindowBuckets())
 			// When the subscriber is behind, read the timestamp of the record it is
 			// parked on to expose time-based lag (byte lag alone hides a slow or
 			// stalled consumer on a low-rate channel). Best-effort: log and skip on error.
@@ -919,8 +938,10 @@ func (m *Messenger) Stats() Stats {
 
 	// Publish-to-disk latency is instance-wide, accumulated at the write sites
 	// rather than derived from the per-channel snapshot.
-	s.Latency.PublishToDisk.SumNanos = m.writeLatencySumNs.Load()
-	s.Latency.PublishToDisk.Count = m.writeLatencyCount.Load()
+	s.Latency.PublishToDisk = latencyStage(
+		m.writeLatencySumNs.Load(), m.writeLatencyCount.Load(), m.writeLatencyWindow.LiveBuckets())
+	s.Latency.Consume = latencyStage(consumeSum, consumeCount, consumeBuckets)
+	s.Latency.Handler = latencyStage(handlerSum, handlerCount, handlerBuckets)
 
 	if len(m.clients) > 0 {
 		s.Federation.Clients = make([]ClientStats, 0, len(m.clients))
@@ -931,7 +952,7 @@ func (m *Messenger) Stats() Stats {
 				Connected:           c.Connected(),
 				ReconnectCount:      c.ReconnectCount(),
 				UnackedBytes:        c.UnackedBytes(),
-				PublishRTT:          LatencyStage{Count: rttCount, SumNanos: rttSum},
+				PublishRTT:          latencyStage(rttSum, rttCount, c.PublishRTTBuckets()),
 				PublishSendFailures: c.PublishSendFailures(),
 			})
 		}
@@ -958,13 +979,47 @@ func (m *Messenger) Stats() Stats {
 			BatchesReceived:       hs.BatchesReceived,
 			ConnectionsAccepted:   hs.ConnectionsAccepted,
 			ConnectionsRejected:   hs.ConnectionsRejected,
-			SubscribeRTT:          LatencyStage{Count: hs.SubscribeRTTCount, SumNanos: hs.SubscribeRTTSumNanos},
+			SubscribeRTT:          latencyStage(hs.SubscribeRTTSumNanos, hs.SubscribeRTTCount, hs.SubscribeRTTBuckets),
 			SubscribeSendFailures: hs.SubscribeSendFailures,
 			Peers:                 peers,
 		}
 	}
 
 	return s
+}
+
+// latencyPercentiles are the quantiles reported in every LatencyStage.
+var latencyPercentiles = []float64{0.5, 0.9, 0.99}
+
+// latencyStage builds a LatencyStage from cumulative sum/count and the
+// sliding-window histogram buckets, computing the recent p50/p90/p99 from the
+// buckets. liveBuckets may be nil (no samples), in which case the percentiles
+// are zero.
+func latencyStage(sumNs, count int64, liveBuckets []int64) LatencyStage {
+	p := latencyhist.Quantiles(liveBuckets, latencyPercentiles)
+	return LatencyStage{
+		Count:    count,
+		SumNanos: sumNs,
+		P50Nanos: p[0],
+		P90Nanos: p[1],
+		P99Nanos: p[2],
+	}
+}
+
+// mergeBuckets adds src into dst element-wise, allocating dst on first use. Used
+// to combine per-subscriber window histograms into one instance-wide histogram
+// before computing percentiles.
+func mergeBuckets(dst, src []int64) []int64 {
+	if len(src) == 0 {
+		return dst
+	}
+	if dst == nil {
+		dst = make([]int64, len(src))
+	}
+	for i := range src {
+		dst[i] += src[i]
+	}
+	return dst
 }
 
 // ----- Internal helpers ------------------------------------------------------

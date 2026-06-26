@@ -25,6 +25,7 @@ import (
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/latencyhist"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
@@ -138,9 +139,11 @@ type Hub struct {
 
 	// hub→peer delivery RTT aggregate (subscribe direction): summed send→ack
 	// durations and the sample count, measured on the hub's own clock so it is
-	// free of cross-host skew. Hub-wide across all subscribing peers.
+	// free of cross-host skew. Hub-wide across all subscribing peers. subscribeRTTWin
+	// is the sliding-window histogram feeding the recent percentiles.
 	subscribeRTTSumNs atomic.Int64
 	subscribeRTTCount atomic.Int64
+	subscribeRTTWin   *latencyhist.Window
 
 	// subscribeSendFailures counts in-flight hub→peer batches that failed to be
 	// acked because the Subscribe stream broke (excluding deliberate shutdown).
@@ -161,6 +164,7 @@ func (h *Hub) recordSubscribeSendFailure() {
 func (h *Hub) recordSubscribeRTT(d time.Duration) {
 	h.subscribeRTTSumNs.Add(int64(d))
 	h.subscribeRTTCount.Add(1)
+	h.subscribeRTTWin.Observe(d)
 }
 
 // NewHub constructs a Hub. Call Listen to start accepting connections.
@@ -187,6 +191,7 @@ func NewHub(
 		notifyRegistry:   make(map[string][]*channelReader),
 		conns:            make(map[int64]*hubConn),
 		stop:             make(chan struct{}),
+		subscribeRTTWin:  latencyhist.NewWindow(),
 	}
 }
 
@@ -653,9 +658,11 @@ type HubStats struct {
 	ConnectionsAccepted int64
 	ConnectionsRejected int64
 	// SubscribeRTT aggregate: hub→peer delivery round-trip on the Subscribe
-	// stream (summed nanoseconds and sample count), hub-wide.
+	// stream (summed nanoseconds and sample count), hub-wide. SubscribeRTTBuckets
+	// is the sliding-window histogram over the same stream for recent percentiles.
 	SubscribeRTTSumNanos int64
 	SubscribeRTTCount    int64
+	SubscribeRTTBuckets  []int64
 	// SubscribeSendFailures counts in-flight hub→peer batches lost to a broken
 	// Subscribe stream, hub-wide.
 	SubscribeSendFailures int64
@@ -694,6 +701,7 @@ func (h *Hub) Stats() HubStats {
 		ConnectionsRejected:   h.connectionsRejected.Load(),
 		SubscribeRTTSumNanos:  h.subscribeRTTSumNs.Load(),
 		SubscribeRTTCount:     h.subscribeRTTCount.Load(),
+		SubscribeRTTBuckets:   h.subscribeRTTWin.LiveBuckets(),
 		SubscribeSendFailures: h.subscribeSendFailures.Load(),
 	}
 
