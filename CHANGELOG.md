@@ -1,3 +1,15 @@
+## [1.20.0](https://github.com/wu/keyop-messenger/compare/v1.19.0...v1.20.0) (2026-06-26)
+
+### Features
+
+* add federation client->hub ack-RTT latency ([3d0bb7e](https://github.com/wu/keyop-messenger/commit/3d0bb7eecb55417932112751f5a9a9a4d8ca9cd5))
+* add hub->peer subscribe-stream delivery RTT ([872276e](https://github.com/wu/keyop-messenger/commit/872276e7477f6b0e73a2d2e8be90473249a2b080))
+* add per-stage latency aggregates to Stats ([217b282](https://github.com/wu/keyop-messenger/commit/217b28241f56265e2d683ddbb147c30678dc4869))
+* add pre-summed Totals to Stats for golden-signal metrics ([f7f1559](https://github.com/wu/keyop-messenger/commit/f7f1559b3d7995499cae2818537479e424f68f4a))
+* add recent p50/p90/p99 latency percentiles to Stats ([9c3eff9](https://github.com/wu/keyop-messenger/commit/9c3eff95a7a079fc48650af11c657df94ec9705e))
+* count federation batch send failures (both directions) ([45ddd54](https://github.com/wu/keyop-messenger/commit/45ddd54c769e3fe17b05c16a7bd425c4e03ace42))
+* **subscribers:** make the retry/backoff window configurable and per-subscriber ([876de80](https://github.com/wu/keyop-messenger/commit/876de80b448ec445fbdd29abcd5b6bdf70c82c0b))
+
 ## [1.19.0](https://github.com/wu/keyop-messenger/compare/v1.18.0...v1.19.0) (2026-06-25)
 
 ### Features
