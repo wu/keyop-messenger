@@ -301,6 +301,89 @@ func TestSubscriber_DeadLetter(t *testing.T) {
 	assert.Equal(t, "com.keyop.messenger.DeadLetterPayload", dl.PayloadType)
 }
 
+// TestSubscriber_DeadLettersUndecodablePayload verifies that a payload which
+// fails to decode is dead-lettered rather than silently skipped: the offset
+// still advances and the handler is never invoked for it, but the message is
+// recoverable from the dead-letter queue. A non-object JSON payload is used
+// because mapDecoder.Decode returns an error for it, mirroring the real
+// registry's behaviour for an unregistered or shape-incompatible type — the very
+// case that previously caused permanent message loss.
+func TestSubscriber_DeadLettersUndecodablePayload(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "orders")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	sub, notifyC, dlWriter := newTestSub(t, "s", channelDir, offsetDir, 0)
+
+	// First an undecodable (non-object) payload, then a normal one to prove
+	// delivery continues past the bad record.
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", []string{"not", "an", "object"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders", map[string]any{"ok": true}))
+
+	delivered := make(chan struct{}, 4)
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		delivered <- struct{}{}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// The undecodable message must be dead-lettered (not lost).
+	require.Eventually(t, func() bool {
+		return len(dlWriter.Written()) == 1
+	}, testTimeout, 10*time.Millisecond, "undecodable message must be dead-lettered")
+	dl := dlWriter.Written()[0]
+	assert.Equal(t, "orders.dead-letter", dl.Channel)
+	assert.Equal(t, "com.keyop.messenger.DeadLetterPayload", dl.PayloadType)
+
+	// Exactly one message reaches the handler: the decodable one.
+	select {
+	case <-delivered:
+	case <-time.After(testTimeout):
+		t.Fatal("decodable message was not delivered")
+	}
+	select {
+	case <-delivered:
+		t.Fatal("undecodable message must not be delivered to the handler")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	assert.Equal(t, int64(1), sub.Stats().DecodeSkipped, "decode failure must be counted")
+}
+
+// TestSubscriber_UndecodableOnDeadLetterChannelIsSkippedNotRecursed verifies that
+// an undecodable message already on a dead-letter channel is skipped (logged)
+// rather than dead-lettered again, which would recurse into
+// channel.dead-letter.dead-letter.
+func TestSubscriber_UndecodableOnDeadLetterChannelIsSkippedNotRecursed(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "orders.dead-letter")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	sub, notifyC, dlWriter := newTestSub(t, "s", channelDir, offsetDir, 0)
+
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders.dead-letter", []string{"bad"}))
+	writeTestEnvelope(t, channelDir, makeEnv(t, "orders.dead-letter", map[string]any{"ok": true}))
+
+	delivered := make(chan struct{}, 4)
+	sub.Start(notifyC, func(_ *envelope.Envelope, _ any) error {
+		delivered <- struct{}{}
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	// The decodable message is delivered; the bad one is skipped.
+	select {
+	case <-delivered:
+	case <-time.After(testTimeout):
+		t.Fatal("decodable message was not delivered")
+	}
+	require.Eventually(t, func() bool { return sub.Stats().DecodeSkipped == 1 },
+		testTimeout, 10*time.Millisecond, "decode failure must be counted")
+
+	// Nothing must be written to a (further) dead-letter channel.
+	assert.Empty(t, dlWriter.Written(), "must not re-dead-letter a dead-letter message")
+}
+
 func TestSubscriber_RetryLater_PausesAndResumes(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "metrics")

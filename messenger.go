@@ -157,7 +157,7 @@ type DiagnosticStats struct {
 	ProcessCalls     int64 // total processAvailable invocations
 	Dispatched       int64 // messages successfully passed to the handler
 	UnmarshalSkipped int64 // lines that failed envelope.Unmarshal (offset still advanced)
-	DecodeSkipped    int64 // payloads that failed reg.Decode (offset still advanced)
+	DecodeSkipped    int64 // payloads that failed reg.Decode (dead-lettered, not delivered; offset advanced)
 	OversizedSkipped int64 // records larger than maxLineSize (offset still advanced)
 	CompactionDrops  int64 // messages permanently dropped by retention before delivery (data loss)
 	RetryLaterPauses int64 // delivery pauses because the downstream handler asked to retry later (backpressure)
@@ -320,7 +320,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		return nil, err
 	}
 
-	reg := registry.New(log)
+	reg := registry.New()
 
 	dd, err := dedup.NewLRUDedup(cfg.Dedup.SeenIDLRUSize)
 	if err != nil {

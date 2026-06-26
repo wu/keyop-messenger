@@ -43,6 +43,7 @@ func TestDiagnosticStats_HappyPath(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.Evt")
 
 	delivered := make(chan struct{}, 1)
 	require.NoError(t, m.Subscribe(context.Background(), "orders", "sub1",
@@ -86,6 +87,7 @@ func TestDiagnosticStats_RetryLaterPauses(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.Evt")
 
 	const failTimes = 2
 	var calls atomic.Int64

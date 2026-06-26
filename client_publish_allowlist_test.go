@@ -69,6 +69,7 @@ func TestMessenger_Client_PublishAllowlist(t *testing.T) {
 	clientMsg, err := New(clientCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = clientMsg.Close() })
+	registerTestTypes(t, clientMsg)
 
 	// Give client time to connect
 	time.Sleep(500 * time.Millisecond)
@@ -183,6 +184,7 @@ func TestMessenger_Client_ReceiveAllowlist(t *testing.T) {
 	clientMsg, err := New(clientCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = clientMsg.Close() })
+	registerTestTypes(t, clientMsg)
 
 	// Give client time to connect
 	time.Sleep(500 * time.Millisecond)

@@ -25,6 +25,7 @@ func throughputRun(t *testing.T, count int, flushIntervalMS int) {
 	m, err := New(cfg, WithTestIdentity("test-instance"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.Evt")
 
 	var received atomic.Int64
 	done := make(chan struct{})

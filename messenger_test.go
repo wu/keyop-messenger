@@ -34,6 +34,24 @@ func newForTest(dataDir string, opts ...Option) (*Messenger, error) {
 	return New(testConfig(dataDir), opts...)
 }
 
+// payloadRegistrar is satisfied by both *Messenger and *EphemeralMessenger.
+type payloadRegistrar interface {
+	RegisterPayloadType(typeStr string, prototype any) error
+}
+
+// registerMapTypes registers each typeStr to decode into map[string]any — the
+// payload shape used by delivery tests and benchmarks that publish a bare map
+// rather than a concrete struct. Required because unregistered payload types are
+// no longer delivered (the durable subscriber dead-letters them; the ephemeral
+// subscriber skips them); a subscriber only receives a type it has registered.
+// Takes testing.TB so it is usable from both tests and benchmarks.
+func registerMapTypes(tb testing.TB, r payloadRegistrar, types ...string) {
+	tb.Helper()
+	for _, ty := range types {
+		require.NoError(tb, r.RegisterPayloadType(ty, map[string]any{}))
+	}
+}
+
 // newEphemeralForTest constructs an EphemeralMessenger with a stable test
 // identity. Like newForTest, this is the right helper for tests that don't
 // provision real TLS certificates.
@@ -291,6 +309,7 @@ func TestSubscribe_PerSubscriptionRetryOverride(t *testing.T) {
 	m, err := newForTest(dir) // instance default max_retries = 5
 	require.NoError(t, err)
 	defer func() { _ = m.Close() }()
+	registerMapTypes(t, m, "test.T")
 
 	ctx := context.Background()
 	calls := make(chan struct{}, 16)
@@ -328,6 +347,7 @@ func TestAtLeastOnce(t *testing.T) {
 	// First instance: subscribe, publish, verify delivery, then close.
 	m1, err := newForTest(dir)
 	require.NoError(t, err)
+	registerMapTypes(t, m1, "test.Evt")
 
 	delivered := make(chan struct{}, 10)
 	require.NoError(t, m1.Subscribe(context.Background(), "events", "sub1",
@@ -371,6 +391,7 @@ func TestMultipleSubscribers(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.Evt")
 
 	channels := make([]chan Message, numSubs)
 	for i := range channels {
@@ -484,6 +505,7 @@ func TestUnsubscribe(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	defer func() { _ = m.Close() }()
+	registerMapTypes(t, m, "test.Evt")
 
 	channel := "unsub-test"
 	subID := "sub1"

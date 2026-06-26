@@ -81,6 +81,7 @@ func BenchmarkSubscribeLatency(b *testing.B) {
 			m, err := New(cfg, WithTestIdentity("test-instance"))
 			require.NoError(b, err)
 			b.Cleanup(func() { _ = m.Close() })
+			registerMapTypes(b, m, "bench.Evt")
 
 			notified := make(chan time.Time, 1)
 			require.NoError(b, m.Subscribe(context.Background(), "bench", "sub",
@@ -260,6 +261,7 @@ func newFederationPair(b *testing.B, syncIntervalMS, offsetFlushInterMS int) (cl
 	hubM, err = New(hubCfg)
 	require.NoError(b, err)
 	b.Cleanup(func() { _ = hubM.Close() })
+	registerMapTypes(b, hubM, "bench.Evt")
 
 	_, port, err := net.SplitHostPort(hubM.HubAddr())
 	require.NoError(b, err)

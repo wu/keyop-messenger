@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -91,6 +92,7 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
+	registerTestTypes(t, em)
 
 	require.NoError(t, em.Subscribe("events", func(msg Message) {
 		received.Add(1)
@@ -105,6 +107,56 @@ func TestEphemeralMessenger_Subscribe_HandlerInvoked(t *testing.T) {
 	require.Eventually(t, func() bool { return received.Load() >= 1 },
 		2*time.Second, 10*time.Millisecond,
 		"Subscribe handler must be invoked when the hub pushes a message")
+}
+
+// TestEphemeralMessenger_Subscribe_SkipsUndecodable verifies that when the hub
+// pushes a message whose payload type is not registered, the ephemeral
+// subscriber skips it (the handler is never invoked) and logs a warning, rather
+// than delivering a nil payload. The ephemeral path has no dead-letter queue.
+func TestEphemeralMessenger_Subscribe_SkipsUndecodable(t *testing.T) {
+	env, err := envelope.NewEnvelope("events", "hub", "test.Unregistered", map[string]string{"x": "1"})
+	require.NoError(t, err)
+	raw, err := envelope.Marshal(env)
+	require.NoError(t, err)
+
+	addr := startEphemeralHub(t, &mockEphemeralGRPCHub{
+		subscribeFn: func(stream grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			if _, err := stream.Recv(); err != nil { // read SubscribeRequest
+				return nil
+			}
+			_ = stream.Send(&federationv1.HubBatch{
+				Payload: &federationv1.HubBatch_Batch{
+					Batch: &federationv1.EnvelopeBatch{Records: [][]byte{raw}},
+				},
+			})
+			_, _ = stream.Recv() // read ack
+			<-stream.Context().Done()
+			return nil
+		},
+	})
+
+	logger := &testutil.FakeLogger{}
+	var received atomic.Int32
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:   addr,
+		Subscribe: []string{"events"},
+	}, WithLogger(logger))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = em.Close() })
+
+	// Deliberately do not register "test.Unregistered".
+	require.NoError(t, em.Subscribe("events", func(_ Message) {
+		received.Add(1)
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, em.Connect(ctx))
+
+	require.Eventually(t, func() bool {
+		return logger.HasWarn("skipping undecodable message")
+	}, 2*time.Second, 20*time.Millisecond, "expected a warning for the undecodable message")
+	assert.Zero(t, received.Load(), "handler must not be invoked for an undecodable message")
 }
 
 // TestEphemeralMessenger_Subscribe_PayloadDecoded verifies that a registered

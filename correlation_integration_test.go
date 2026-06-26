@@ -19,6 +19,7 @@ func TestMessenger_CorrelationID_PublishAndSubscribe(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 
 	// Use a channel to safely receive the message from the handler goroutine.
 	received := make(chan Message, 1)
@@ -57,6 +58,7 @@ func TestMessenger_CorrelationID_Empty(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 
 	// Use a channel to safely receive the message from the handler goroutine.
 	received := make(chan Message, 1)
@@ -93,6 +95,7 @@ func TestMessenger_CorrelationID_MultipleMessages(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 
 	// Use a channel to safely receive messages from the handler goroutine.
 	received := make(chan Message, 2)

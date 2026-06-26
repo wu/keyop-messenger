@@ -82,6 +82,7 @@ func TestWithDataDirWithNilConfig(t *testing.T) {
 	m, err := New(nil, WithConfig(cfg), WithDataDir(overrideDir), WithTestIdentity("combo"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.T")
 
 	assert.Equal(t, "combo", m.InstanceName())
 

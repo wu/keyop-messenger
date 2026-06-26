@@ -70,6 +70,7 @@ func newHubMessenger(
 	m, err := New(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 	return m
 }
 
@@ -262,6 +263,7 @@ func TestIntegrationBackpressure(t *testing.T) {
 	hub2M, err := New(hub2Cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = hub2M.Close() })
+	registerTestTypes(t, hub2M)
 	hub2Addr := hubLocalAddr(t, hub2M)
 
 	// Publisher connects to Hub2 as client.
@@ -326,6 +328,7 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 	m, err := New(cfg, WithTestIdentity("compact-test"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 
 	// Use struct{} to avoid JSON round-trip type issues: JSON numbers in
 	// map[string]any are decoded as float64, not int.
@@ -400,6 +403,7 @@ func newClientMessengerWithPolicy(
 	m, err := New(cfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerTestTypes(t, m)
 	return m
 }
 
@@ -631,6 +635,7 @@ func TestFederationEndToEnd(t *testing.T) {
 	hubM, err := New(hubCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = hubM.Close() })
+	registerTestTypes(t, hubM)
 
 	boundAddr := hubM.HubAddr()
 	require.NotEmpty(t, boundAddr, "hub must be listening")

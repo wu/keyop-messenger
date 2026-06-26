@@ -48,6 +48,7 @@ func TestStats_SubscriberLagAfterDelivery(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.E")
 
 	delivered := make(chan struct{}, 10)
 	require.NoError(t, m.Subscribe(context.Background(), "events", "sub1",
@@ -99,6 +100,7 @@ func TestStats_OldestPendingWhileBehind(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.E")
 
 	// The handler parks on the first message so the subscriber's offset never
 	// advances; release is closed in cleanup so Close() does not hang.
@@ -218,6 +220,7 @@ func TestStats_Totals(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.E")
 
 	ctx := context.Background()
 
@@ -300,6 +303,7 @@ func TestStats_LatencyAggregates(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.E")
 
 	ctx := context.Background()
 
@@ -370,6 +374,7 @@ func TestStats_LatencyPercentilesAcrossSubscribers(t *testing.T) {
 	m, err := newForTest(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "test.E")
 
 	ctx := context.Background()
 	delivered := make(chan struct{}, 8)

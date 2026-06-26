@@ -8,7 +8,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wu/keyop-messenger/internal/testutil"
 )
 
 // ---- test types -------------------------------------------------------
@@ -25,10 +24,9 @@ type paymentReceived struct {
 
 // ---- helpers ----------------------------------------------------------
 
-func newReg(t *testing.T) (PayloadRegistry, *testutil.FakeLogger) {
+func newReg(t *testing.T) PayloadRegistry {
 	t.Helper()
-	log := &testutil.FakeLogger{}
-	return New(log), log
+	return New()
 }
 
 func rawJSON(t *testing.T, v any) json.RawMessage {
@@ -41,14 +39,14 @@ func rawJSON(t *testing.T, v any) json.RawMessage {
 // ---- Register ---------------------------------------------------------
 
 func TestRegister_ValueType(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))
 	assert.Equal(t, []string{"com.keyop.OrderCreated"}, reg.KnownTypes())
 }
 
 func TestRegister_PointerType_StoredAsValue(t *testing.T) {
 	// Registering a pointer type should be treated identically to the value type.
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", &orderCreated{}))
 	// Decode should return a value, not a pointer.
 	raw := rawJSON(t, orderCreated{OrderID: "ord-1", Amount: 10})
@@ -59,14 +57,14 @@ func TestRegister_PointerType_StoredAsValue(t *testing.T) {
 }
 
 func TestRegister_NilPrototype(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	err := reg.Register("some.Type", nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "prototype must not be nil")
 }
 
 func TestRegister_Duplicate(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))
 
 	err := reg.Register("com.keyop.OrderCreated", orderCreated{})
@@ -77,7 +75,7 @@ func TestRegister_Duplicate(t *testing.T) {
 // ---- Decode -----------------------------------------------------------
 
 func TestDecode_RegisteredType(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))
 
 	raw := rawJSON(t, orderCreated{OrderID: "ord-42", Amount: 100})
@@ -90,33 +88,33 @@ func TestDecode_RegisteredType(t *testing.T) {
 	assert.Equal(t, 100, order.Amount)
 }
 
-func TestDecode_UnregisteredType_ReturnsMap(t *testing.T) {
-	reg, log := newReg(t)
+func TestDecode_UnregisteredType_ReturnsError(t *testing.T) {
+	reg := newReg(t)
 
-	raw := rawJSON(t, map[string]any{"foo": "bar", "n": 1})
-	result, err := reg.Decode("com.keyop.Unknown", raw)
+	result, err := reg.Decode("com.keyop.Unknown", rawJSON(t, map[string]any{"foo": "bar"}))
 
-	// Must not return an error — message is delivered as map[string]any.
-	require.NoError(t, err)
-	m, ok := result.(map[string]any)
-	require.True(t, ok, "unregistered result must be map[string]any, got %T", result)
-	assert.Equal(t, "bar", m["foo"])
-
-	// A warning must have been logged.
-	assert.True(t, log.HasWarn("unregistered payload type"),
-		"expected a WARN log entry for unregistered type; entries: %v", log.Entries())
-}
-
-func TestDecode_UnregisteredType_NullPayload(t *testing.T) {
-	reg, _ := newReg(t)
-	// null JSON unmarshals into a nil map — should not error.
-	result, err := reg.Decode("com.keyop.Unknown", json.RawMessage(`null`))
-	require.NoError(t, err)
+	// Unregistered types are no longer coerced into map[string]any; they return
+	// a typed error and a nil value so the caller can dead-letter or skip.
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrUnregisteredPayloadType)
 	assert.Nil(t, result)
 }
 
+// TestDecode_UnregisteredType_NonObjectPayloads is the regression for the data-
+// loss bug: the old map[string]any fallback failed for any non-object JSON
+// (array, string, number, null), so those payloads errored and were silently
+// skipped. They must now all surface ErrUnregisteredPayloadType uniformly.
+func TestDecode_UnregisteredType_NonObjectPayloads(t *testing.T) {
+	reg := newReg(t)
+	for _, raw := range []string{`["a","b"]`, `"a string"`, `42`, `3.14`, `true`, `null`} {
+		result, err := reg.Decode("com.keyop.Unknown", json.RawMessage(raw))
+		assert.ErrorIs(t, err, ErrUnregisteredPayloadType, "payload %s", raw)
+		assert.Nil(t, result, "payload %s", raw)
+	}
+}
+
 func TestDecode_MalformedJSON(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))
 
 	_, err := reg.Decode("com.keyop.OrderCreated", json.RawMessage(`{invalid`))
@@ -125,7 +123,7 @@ func TestDecode_MalformedJSON(t *testing.T) {
 }
 
 func TestDecode_MultipleTypes(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))
 	require.NoError(t, reg.Register("com.keyop.PaymentReceived", paymentReceived{}))
 
@@ -143,7 +141,7 @@ func TestDecode_MultipleTypes(t *testing.T) {
 // ---- KnownTypes -------------------------------------------------------
 
 func TestKnownTypes_Sorted(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.Z", orderCreated{}))
 	require.NoError(t, reg.Register("com.keyop.A", orderCreated{}))
 	require.NoError(t, reg.Register("com.keyop.M", orderCreated{}))
@@ -153,26 +151,14 @@ func TestKnownTypes_Sorted(t *testing.T) {
 }
 
 func TestKnownTypes_Empty(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 	assert.Empty(t, reg.KnownTypes())
-}
-
-// ---- NilLogger --------------------------------------------------------
-
-func TestNew_NilLogger_DoesNotPanic(t *testing.T) {
-	reg := New(nil)
-	require.NoError(t, reg.Register("t", orderCreated{}))
-	// Decode an unregistered type — this would panic if the nil logger is
-	// not replaced with a nop internally.
-	assert.NotPanics(t, func() {
-		_, _ = reg.Decode("unknown", rawJSON(t, map[string]any{}))
-	})
 }
 
 // ---- Concurrency ------------------------------------------------------
 
 func TestRegistry_Concurrent(t *testing.T) {
-	reg, _ := newReg(t)
+	reg := newReg(t)
 
 	// Pre-register one type so Decode has something to find.
 	require.NoError(t, reg.Register("com.keyop.OrderCreated", orderCreated{}))

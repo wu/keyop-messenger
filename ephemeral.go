@@ -62,6 +62,7 @@ type EphemeralMessenger struct {
 	name   string // derived from local TLS cert CN (or test override)
 	client *federation.EphemeralClient
 	reg    registry.PayloadRegistry
+	log    Logger
 }
 
 // NewEphemeralMessenger constructs an EphemeralMessenger. Call Subscribe to
@@ -117,7 +118,8 @@ func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMesse
 		cfg:    cfg,
 		name:   name,
 		client: federation.NewEphemeralClient(fedCfg, o.logger),
-		reg:    registry.New(o.logger),
+		reg:    registry.New(),
+		log:    o.logger,
 	}, nil
 }
 
@@ -142,8 +144,18 @@ func (m *EphemeralMessenger) Subscribe(channel string, handler func(msg Message)
 		return err
 	}
 	reg := m.reg
+	log := m.log
 	m.client.AddHandler(channel, func(env *envelope.Envelope) error {
-		payload, _ := reg.Decode(env.PayloadType, env.Payload)
+		payload, err := reg.Decode(env.PayloadType, env.Payload)
+		if err != nil {
+			// Unregistered or undecodable payload: skip delivery and warn. The
+			// ephemeral path has no dead-letter queue, so there is nothing durable
+			// to fall back to — but silently delivering a nil payload would hide a
+			// registration mistake.
+			log.Warn("ephemeral: skipping undecodable message",
+				"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
+			return nil
+		}
 		handler(Message{
 			ID:            env.ID,
 			Channel:       env.Channel,

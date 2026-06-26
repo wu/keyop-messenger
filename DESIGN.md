@@ -98,7 +98,7 @@ Publishers register a payload type string and a corresponding Go type at startup
 messenger.RegisterPayloadType("com.keyop.orders.OrderCreated", OrderCreated{})
 ```
 
-Subscribers receive the decoded `payload` field as the registered type. An unregistered `payload_type` is delivered as `map[string]any` with a warning logged — it is never dropped.
+Subscribers receive the decoded `payload` field as the registered type. A payload whose `payload_type` is not registered (or whose JSON does not decode into the registered type) is **not** delivered to the handler: the durable subscriber routes it to the channel's dead-letter queue (so it is recoverable, never silently lost), and the ephemeral subscriber — which has no dead-letter queue — skips it with a warning. Unregistered payloads are no longer coerced into `map[string]any`; that fallback silently lost any non-object payload (a JSON array, string, or number) because it could not unmarshal into a map.
 
 ### 4.3 Envelope Versioning
 

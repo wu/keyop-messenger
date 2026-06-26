@@ -4,6 +4,7 @@ package messenger
 
 import (
 	"context"
+	"encoding/json"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -26,7 +27,29 @@ func newEphemeralMessenger(t *testing.T, _ /* name */, hubAddr, caFile, certFile
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })
+	registerTestTypes(t, em)
 	return em
+}
+
+// registerTestTypes registers the payload types the integration/ephemeral
+// delivery tests publish, so they decode and are delivered (unregistered types
+// are no longer delivered). It is called by the test constructors
+// (newEphemeralMessenger, newHubMessenger, newClientMessengerWithPolicy) so every
+// integration messenger has them.
+//
+// The same type string is published with varying JSON shapes across tests (a
+// bare string in some, an object in others), so those are registered as
+// json.RawMessage — which decodes any JSON shape — since no handler inspects
+// their decoded value. test.ForwardMsg is the exception: a handler asserts it as
+// map[string]any, so it is registered as such. test.MyEvent is registered by the
+// one test that uses it (as a concrete struct) and is intentionally omitted here
+// to avoid a duplicate registration.
+func registerTestTypes(t *testing.T, r payloadRegistrar) {
+	t.Helper()
+	for _, ty := range []string{"test.E", "test.Event", "test.Evt", "test.Msg", "test.Order", "test.v1"} {
+		require.NoError(t, r.RegisterPayloadType(ty, json.RawMessage(nil)))
+	}
+	require.NoError(t, r.RegisterPayloadType("test.ForwardMsg", map[string]any{}))
 }
 
 // TestEphemeralMessenger_Publish_ToHub verifies that a message published by the

@@ -182,11 +182,16 @@ var (
 // SubscriberStats returns a snapshot of the diagnostic counters. Intended for
 // tests and observability hooks investigating delivery anomalies.
 type SubscriberStats struct {
-	WakesByNotify       int64
-	WakesByPoll         int64
-	ProcessCalls        int64
-	Dispatched          int64
-	UnmarshalSkipped    int64
+	WakesByNotify    int64
+	WakesByPoll      int64
+	ProcessCalls     int64
+	Dispatched       int64
+	UnmarshalSkipped int64
+	// DecodeSkipped counts messages whose payload could not be decoded
+	// (unregistered type or malformed JSON). These are not delivered to the
+	// handler; instead they are dead-lettered (except when already on a
+	// dead-letter channel, where they are only logged), so the count also
+	// appears as messages on the {channel}.dead-letter channel.
 	DecodeSkipped       int64
 	RetryLaterPauses    int64
 	CompactionDrops     int64
@@ -656,8 +661,21 @@ func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset in
 
 			payload, err := s.reg.Decode(env.PayloadType, env.Payload)
 			if err != nil {
+				// Undecodable payload (unregistered type or malformed JSON). Route
+				// it to the dead-letter queue instead of silently advancing past it,
+				// so a registration oversight or corrupt payload is recoverable
+				// rather than permanently lost. A message already on a dead-letter
+				// channel is only logged — re-dead-lettering would loop into
+				// channel.dead-letter.dead-letter.
 				s.decodeSkipped.Add(1)
-				s.log.Error("decode payload", "type", env.PayloadType, "err", err)
+				if strings.HasSuffix(env.Channel, ".dead-letter") {
+					s.log.Error("dead-letter message failed to decode, skipping",
+						"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
+				} else {
+					s.log.Error("decode payload failed; dead-lettering",
+						"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
+					s.sendToDeadLetter(&env, err)
+				}
 				s.advanceOffset(nextOffset)
 				offset = nextOffset
 				continue
