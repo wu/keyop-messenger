@@ -58,3 +58,29 @@ func OffsetFileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+// SanitizeForFilename returns a filename-safe form of s, replacing every
+// character outside [a-zA-Z0-9._-] with '_'. It is used to derive offset
+// filenames from caller-controlled identifiers (subscriber IDs, peer CNs, hub
+// addresses) that are otherwise joined straight into a path. Because '/' (and
+// the platform separator) is replaced, the result can never introduce a path
+// component, so it cannot escape its intended directory. The transform is
+// idempotent: applying it to already-sanitized input is a no-op. An empty input
+// yields an empty string (callers always append a fixed suffix such as
+// ".offset", so the basename is never "." or "..").
+func SanitizeForFilename(s string) string {
+	out := make([]byte, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z',
+			c >= 'A' && c <= 'Z',
+			c >= '0' && c <= '9',
+			c == '.', c == '_', c == '-':
+			out[i] = c
+		default:
+			out[i] = '_'
+		}
+	}
+	return string(out)
+}

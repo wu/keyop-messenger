@@ -236,7 +236,10 @@ func NewSubscriber(
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create offset dir %q: %w", offsetDir, err)
 	}
-	offsetPath := filepath.Join(offsetDir, id+".offset")
+	// id is caller-controlled (the public Subscribe subscriberID) and is joined
+	// straight into a filesystem path; sanitize it so a value containing path
+	// separators cannot write its offset file outside offsetDir.
+	offsetPath := filepath.Join(offsetDir, SanitizeForFilename(id)+".offset")
 
 	var offset int64
 	if OffsetFileExists(offsetPath) {

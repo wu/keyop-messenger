@@ -119,7 +119,11 @@ func newChannelReader(
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("newChannelReader: mkdir %q: %w", offsetDir, err)
 	}
-	offsetPath := filepath.Join(offsetDir, offsetPrefix+peerName+".offset")
+	// peerName is caller-controlled: on the hub side it is the peer's certificate
+	// CN, joined straight into a filesystem path. Sanitize it so a CN containing
+	// path separators cannot write/remove offset files outside offsetDir. The
+	// client outbound path already sanitizes hubAddr; re-sanitizing is a no-op.
+	offsetPath := filepath.Join(offsetDir, offsetPrefix+storage.SanitizeForFilename(peerName)+".offset")
 
 	var offset int64
 	if storage.OffsetFileExists(offsetPath) {

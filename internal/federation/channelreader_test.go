@@ -34,6 +34,32 @@ func writeTestSegment(t *testing.T, channelDir string, startOffset int64, envs [
 	return data
 }
 
+// TestNewChannelReader_SanitizesPeerNameForOffsetPath verifies that a peerName
+// (on the hub side, the peer's certificate CN) containing path separators cannot
+// write its offset file outside offsetDir.
+func TestNewChannelReader_SanitizesPeerNameForOffsetPath(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "ch")
+	offsetDir := filepath.Join(dir, "subscribers", "ch")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 1)
+	// "../../evil" would otherwise escape offsetDir entirely. The reader is not
+	// started (close() would block waiting on a goroutine that never ran); the
+	// offset file is written during construction, which is all this test checks.
+	_, err := newChannelReader("../../evil", "ch", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	require.NoError(t, err)
+
+	// No offset file may appear outside offsetDir.
+	_, statErr := os.Stat(filepath.Join(dir, "fed-evil.offset"))
+	assert.True(t, os.IsNotExist(statErr), "offset must not escape offsetDir")
+
+	// The sanitized offset file lives inside offsetDir.
+	want := filepath.Join(offsetDir, "fed-"+storage.SanitizeForFilename("../../evil")+".offset")
+	_, statErr = os.Stat(want)
+	require.NoError(t, statErr, "sanitized offset file must exist inside offsetDir")
+}
+
 // makeEnvelope is a test helper that creates a simple envelope.
 func makeEnvelope(t *testing.T, channel, id string) envelope.Envelope {
 	t.Helper()

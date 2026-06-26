@@ -251,24 +251,12 @@ func (c *Client) buildOutboundReaders(hubAddr string) ([]*channelReader, map[str
 	return readers, byChannel, nil
 }
 
-// sanitizeForFilename returns a filename-safe form of s by replacing characters
-// outside [a-zA-Z0-9._-] with '_'. Used to derive an offset filename from a
-// hub network address like "host:7740".
+// sanitizeForFilename derives a filename-safe form of s (e.g. a hub network
+// address like "host:7740") for use as an offset filename. It delegates to
+// storage.SanitizeForFilename so the rule has a single definition shared with
+// the subscriber and channelReader offset paths.
 func sanitizeForFilename(s string) string {
-	out := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z',
-			c >= 'A' && c <= 'Z',
-			c >= '0' && c <= '9',
-			c == '.', c == '_', c == '-':
-			out[i] = c
-		default:
-			out[i] = '_'
-		}
-	}
-	return string(out)
+	return storage.SanitizeForFilename(s)
 }
 
 // getOrCreateGRPCConn returns the existing gRPC connection or creates a new one

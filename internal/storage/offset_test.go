@@ -73,6 +73,29 @@ func TestOffsetFileExists(t *testing.T) {
 	assert.True(t, OffsetFileExists(path), "should exist after write")
 }
 
+func TestSanitizeForFilename(t *testing.T) {
+	cases := map[string]string{
+		"orders":      "orders",
+		"my-sub_1.v2": "my-sub_1.v2",
+		"../evil":     ".._evil",
+		"a/b/c":       "a_b_c",
+		"host:7740":   "host_7740",
+		"sp ace":      "sp_ace",
+		"":            "",
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, SanitizeForFilename(in), "input %q", in)
+		// Idempotent: re-sanitizing already-safe output changes nothing.
+		assert.Equal(t, want, SanitizeForFilename(want), "idempotent for %q", in)
+	}
+	// The result can never contain a path separator, so it cannot escape its dir.
+	for _, in := range []string{"../../etc/passwd", `a\b`, "x/y", "/abs"} {
+		out := SanitizeForFilename(in)
+		assert.NotContains(t, out, "/", "input %q", in)
+		assert.NotContains(t, out, `\`, "input %q", in)
+	}
+}
+
 // TestWriteOffset_CreateFailure verifies the error path when the temporary file
 // cannot be created (e.g. the parent directory does not exist).
 func TestWriteOffset_CreateFailure(t *testing.T) {

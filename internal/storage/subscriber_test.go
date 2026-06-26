@@ -116,6 +116,25 @@ const testTimeout = 2 * time.Second
 
 // ---- tests ------------------------------------------------------------------
 
+// TestNewSubscriber_SanitizesIDForOffsetPath verifies a subscriber ID with path
+// separators cannot write its offset file outside offsetDir.
+func TestNewSubscriber_SanitizesIDForOffsetPath(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "ch")
+	offsetDir := filepath.Join(dir, "offsets")
+
+	// "../evil" would otherwise resolve to dir/evil.offset (outside offsetDir).
+	_, _, _ = newTestSub(t, "../evil", channelDir, offsetDir, 0)
+
+	_, err := os.Stat(filepath.Join(dir, "evil.offset"))
+	assert.True(t, os.IsNotExist(err), "offset file must not escape offsetDir")
+
+	// The sanitized offset file lives inside offsetDir.
+	info, err := os.Stat(filepath.Join(offsetDir, SanitizeForFilename("../evil")+".offset"))
+	require.NoError(t, err, "sanitized offset file must exist inside offsetDir")
+	assert.False(t, info.IsDir())
+}
+
 func TestSubscriber_Offset(t *testing.T) {
 	dir := t.TempDir()
 	channelDir := filepath.Join(dir, "ch")
