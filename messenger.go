@@ -1089,6 +1089,17 @@ func (m *Messenger) channelRetention(channel string) time.Duration {
 	return retention
 }
 
+// maxLogFiles returns the configured cap on the total number of segment files
+// retained per channel (including the active one), falling back to the default
+// of 10 when the config was built programmatically without ApplyDefaults. An
+// explicit 0 disables the cap.
+func (m *Messenger) maxLogFiles() int {
+	if m.cfg.Storage.MaxFiles == nil {
+		return 10
+	}
+	return *m.cfg.Storage.MaxFiles
+}
+
 // channelRollThreshold returns the segment roll size in bytes for channel.
 // Dead-letter channels use the smaller storage.dead_letter_compaction_threshold_mb
 // so their active segment seals sooner and age-based retention can reclaim it;
@@ -1126,7 +1137,7 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 		subs: make(map[string]*subscriberEntry),
 		compactor: storage.NewCompactor(
 			m.offsetDir(channel),
-			int64(m.cfg.Storage.MaxChannelSizeMB)*1024*1024,
+			m.maxLogFiles(),
 			m.channelRetention(channel),
 			m.log,
 		),

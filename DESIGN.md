@@ -212,7 +212,7 @@ Dead-letter channels are regular channels in their storage layout. They can be s
 
 **Default retention.** An undrained dead-letter channel — one with no reprocessing consumer — would otherwise grow without bound, since consumption-based compaction never reclaims segments no subscriber has read. To bound this, dead-letter channels are given a default retention of **7 days** when no global `storage.retention` is configured: the compactor force-deletes sealed dead-letter segments older than that even though nothing consumed them (see §5.7). When a global `storage.retention` *is* configured, dead-letter channels inherit it like any other channel.
 
-Age-based retention only acts on **sealed** segments — the active (currently-written) segment is never deleted, and a segment only seals when a write would push it past the channel's roll threshold. To keep that floor low for dead-letter channels, they roll at a separate, smaller threshold: `storage.dead_letter_compaction_threshold_mb` (default **64 MB**, versus `storage.compaction_threshold_mb`'s 256 MB for regular channels). A smaller roll size means a quiet dead-letter channel seals its active segment sooner, so the 7-day retention can actually reclaim it rather than holding everything in one never-rolled segment. Lower it further if you need a tighter bound on a low-volume channel.
+Age-based retention only acts on **sealed** segments — the active (currently-written) segment is never deleted, and a segment only seals when a write would push it past the channel's roll threshold. To keep that floor low for dead-letter channels, they roll at a separate, smaller threshold: `storage.dead_letter_compaction_threshold_mb` (default **50 MB**, versus `storage.compaction_threshold_mb`'s 100 MB for regular channels). A smaller roll size means a quiet dead-letter channel seals its active segment sooner, so the 7-day retention can actually reclaim it rather than holding everything in one never-rolled segment. Lower it further if you need a tighter bound on a low-volume channel.
 
 **Head-of-line blocking.** Each subscriber runs its own delivery goroutine with its own offset, and retries — including the exponential-backoff sleeps between attempts — run inline in that goroutine. So a consistently-failing message blocks **that subscriber's** delivery of every later message on the channel until it is dead-lettered. The stall is per subscriber: other subscribers on the same channel read from their own offsets and keep delivering, unaffected. At the default `max_retries` of 5 that is roughly **3.1 s** (100 + 200 + 400 + 800 + 1600 ms) of stalled delivery per poison message for the affected subscriber; raising `max_retries` lengthens the stall (each further attempt adds up to the 5 s backoff cap). This is intentional backpressure — for an ordered stream of state-change events you generally *want* to stall rather than process message N+1 before N succeeds — so for many channels the blocking is a feature, not a problem.
 
@@ -235,18 +235,18 @@ Because each `data_dir` is owned by a single process (see §3.2), subscribers an
 
 ### 5.7 File Rotation and Compaction
 
-**Segment rolling:** The writer rolls to a new segment when the current segment's size would exceed `compaction_threshold_mb` (default: 256 MB). Rolling is O(1): the current segment is synced and closed, a new file is created with a name encoding its start offset, and subsequent writes land in the new file. There is no pause, copy, or coordination with subscribers.
+**Segment rolling:** The writer rolls to a new segment when the current segment's size would exceed `compaction_threshold_mb` (default: 100 MB). Rolling is O(1): the current segment is synced and closed, a new file is created with a name encoding its start offset, and subsequent writes land in the new file. There is no pause, copy, or coordination with subscribers.
 
 **Compaction:** The compactor periodically scans the channel directory and deletes any sealed segment (all segments except the active one) whose entire content lies before the minimum subscriber offset — i.e., every registered subscriber has advanced past the segment's last byte. Deletion is a single `unlink` syscall. No writer pause is needed: the writer holds the active segment open, and Unix permits deletion of sealed segments even while subscribers hold open file descriptors to them (the inode persists until all readers close their fds).
 
 **Retention caps (force-eviction):** Consumption-based compaction alone lets a single parked or lagging subscriber pin a channel's log into unbounded growth, eventually filling the disk. Two optional bounds cap usage by force-deleting the oldest sealed segments **even if a subscriber has not consumed them**:
 
-- `max_channel_size_mb` — a hard cap on a channel's total retained on-disk bytes.
-- `retention` — a maximum message age. A sealed segment's file mtime is used as the age of its newest record (a record's timestamp is at most its write time). Accepts a day unit, e.g. `7d` or `168h`.
+- `max_files` — a cap on the total number of segment files a channel retains, **including the active segment**. The active segment is never deleted, so the on-disk ceiling is `max_files` files (and the floor is 1). **Defaults to `10`**, so disk usage is bounded out of the box; an explicit `0` disables the cap (unbounded, pure consumption-based behavior). The per-channel byte ceiling is therefore roughly `max_files × compaction_threshold_mb` (≈ 1 GB at the defaults of 10 × 100 MB) — keep `compaction_threshold_mb` small if you need a tighter bound.
+- `retention` — a maximum message age. A sealed segment's file mtime is used as the age of its newest record (a record's timestamp is at most its write time). Accepts a day unit, e.g. `7d` or `168h`. Defaults to `0` (disabled).
 
-Eviction fires when **either** bound is exceeded; both default to `0` (disabled), preserving pure consumption-based behavior. Sealed segments are evaluated oldest-first and deleted while consumed, over the size cap, or past the age bound; the active segment is never deleted, so the effective floor is one segment (keep `compaction_threshold_mb` small to keep that floor low). Federation peer offsets participate in the minimum-offset boundary like any subscriber, so a lagging peer's unconsumed data is subject to the same force-eviction.
+Eviction fires when **either** bound is exceeded. Sealed segments are evaluated oldest-first and deleted while consumed, over the file count, or past the age bound; the active segment is never deleted, so the effective floor is one segment. Federation peer offsets participate in the minimum-offset boundary like any subscriber, so a lagging or disconnected peer's unconsumed data is subject to the same force-eviction.
 
-**Subscriber fast-forward on undercut:** When force-eviction drops data a subscriber had not yet read, that subscriber's persisted offset falls below the earliest surviving segment's start. On its next read the subscriber detects this, fast-forwards to that start (skipping the dropped messages), logs a warning, and continues — preventing a negative-seek wedge. The event is surfaced via the `CompactionDrops` subscriber stat.
+**Reader fast-forward on undercut:** When force-eviction drops data a subscriber or federation peer had not yet read, its persisted offset falls below the earliest surviving segment's start. A durable subscriber detects this on its next read, fast-forwards to that start (skipping the dropped messages), logs a warning, and continues — preventing a negative-seek wedge; the event is surfaced via the `CompactionDrops` subscriber stat. The federation outbound `channelReader` does the same by construction: its read seeks to `max(storedOffset, earliestSegment.startOffset)`, so a client that stays disconnected long enough for the cap to drop unconsumed segments resumes, on reconnect, at the oldest message still available rather than replaying the lost range or stalling.
 
 ### 5.8 Subscriber Registration
 
@@ -655,10 +655,10 @@ storage:
                            # > 0 = fsync periodically at interval in milliseconds (batched, faster).
   offset_flush_interval_ms: 0  # 0 = flush subscriber offset after every message (strictest at-least-once);
                            # > 0 = batch offset flushes (faster; may redeliver up to this window on crash).
-  compaction_threshold_mb: 256 # Writer rolls to a new segment when the active segment reaches this size.
-  max_channel_size_mb: 0   # 0 = unlimited; > 0 force-evicts oldest segments to cap a channel's retained bytes.
+  compaction_threshold_mb: 100 # Writer rolls to a new segment when the active segment reaches this size.
+  max_files: 10            # Max total segment files per channel incl. the active one (default 10). 0 = unlimited.
   retention: 0             # 0 = no age limit; e.g. "7d" / "168h" force-evicts segments older than this.
-                           # max_channel_size_mb and retention drop the oldest data even if unconsumed.
+                           # max_files and retention drop the oldest data even if unconsumed.
 
 subscribers:
   max_retries: 5           # Retry count before routing a message to the dead-letter channel.

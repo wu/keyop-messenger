@@ -144,8 +144,8 @@ func TestApplyDefaults(t *testing.T) {
 		c.ApplyDefaults()
 
 		assert.Equal(t, 0, c.Storage.SyncIntervalMS)
-		assert.Equal(t, 256, c.Storage.CompactionThresholdMB)
-		assert.Equal(t, 64, c.Storage.DeadLetterCompactionThresholdMB)
+		assert.Equal(t, 100, c.Storage.CompactionThresholdMB)
+		assert.Equal(t, 50, c.Storage.DeadLetterCompactionThresholdMB)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 5, *c.Subscribers.MaxRetries)
 		assert.Equal(t, 100, c.Subscribers.RetryBackoffBaseMS)
@@ -159,6 +159,15 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 100_000, c.Dedup.SeenIDLRUSize)
 		assert.Equal(t, 100, c.Audit.MaxSizeMB)
 		assert.Equal(t, 10, c.Audit.MaxFiles)
+		require.NotNil(t, c.Storage.MaxFiles)
+		assert.Equal(t, 10, *c.Storage.MaxFiles)
+	})
+
+	t.Run("explicit zero MaxFiles is preserved (disabled)", func(t *testing.T) {
+		c := Config{Storage: StorageConfig{MaxFiles: intPtr(0)}}
+		c.ApplyDefaults()
+		require.NotNil(t, c.Storage.MaxFiles)
+		assert.Equal(t, 0, *c.Storage.MaxFiles, "explicit 0 disables the cap and must not be defaulted to 10")
 	})
 
 	t.Run("explicit values are not overwritten", func(t *testing.T) {
@@ -167,6 +176,7 @@ func TestApplyDefaults(t *testing.T) {
 				SyncIntervalMS:                  999,
 				CompactionThresholdMB:           512,
 				DeadLetterCompactionThresholdMB: 128,
+				MaxFiles:                        intPtr(25),
 			},
 			Subscribers: SubscribersConfig{MaxRetries: intPtr(10), RetryBackoffBaseMS: 250, RetryBackoffMaxMS: 10_000},
 			TLS:         TLSConfig{ExpiryWarnDays: 60},
@@ -185,6 +195,8 @@ func TestApplyDefaults(t *testing.T) {
 		assert.Equal(t, 999, c.Storage.SyncIntervalMS)
 		assert.Equal(t, 512, c.Storage.CompactionThresholdMB)
 		assert.Equal(t, 128, c.Storage.DeadLetterCompactionThresholdMB)
+		require.NotNil(t, c.Storage.MaxFiles)
+		assert.Equal(t, 25, *c.Storage.MaxFiles)
 		require.NotNil(t, c.Subscribers.MaxRetries)
 		assert.Equal(t, 10, *c.Subscribers.MaxRetries)
 		assert.Equal(t, 250, c.Subscribers.RetryBackoffBaseMS)
@@ -216,7 +228,7 @@ func TestLoadConfig_RoundTrip(t *testing.T) {
 storage:
   data_dir: /var/keyop
   sync_interval_ms: 500
-  max_channel_size_mb: 2048
+  max_files: 25
   retention: 7d
   compaction_threshold_mb: 512
 subscribers:
@@ -261,7 +273,8 @@ audit:
 
 	assert.Equal(t, "/var/keyop", cfg.Storage.DataDir)
 	assert.Equal(t, 500, cfg.Storage.SyncIntervalMS)
-	assert.Equal(t, 2048, cfg.Storage.MaxChannelSizeMB)
+	require.NotNil(t, cfg.Storage.MaxFiles)
+	assert.Equal(t, 25, *cfg.Storage.MaxFiles)
 	assert.Equal(t, 7*24*time.Hour, cfg.Storage.RetentionAge.Duration)
 	assert.Equal(t, 512, cfg.Storage.CompactionThresholdMB)
 	require.NotNil(t, cfg.Subscribers.MaxRetries)

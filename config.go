@@ -66,7 +66,7 @@ type StorageConfig struct {
 	SyncIntervalMS int `yaml:"sync_interval_ms"`
 
 	// CompactionThresholdMB triggers file rotation when the consumed (already-read-by-all-
-	// subscribers) portion of a channel file exceeds this size. Default: 256.
+	// subscribers) portion of a channel file exceeds this size. Default: 100.
 	CompactionThresholdMB int `yaml:"compaction_threshold_mb"`
 
 	// DeadLetterCompactionThresholdMB is the segment roll size for dead-letter
@@ -75,23 +75,28 @@ type StorageConfig struct {
 	// channel's active segment seals sooner, letting age-based retention (see
 	// RetentionAge and the default dead-letter retention) actually reclaim it on
 	// a low-volume channel instead of holding everything in one never-rolled
-	// active segment. Default: 64.
+	// active segment. Default: 50.
 	DeadLetterCompactionThresholdMB int `yaml:"dead_letter_compaction_threshold_mb"`
 
-	// MaxChannelSizeMB caps the on-disk size of a single channel's retained segment
-	// files. When the total exceeds this, the compactor force-deletes the oldest
-	// sealed segments — including ones a lagging subscriber has not yet consumed —
-	// to bound disk usage. The active (currently-written) segment is never deleted,
-	// so the effective floor is one segment (keep CompactionThresholdMB small to
-	// keep that floor low). A subscriber whose offset is undercut fast-forwards past
-	// the dropped messages. 0 (default) disables the size cap.
-	MaxChannelSizeMB int `yaml:"max_channel_size_mb"`
+	// MaxFiles caps the total number of channel log files a single channel retains,
+	// counting the active (currently-written) segment. The active segment is never
+	// deleted, so the on-disk floor is one file and the ceiling is MaxFiles files.
+	// When the total exceeds MaxFiles, the compactor force-deletes the oldest
+	// sealed segments — including ones a lagging or disconnected subscriber/
+	// federation peer has not yet consumed — to bound disk usage. A reader whose
+	// offset is undercut by this eviction resumes at the oldest still-available
+	// message.
+	//
+	// nil (field omitted) applies the default of 10. An explicit 0 disables the
+	// cap (unbounded, pure consumption-based behavior). A positive value keeps that
+	// many log files total. Set via [Config.ApplyDefaults].
+	MaxFiles *int `yaml:"max_files"`
 
 	// RetentionAge caps how long messages are retained. The compactor force-deletes
 	// sealed segments whose most recent write is older than this, even if a
 	// subscriber has not consumed them. The active segment is never deleted.
 	// 0 (default) disables age-based retention. Eviction occurs when EITHER
-	// MaxChannelSizeMB or RetentionAge is exceeded. Accepts a day unit, e.g.
+	// MaxFiles or RetentionAge is exceeded. Accepts a day unit, e.g.
 	// "7d" or "168h" for one week.
 	RetentionAge Duration `yaml:"retention"`
 
@@ -314,11 +319,16 @@ func LoadConfig(path string) (*Config, error) {
 // programmatically, call ApplyDefaults before passing it to [New].
 func (c *Config) ApplyDefaults() {
 	if c.Storage.CompactionThresholdMB == 0 {
-		c.Storage.CompactionThresholdMB = 256
+		c.Storage.CompactionThresholdMB = 100
 	}
 
 	if c.Storage.DeadLetterCompactionThresholdMB == 0 {
-		c.Storage.DeadLetterCompactionThresholdMB = 64
+		c.Storage.DeadLetterCompactionThresholdMB = 50
+	}
+
+	if c.Storage.MaxFiles == nil {
+		n := 10
+		c.Storage.MaxFiles = &n
 	}
 
 	if c.Subscribers.MaxRetries == nil {

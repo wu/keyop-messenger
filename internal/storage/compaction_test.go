@@ -420,10 +420,13 @@ func TestMaybeCompact_CorruptFedOffset(t *testing.T) {
 	assert.Len(t, segs, 1, "sealed segment must be deleted based on subscriber offset despite corrupt fed file")
 }
 
-// TestCompactor_SizeCapForceEvictsUnconsumed verifies that the size cap deletes
+// TestCompactor_MaxFilesForceEvictsUnconsumed verifies that the file cap deletes
 // the oldest sealed segments even when a subscriber has consumed nothing, so a
-// lagging subscriber cannot pin the channel log into unbounded growth.
-func TestCompactor_SizeCapForceEvictsUnconsumed(t *testing.T) {
+// lagging subscriber cannot pin the channel log into unbounded growth. maxFiles
+// counts the active segment: with maxFiles=2 and four total segments (three
+// sealed + active), the two oldest sealed segments are force-evicted, leaving one
+// sealed plus the active segment.
+func TestCompactor_MaxFilesForceEvictsUnconsumed(t *testing.T) {
 	base := t.TempDir()
 	channelDir := filepath.Join(base, "orders")
 	offsetDir := filepath.Join(base, "offsets")
@@ -438,23 +441,63 @@ func TestCompactor_SizeCapForceEvictsUnconsumed(t *testing.T) {
 	// delete no segments (minOffset == 0).
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
 
-	// Cap retains roughly two segments' worth of bytes.
-	maxSize := 2 * s0
-	c := NewCompactor(offsetDir, maxSize, 0, &testutil.FakeLogger{})
+	// Keep at most two log files total (one sealed + the active).
+	c := NewCompactor(offsetDir, 2, 0, &testutil.FakeLogger{})
 	c.RegisterSubscriber("sub1")
 
 	require.NoError(t, c.MaybeCompact(channelDir))
 
 	segs, err := listSegments(channelDir)
 	require.NoError(t, err)
-	require.Len(t, segs, 2, "oldest unconsumed segments should be force-evicted to honor the size cap")
+	require.Len(t, segs, 2, "total files (incl. active) should be capped at maxFiles=2")
 	assert.Equal(t, s0+s1, segs[0].startOffset, "earliest surviving segment should start past the dropped data")
+}
 
-	var total int64
-	for _, sg := range segs {
-		total += sg.size
-	}
-	assert.LessOrEqual(t, total, maxSize, "retained bytes should be within the size cap")
+// TestCompactor_MaxFilesKeepsOnlyActive verifies that maxFiles=1 evicts every
+// sealed segment, leaving only the active one (the floor).
+func TestCompactor_MaxFilesKeepsOnlyActive(t *testing.T) {
+	base := t.TempDir()
+	channelDir := filepath.Join(base, "orders")
+	offsetDir := filepath.Join(base, "offsets")
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+
+	s0 := writeSegment(t, channelDir, 0, 10)
+	s1 := writeSegment(t, channelDir, s0, 10)
+	_ = writeSegment(t, channelDir, s0+s1, 5) // active segment
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
+
+	c := NewCompactor(offsetDir, 1, 0, &testutil.FakeLogger{})
+	c.RegisterSubscriber("sub1")
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	require.Len(t, segs, 1, "maxFiles=1 keeps only the active segment")
+	assert.Equal(t, s0+s1, segs[0].startOffset)
+}
+
+// TestCompactor_MaxFilesDisabledByZero verifies that maxFiles=0 disables the
+// cap: nothing is force-evicted when a subscriber has consumed nothing.
+func TestCompactor_MaxFilesDisabledByZero(t *testing.T) {
+	base := t.TempDir()
+	channelDir := filepath.Join(base, "orders")
+	offsetDir := filepath.Join(base, "offsets")
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+
+	s0 := writeSegment(t, channelDir, 0, 10)
+	s1 := writeSegment(t, channelDir, s0, 10)
+	_ = writeSegment(t, channelDir, s0+s1, 5) // active segment
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
+
+	c := NewCompactor(offsetDir, 0, 0, &testutil.FakeLogger{})
+	c.RegisterSubscriber("sub1")
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 3, "cap disabled (0) must not force-evict unconsumed segments")
 }
 
 // TestCompactor_RetentionAgeForceEvicts verifies that sealed segments older than

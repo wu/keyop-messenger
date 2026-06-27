@@ -280,13 +280,13 @@ func TestChannelRetention(t *testing.T) {
 func TestChannelRollThreshold(t *testing.T) {
 	const mb = 1024 * 1024
 
-	// Defaults: 256 MB regular, 64 MB dead-letter.
+	// Defaults: 100 MB regular, 50 MB dead-letter.
 	m, err := newForTest(t.TempDir())
 	require.NoError(t, err)
 	defer func() { _ = m.Close() }()
 
-	assert.Equal(t, int64(256*mb), m.channelRollThreshold("orders"))
-	assert.Equal(t, int64(64*mb), m.channelRollThreshold("orders.dead-letter"))
+	assert.Equal(t, int64(100*mb), m.channelRollThreshold("orders"))
+	assert.Equal(t, int64(50*mb), m.channelRollThreshold("orders.dead-letter"))
 
 	// Explicit config is honoured for both channel kinds.
 	cfg := testConfig(t.TempDir())

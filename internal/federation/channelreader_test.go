@@ -432,6 +432,51 @@ func TestChannelReader_ResumeFromOffset(t *testing.T) {
 	}
 }
 
+// TestChannelReader_UndercutResumesAtOldestAvailable verifies that when retention
+// compaction has dropped segments below a (disconnected) reader's stored offset,
+// the reader resumes at the oldest still-available message rather than failing or
+// stalling. This is the reconnect half of the old-log-file force-eviction
+// contract: the cap drops segments a disconnected client never consumed, and on
+// reconnect the client picks up at the oldest message still on disk.
+func TestChannelReader_UndercutResumesAtOldestAvailable(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "undercut")
+	offsetDir := filepath.Join(dir, "subscribers", "undercut")
+	log := &testutil.FakeLogger{}
+	require.NoError(t, os.MkdirAll(offsetDir, 0o750))
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+
+	// Simulate that compaction force-evicted everything below offset 500: the only
+	// surviving segment starts at 500.
+	const earliest = int64(500)
+	m1 := makeEnvelope(t, "undercut", "m1")
+	m2 := makeEnvelope(t, "undercut", "m2")
+	data := writeTestSegment(t, channelDir, earliest, []envelope.Envelope{m1, m2})
+
+	// The reader's stored offset (100) is below the earliest surviving segment —
+	// it was undercut while the client was disconnected.
+	offsetPath := filepath.Join(offsetDir, "fed-peer1.offset")
+	require.NoError(t, storage.WriteOffset(offsetPath, 100))
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "undercut", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	require.NoError(t, err)
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	select {
+	case req := <-requestCh:
+		assert.Len(t, req.rawLines, 2, "both surviving records delivered from the oldest available")
+		assert.Equal(t, earliest+int64(len(data)), req.newOffset,
+			"offset resumes at oldest available; the dropped [100,500) gap is not replayed")
+		close(req.doneCh)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for batch")
+	}
+}
+
 // TestChannelReader_MultipleNotificationsCoalesced verifies that rapid
 // back-to-back notify() calls do not cause extra reads.
 func TestChannelReader_MultipleNotificationsCoalesced(t *testing.T) {
