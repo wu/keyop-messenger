@@ -8,6 +8,7 @@ import (
 	"google.golang.org/grpc"
 
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
+	"github.com/wu/keyop-messenger/internal/audit"
 )
 
 // clientCoordinator serialises hub→peer sends across all channel readers
@@ -37,6 +38,10 @@ type clientCoordinator struct {
 	// the Subscribe stream broke (not a deliberate shutdown), so the Hub can
 	// surface a delivery-failure count.
 	recordSendFail func()
+	// auditL records an outbound forward event per envelope once a batch is
+	// acked by the peer. peer identifies the destination in those records.
+	auditL audit.AuditLogger
+	peer   string
 
 	stop chan struct{}
 	done chan struct{}
@@ -58,6 +63,8 @@ func newClientCoordinator(
 	readers []*channelReader,
 	recordAckRTT func(time.Duration),
 	recordSendFail func(),
+	auditL audit.AuditLogger,
+	peer string,
 ) *clientCoordinator {
 	requestCh := make(chan sendReq, 1)
 	cc := &clientCoordinator{
@@ -68,6 +75,8 @@ func newClientCoordinator(
 		readers:        readers,
 		recordAckRTT:   recordAckRTT,
 		recordSendFail: recordSendFail,
+		auditL:         auditL,
+		peer:           peer,
 		requestCh:      requestCh,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -145,6 +154,7 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 		if cc.recordAckRTT != nil {
 			cc.recordAckRTT(time.Since(sendStart))
 		}
+		auditOutboundForwards(cc.auditL, cc.peer, req.rawLines)
 		close(req.doneCh)
 		return nil
 	case <-cc.stop:

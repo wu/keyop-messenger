@@ -176,7 +176,7 @@ func (c *Client) dial(hubAddr string) error {
 		pubCancel()
 		return fmt.Errorf("federation: client build outbound readers: %w", err)
 	}
-	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT, c.recordPublishSendFailure)
+	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT, c.recordPublishSendFailure, c.auditL, hubAddr)
 	coordinator.start()
 
 	// Open the Subscribe stream if this client subscribes to channels.

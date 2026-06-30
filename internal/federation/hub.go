@@ -626,7 +626,7 @@ func (h *Hub) buildChannelReaders(
 		readers = append(readers, r)
 	}
 
-	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers, h.recordSubscribeRTT, h.recordSubscribeSendFailure)
+	cc := newClientCoordinator(stream, ackCh, h.maxBatchBytes, h.log, readers, h.recordSubscribeRTT, h.recordSubscribeSendFailure, h.auditL, peerName)
 	return cc, nil
 }
 

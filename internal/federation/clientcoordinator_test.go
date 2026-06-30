@@ -2,6 +2,7 @@ package federation
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -9,12 +10,29 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
+	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/storage"
 	"github.com/wu/keyop-messenger/internal/testutil"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
+
+// captureAudit is a thread-safe audit logger that records events for assertion
+// in unit tests (the integration-tagged recordingAudit is not available here).
+type captureAudit struct {
+	mu     sync.Mutex
+	events []audit.Event
+}
+
+func (c *captureAudit) Log(ev audit.Event) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, ev)
+	return nil
+}
+
+func (c *captureAudit) Close() error { return nil }
 
 // mockSubServerStream implements grpc.BidiStreamingServer[SubscribeFrame, HubBatch]
 // for coordinator unit tests. The test goroutine reads batches from sendCh and
@@ -80,7 +98,7 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil, nil, "")
 	cc.start()
 	defer cc.close()
 
@@ -117,6 +135,65 @@ func TestClientCoordinator_SendBatch_AckFlow(t *testing.T) {
 	}
 }
 
+// TestClientCoordinator_SendBatch_AuditsOutboundForward verifies that, once a
+// batch is acked, one outbound forward audit event is logged per envelope with
+// the configured peer name.
+func TestClientCoordinator_SendBatch_AuditsOutboundForward(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+	auditL := &captureAudit{}
+
+	stream := newMockSubServerStream()
+	ackCh := make(chan struct{}, 4)
+
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil, auditL, "peer-a")
+	cc.start()
+	defer cc.close()
+
+	line1 := []byte(`{"v":1,"id":"id1","channel":"events","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
+	line2 := []byte(`{"v":1,"id":"id2","channel":"events","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
+	doneCh := make(chan struct{})
+
+	go func() {
+		select {
+		case <-stream.sendCh:
+		case <-time.After(2 * time.Second):
+			return
+		}
+		ackCh <- struct{}{}
+	}()
+
+	require.NoError(t, submitReq(t, cc, sendReq{
+		channel:   "events",
+		rawLines:  [][]byte{line1, line2},
+		newOffset: int64(len(line1)+1) + int64(len(line2)+1),
+		doneCh:    doneCh,
+	}))
+
+	select {
+	case <-doneCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for doneCh to close")
+	}
+
+	auditL.mu.Lock()
+	defer auditL.mu.Unlock()
+	var fwd []audit.Event
+	for _, e := range auditL.events {
+		if e.Event == audit.EventForward {
+			fwd = append(fwd, e)
+		}
+	}
+	require.Len(t, fwd, 2)
+	for _, e := range fwd {
+		assert.Equal(t, "outbound", e.Direction)
+		assert.Equal(t, "peer-a", e.Peer)
+		assert.Equal(t, "events", e.Channel)
+	}
+	assert.Equal(t, "id1", fwd[0].MessageID)
+	assert.Equal(t, "id2", fwd[1].MessageID)
+}
+
 // TestClientCoordinator_SequentialDelivery verifies two batches are delivered in order.
 func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	t.Parallel()
@@ -125,7 +202,7 @@ func TestClientCoordinator_SequentialDelivery(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 8)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil, nil, "")
 	cc.start()
 	defer cc.close()
 
@@ -186,7 +263,7 @@ func TestClientCoordinator_Close_Idempotent(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil, nil, "")
 	cc.start()
 
 	cc.close()
@@ -201,7 +278,7 @@ func TestClientCoordinator_AckChannelClosed(t *testing.T) {
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil, nil, nil, "")
 	cc.start()
 
 	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
@@ -240,7 +317,7 @@ func TestClientCoordinator_SendFailureCounted(t *testing.T) {
 
 	var failures atomic.Int64
 	cc := newClientCoordinator(stream, ackCh, 65536, log, nil, nil,
-		func() { failures.Add(1) })
+		func() { failures.Add(1) }, nil, "")
 	cc.start()
 
 	rawLine := []byte(`{"v":1,"id":"z","channel":"ch","origin":"o","ts":"2024-01-01T00:00:00Z","payload_type":"t","payload":{}}`)
@@ -286,7 +363,7 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	reader, err := newChannelReader("peer1", "feed", channelDir, offsetDir, "fed-", 65536, placeholder, log)
 	require.NoError(t, err)
 
-	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil, nil)
+	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil, nil, nil, "")
 	cc.start()
 	defer cc.close()
 
