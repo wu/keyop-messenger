@@ -96,6 +96,7 @@ type Hub struct {
 	federationv1.UnimplementedFederationServiceServer
 
 	tlsCfg             *tls.Config
+	instanceName       string // this hub's identity; appended to Route and used for loop detection
 	localBatchWriter   func([]*envelope.Envelope) error
 	dedup              Deduplicator
 	auditL             audit.AuditLogger
@@ -171,6 +172,7 @@ func (h *Hub) recordSubscribeRTT(d time.Duration) {
 func NewHub(
 	cfg HubConfig,
 	tlsCfg *tls.Config,
+	instanceName string,
 	localBatchWriter func([]*envelope.Envelope) error,
 	dedup Deduplicator,
 	auditL audit.AuditLogger,
@@ -181,6 +183,7 @@ func NewHub(
 	return &Hub{
 		cfg:              cfg,
 		tlsCfg:           tlsCfg,
+		instanceName:     instanceName,
 		localBatchWriter: localBatchWriter,
 		dedup:            dedup,
 		auditL:           auditL,
@@ -429,7 +432,7 @@ func (h *Hub) Publish(stream grpc.BidiStreamingServer[federationv1.PublishBatch,
 		// is skipped on ingest, symmetric with the inbound peer-receiver path. The
 		// gRPC receive frame limit is a coarser transport cap above this.
 		lastID, commitErr := commitInboundBatch(batch.Records, policy, h.dedup,
-			h.localBatchWriter, h.auditL, h.log, peerName, h.maxBatchBytes)
+			h.localBatchWriter, h.auditL, h.log, peerName, h.instanceName, h.maxBatchBytes)
 		if commitErr != nil {
 			// Do not ack: the peer's offset stays put and it resends the batch.
 			h.log.Error("federation: hub batch commit failed; not acking, peer will resend",
@@ -618,8 +621,12 @@ func (h *Hub) buildChannelReaders(
 		offsetDir := filepath.Join(h.dataDir, "subscribers", ch)
 
 		placeholder := make(chan sendReq, 1)
+		// The subscriber's authenticated identity (its cert CN) is peerName; a
+		// record whose path vector already contains it is an echo and is filtered
+		// send-side by the reader.
+		destInstance := peerName
 		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fed-",
-			h.maxBatchBytes, placeholder, h.log)
+			h.maxBatchBytes, placeholder, func() string { return destInstance }, h.log)
 		if err != nil {
 			return nil, fmt.Errorf("channel %q: %w", ch, err)
 		}

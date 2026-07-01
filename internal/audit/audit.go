@@ -25,6 +25,7 @@ func SetStderr(w io.Writer) { stderr = w }
 // Event name constants for all audited federation events.
 const (
 	EventForward            = "forward"
+	EventLoopDropped        = "loop_dropped"
 	EventPolicyViolation    = "policy_violation"
 	EventReplayGap          = "replay_gap"
 	EventPeerConnected      = "peer_connected"

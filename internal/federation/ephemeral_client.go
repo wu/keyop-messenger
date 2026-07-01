@@ -183,7 +183,9 @@ func (c *EphemeralClient) Close() {
 // and starts per-connection goroutines. Returns a channel closed when the
 // connection is lost.
 func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, error) {
-	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes)
+	// Ephemeral clients dispatch received messages in-memory and never re-forward
+	// them, so they need no send-side loop filtering and do not capture the hub CN.
+	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, nil)
 	if err != nil {
 		return nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
 	}
@@ -262,7 +264,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 		} else {
 			dd, _ := dedup.NewLRUDedup(1024)
 			recv := NewPeerReceiver(subStream, subCancel, nil, dd, c.dispatchEnvelope,
-				nil /* no batch writer: ephemeral dispatches in-memory */, noopAuditLogger{}, c.log, hubAddr, c.maxBatchBytes)
+				nil /* no batch writer: ephemeral dispatches in-memory */, noopAuditLogger{}, c.log, hubAddr, c.instanceName, c.maxBatchBytes)
 			c.wg.Add(1)
 			go func() {
 				defer c.wg.Done()

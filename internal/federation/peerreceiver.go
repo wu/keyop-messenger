@@ -44,6 +44,7 @@ type PeerReceiver struct {
 	auditL           audit.AuditLogger
 	log              logger
 	peerName         string
+	selfInstance     string // this node's identity; appended to Route and used for loop detection
 	maxBatchBytes    int
 
 	mu             sync.Mutex
@@ -73,6 +74,7 @@ func NewPeerReceiver(
 	auditL audit.AuditLogger,
 	log logger,
 	peerName string,
+	selfInstance string,
 	maxBatchBytes int,
 ) *PeerReceiver {
 	pr := &PeerReceiver{
@@ -85,6 +87,7 @@ func NewPeerReceiver(
 		auditL:           auditL,
 		log:              log,
 		peerName:         peerName,
+		selfInstance:     selfInstance,
 		maxBatchBytes:    maxBatchBytes,
 		stop:             make(chan struct{}),
 		done:             make(chan struct{}),
@@ -163,7 +166,7 @@ func (pr *PeerReceiver) processBatch(batch *federationv1.EnvelopeBatch) error {
 // suppressed as a duplicate.
 func (pr *PeerReceiver) processBatchDurable(batch *federationv1.EnvelopeBatch) error {
 	lastID, err := commitInboundBatch(batch.Records, pr.policy, pr.dedup,
-		pr.localBatchWriter, pr.auditL, pr.log, pr.peerName, pr.maxBatchBytes)
+		pr.localBatchWriter, pr.auditL, pr.log, pr.peerName, pr.selfInstance, pr.maxBatchBytes)
 	if err != nil {
 		pr.log.Error("federation: receiver batch commit failed; not acking, sender will resend",
 			"peer", pr.peerName, "err", err)
@@ -193,6 +196,7 @@ func commitInboundBatch(
 	auditL audit.AuditLogger,
 	log logger,
 	peerName string,
+	selfInstance string,
 	maxBatchBytes int,
 ) (string, error) {
 	accepted := make([]*envelope.Envelope, 0, len(records))
@@ -212,6 +216,24 @@ func commitInboundBatch(
 		env, err := envelope.Unmarshal(rec)
 		if err != nil {
 			log.Error("federation: inbound unmarshal", "peer", peerName, "err", err)
+			continue
+		}
+
+		// Loop detection: if this node already appears in the path vector it has
+		// a durable copy of this message, so the arrival is an echo returning
+		// around a cyclic topology. Drop it before dedup so it survives even when
+		// the (soft-state, size-bounded) dedup cache has evicted the ID — the case
+		// dedup alone cannot cover after a long disconnect or a restart. lastID is
+		// still advanced so the sender's offset moves past the echo.
+		if selfInstance != "" && env.RouteContains(selfInstance) {
+			_ = auditL.Log(audit.Event{
+				Event:     audit.EventLoopDropped,
+				MessageID: env.ID,
+				Channel:   env.Channel,
+				Peer:      peerName,
+				Direction: "inbound",
+			})
+			lastID = env.ID
 			continue
 		}
 
@@ -235,7 +257,12 @@ func commitInboundBatch(
 			continue
 		}
 
+		// Record this node in the path vector before the durable write, so the
+		// persisted copy — and any onward forward of it — carries our identity.
+		// This maintains the invariant that a locally-stored envelope always
+		// contains this node's identity in Route.
 		envCopy := env
+		envCopy.AppendRoute(selfInstance)
 		accepted = append(accepted, &envCopy)
 	}
 
@@ -284,6 +311,22 @@ func (pr *PeerReceiver) processBatchPerRecord(batch *federationv1.EnvelopeBatch)
 			continue
 		}
 
+		// Loop detection: drop an echo that has already visited this node. For an
+		// ephemeral subscriber this also suppresses delivery of its own published
+		// messages back to its handlers (self is the origin, hence already in
+		// Route), giving no-echo semantics.
+		if pr.selfInstance != "" && env.RouteContains(pr.selfInstance) {
+			_ = pr.auditL.Log(audit.Event{
+				Event:     audit.EventLoopDropped,
+				MessageID: env.ID,
+				Channel:   env.Channel,
+				Peer:      pr.peerName,
+				Direction: "inbound",
+			})
+			lastID = env.ID
+			continue
+		}
+
 		if pr.dedup.SeenOrAdd(env.ID) {
 			continue
 		}
@@ -303,6 +346,7 @@ func (pr *PeerReceiver) processBatchPerRecord(batch *federationv1.EnvelopeBatch)
 		}
 
 		envCopy := env
+		envCopy.AppendRoute(pr.selfInstance)
 		if err := pr.localWriter(&envCopy); err != nil {
 			pr.log.Error("federation: receiver local write", "id", env.ID, "err", err, "channel", env.Channel)
 			lastID = env.ID

@@ -190,3 +190,55 @@ func TestDeadLetterPayload(t *testing.T) {
 	assert.True(t, dlp.FailedAt.Equal(recovered.FailedAt))
 	assert.Equal(t, original.ID, recovered.Original.ID)
 }
+
+// TestNewEnvelope_SeedsRoute confirms the path vector is initialised with the
+// original publisher so loop detection has a starting entry.
+func TestNewEnvelope_SeedsRoute(t *testing.T) {
+	env := makeEnvelope(t)
+	assert.Equal(t, []string{"billing-host"}, env.Route)
+	assert.True(t, env.RouteContains("billing-host"))
+	assert.False(t, env.RouteContains("other-host"))
+}
+
+// TestNewEnvelope_EmptyOriginNoRoute confirms a blank origin (standalone /
+// non-federated mode) does not seed an empty-string route entry.
+func TestNewEnvelope_EmptyOriginNoRoute(t *testing.T) {
+	env, err := NewEnvelope("orders", "", "com.keyop.orders.OrderCreated",
+		testPayload{OrderID: "ord-1", Amount: 1})
+	require.NoError(t, err)
+	assert.Empty(t, env.Route)
+	assert.False(t, env.RouteContains(""))
+}
+
+// TestAppendRoute_Idempotent confirms AppendRoute records new identities in
+// order and ignores duplicates and the empty string.
+func TestAppendRoute_Idempotent(t *testing.T) {
+	var env Envelope
+	env.AppendRoute("a")
+	env.AppendRoute("b")
+	env.AppendRoute("a") // duplicate: no-op
+	env.AppendRoute("")  // empty: no-op
+	assert.Equal(t, []string{"a", "b"}, env.Route)
+}
+
+// TestRoute_SurvivesRoundTrip confirms Route is carried through the JSONL
+// marshal/unmarshal cycle (so it persists in segment files), and that an
+// envelope encoded without a route decodes to an empty Route.
+func TestRoute_SurvivesRoundTrip(t *testing.T) {
+	env := makeEnvelope(t)
+	env.AppendRoute("hub-1")
+	data, err := Marshal(env)
+	require.NoError(t, err)
+
+	got, err := Unmarshal(data)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"billing-host", "hub-1"}, got.Route)
+
+	// A legacy envelope with no "route" key decodes to an empty Route and is
+	// treated as "not in route" by RouteContains.
+	legacy := `{"v":1,"id":"x","ts":"2020-01-01T00:00:00Z","channel":"c","origin":"o","payload_type":"t","payload":null}`
+	le, err := Unmarshal([]byte(legacy))
+	require.NoError(t, err)
+	assert.Empty(t, le.Route)
+	assert.False(t, le.RouteContains("anyone"))
+}

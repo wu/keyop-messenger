@@ -49,6 +49,8 @@ Instance C ─┘           channels only             └──(selected)──�
 
 A single instance may simultaneously accept client connections (hub role) and dial outbound to peer hubs (client role). In this case it acts as a relay between its local clients and the wider federation.
 
+Relay chains and **cyclic** peerings (an instance that both subscribes to and publishes to the same channel, or peer hubs that forward to each other) are loop-safe: the per-message path vector (§6.6) stops a message from being forwarded back to any instance already in its path, so duplicates are never re-sent across the wire.
+
 ### 3.2 What Is Not Supported
 
 - Direct client-to-client connections
@@ -72,6 +74,7 @@ Every message written to a `.jsonl` file is a single JSON object on one line:
   "channel":      "orders",
   "origin":       "billing-host",
   "payload_type": "com.keyop.orders.OrderCreated",
+  "route":        ["billing-host", "hub-west"],
   "payload":      { ... }
 }
 ```
@@ -84,6 +87,7 @@ Every message written to a `.jsonl` file is a single JSON object on one line:
 | `channel` | string | The channel this message was published to.                                                                     |
 | `origin` | string | Instance name of the original publisher. Preserved across hub forwarding.                                      |
 | `payload_type` | string | Fully-qualified type discriminator for the payload. Reverse-DNS format recommended.                            |
+| `route` | array of string | Path vector: the ordered set of instance identities (TLS cert CNs) that have durably committed this message — the original publisher followed by each forwarding hub/peer. Used for routing-loop prevention (see §6.6). Bounded by the network diameter. Omitted when empty. |
 | `payload` | object | Arbitrary JSON object. Shape is defined by the payload type.                                                   |
 
 The envelope is intentionally minimal. Infrastructure fields live in the envelope; all application semantics live in `payload`.
@@ -103,6 +107,8 @@ Subscribers receive the decoded `payload` field as the registered type. A payloa
 ### 4.3 Envelope Versioning
 
 The `v` field allows future changes to the envelope schema. Readers must handle unknown `v` values gracefully (log and skip, or pass through raw). Version `1` is the only defined version.
+
+**Additive fields within a version.** New optional fields may be added within an existing version without a bump, provided they are `omitempty` and absence decodes to a safe zero value. The `route` field was introduced this way: an envelope written by a build that predates it simply has no `route` key and decodes to an empty path vector, which loop prevention treats as "unknown provenance" and falls back to the dedup cache (see §6.6). A version bump is reserved for changes that would break decoding by an older reader.
 
 ---
 
@@ -269,6 +275,13 @@ Library tests that exercise non-TLS code paths may use the test-only `WithTestId
 
 If multiple instances need to run on the same physical host they require separate certificates with distinct CNs (e.g. `billing-host` and `orders-host`). The CN is identity only; it is not used for network addressing. Because the federation TLS verifier checks the CA chain only (see §6.4), the cert's DNS SAN does not need to match the address callers use to reach the instance — operators are free to choose CNs that describe the instance's role rather than its hostname or port.
 
+> **Footgun: never share a certificate between two running instances.** The CN *is* the identity, and loop prevention (§6.6.1) is keyed on it. Two processes that present the same certificate are, to the federation, the **same node** — and the path vector cannot tell them apart. Concretely, if a metrics-publisher process and a dashboard process on one host share a cert with CN `host-a`:
+> 1. the publisher publishes a metric; its `route` is seeded with `host-a` and it is forwarded to the hub;
+> 2. the dashboard subscribes to that channel from the same hub;
+> 3. when the hub delivers the metric toward the dashboard, the loop guard sees `host-a` — the dashboard's own identity — already in `route`, concludes the message has looped back to a node that already holds it, and drops it (send-side at the hub, or receive-side at the dashboard).
+>
+> The result: **the dashboard instance never receives messages that the sibling process published**, even though both are healthy and correctly subscribed. This is by design — the guard is doing exactly its job of not re-delivering a message to an instance already in its path — but it is surprising because the two processes are logically distinct. The fix is to give each instance its own certificate with a unique CN. This is the same requirement as the distinct-CN rule above; the path vector just raises the stakes from "confused allowlist/audit" to "cross-delivery suppressed."
+>
 The instance name is used for:
 - Allowlist authorization (hub verifies the cert CN against its `allowed_peers` config)
 - The `origin` field in message envelopes
@@ -374,7 +387,12 @@ The `publish` allowlist is the **sole** authority for what the hub accepts. The 
 
 Forwarding is independent of whether any local subscriber currently exists for the channel. Messages are written to the local `.jsonl` file regardless of local subscriber presence.
 
-### 6.6 Message Deduplication
+### 6.6 Deduplication and Loop Prevention
+
+Two complementary mechanisms keep messages from being processed or forwarded more than once:
+
+- **Path vector (§6.6.1)** — the primary loop guard. A durable, per-message record of the instances a message has visited, carried in the envelope's `route` field. It prevents a message from being forwarded back to any instance that already holds it, including around cyclic topologies, and is enforced **send-side** so an echo never crosses the wire. Because it travels with the message, it survives restarts and arbitrarily long disconnects.
+- **LRU dedup (below)** — suppresses duplicate *arrivals* of the same message ID at a receiver. It handles the case the path vector does not: **diamond/fan-in**, where the same message reaches a node via two distinct, non-looping paths. It is soft, in-memory state and is no longer relied on as the primary loop guard.
 
 Every instance (hub and client alike) maintains an in-memory LRU set of recently-seen message IDs. The set holds the last 100,000 IDs (configurable). TTL-based expiry is not used; the LRU eviction bound is sufficient for the expected message rates.
 
@@ -395,12 +413,40 @@ On `Publish()` (local origin):
 
 The dedup set is shared across all PeerReceivers on the same Messenger instance. This ensures that if the same envelope arrives via two simultaneous incoming connections (dual-path forwarding), only the first arrival triggers a local write.
 
-**Note on ring topologies:** Because outbound delivery is driven from the per-channel segment files (see §6.7), federated-received messages that are written to local storage by `writeLocalEnvelope` ARE eligible for re-forwarding when an outbound reader is configured for the same channel — a relay instance forwards them onward. The dedup LRU is the live loop-prevention mechanism: if a forwarded message returns to its origin via some ring topology, the origin's seen-ID set will reject the duplicate local write. Note that the re-send still consumes wire bandwidth before being rejected; for ring-prone topologies, restricting `publish` allowlists per peer is the right operational control.
+**Note on ring topologies:** Because outbound delivery is driven from the per-channel segment files (see §6.7), federated-received messages that are written to local storage by `writeLocalEnvelope` ARE eligible for re-forwarding when an outbound reader is configured for the same channel — a relay instance forwards them onward. Loops are prevented by the path vector (§6.6.1), which is checked send-side, so a message is not re-forwarded to an instance already in its `route` and the echo never leaves the sender. The dedup LRU is no longer the loop guard for this case; it remains the guard for fan-in (below).
 
-Practical scenarios the dedup handles today:
+Practical scenarios the dedup LRU handles today:
 - Two client connections from the same publisher both deliver the same envelope to a hub (dual-path)
-- A publisher's own message arrives back via a federated receive path on a multi-hop topology (self-loop prevention)
+- The same message reaches one node via two distinct, non-looping forwarding paths (diamond fan-in) — the path vector does not suppress this because neither arrival is a loop
 - Reconnect replay delivering messages already written in a previous session
+
+#### 6.6.1 Loop Prevention (Path Vector)
+
+The envelope's `route` field (§4.1) is an ordered **path vector**: the set of instance identities that hold a durable copy of the message. It is maintained by two rules that together guarantee one invariant.
+
+**Invariant:** every envelope in an instance's local store contains that instance's identity in `route`.
+
+Maintained by:
+1. **On publish** (`Publish()` / local origin) — `route` is seeded with the publisher's own identity.
+2. **On inbound commit** — before an instance durably writes a federated-received message, it appends its own identity to `route` (idempotent: appended only if absent). Since the local writer re-marshals the envelope struct, the appended identity is persisted in the segment file and travels on any onward forward.
+
+An instance's identity is its TLS certificate CN (§6.1) — the same authenticated value used everywhere else, so `route` entries cannot be spoofed. Because loop prevention is keyed on this identity, two running instances must never share a certificate: the guard would treat them as one node and silently suppress cross-delivery between them through a shared hub. See the foot-gun callout in §6.1.
+
+**Primary enforcement is send-side.** Each outbound `channelReader` (§6.7) knows the identity of the peer it feeds. Before forwarding a record it checks whether that destination already appears in the record's `route`; if so the record is an echo and is dropped **before it reaches the wire** (the offset still advances past it, so it is not rescanned). Because the check is per-destination, a message can be dropped for one peer while still being forwarded to another. This is what makes cyclic and mesh topologies loop-safe: a message circulating a ring stops at the first hop that would return it to an instance already in its path.
+
+The destination identity comes from the TLS certificate on both sides, but is obtained differently:
+
+- **Hub → subscriber:** the hub authenticates each peer from its certificate CN when the Subscribe stream is accepted (`authenticatePeer`). The destination identity is known synchronously; there is no gap.
+- **Client → hub:** the client learns the hub's identity from the **verified server certificate at the TLS handshake**, captured by a credentials wrapper and stored on the client; the outbound readers read it lazily. Because gRPC dials lazily, on the **very first connect** the readers can begin evaluating records before the handshake has populated the hub's CN. During that sub-second, first-connect-only window the client's send-side check is skipped (unknown destination → do not filter), and the receive-side backstop catches any echo that slips through. The captured value persists for the life of the process, so reconnects reintroduce no gap.
+
+**Receive-side backstop.** On inbound commit, before appending itself, an instance checks whether its **own** identity is already in `route`. If so the message has looped back to a node that already holds it, and it is dropped (audited as `loop_dropped`, §8). This backstop requires only the instance's own identity — never the peer's — so it always applies. It covers the windows send-side cannot:
+- the sub-second first-connect gap on the client described above;
+- **non-TLS (insecure) connections**, where the client cannot learn the hub's CN from a certificate and so does no send-side filtering (TLS is mandatory whenever federation identity matters, so this is a dev/test consideration);
+- **pre-upgrade peers** during a rolling deployment — nodes running a build that predates `route`. They neither seed, append, nor check the path vector, so messages they originate or relay carry an empty or partial `route`. An upgraded node still self-protects via the backstop (it stamped its own identity on the way out) and, for genuinely empty routes, falls back to the dedup LRU — i.e. exactly the pre-change behavior, with no regression. Once every node is upgraded, all messages carry a complete route from birth and the send-side guarantee is fully effective.
+
+**Path vector vs. dedup.** The path vector prevents *loops* — a message returning to a node it has already visited. It does **not** suppress *diamond fan-in*, where the same message reaches a node via two distinct paths that each never revisit a node; both arrivals pass the loop check and the LRU dedup collapses them by message ID. The two mechanisms are complementary.
+
+**Observability.** This is a net improvement over the old dedup-only design, which dropped duplicates silently. Loop suppression is now surfaced: receive-side drops emit a `loop_dropped` audit event, and send-side drops (the common case) are logged at debug level by the outbound reader. Because send-side is where echoes are stopped in a healthy, fully-upgraded mesh, `loop_dropped` audit events should be rare — a sustained rate is itself a diagnostic signal (first-connect window, a pre-upgrade peer, or the shared-certificate foot-gun in §6.1). See §8 for the full description and how to read these signals.
 
 ### 6.7 File-Reader Delivery and Reconnection
 
@@ -505,12 +551,18 @@ Event types:
 | `event` | Meaning |
 |---|---|
 | `forward` | Message forwarded to or received from a peer hub |
+| `loop_dropped` | Inbound message dropped by the receive-side loop guard: this instance was already in the message's `route` (see §6.6.1) |
 | `policy_violation` | Inbound message rejected by receive policy |
 | `replay_gap` | Reconnecting peer's last-ack ID was compacted away; delivery continues from earliest available |
 | `peer_connected` | A peer hub connection was established |
 | `peer_disconnected` | A peer hub connection was lost |
 | `client_connected` | A client connected to this hub |
 | `client_rejected` | A client was rejected (name not in allowlist) |
+
+**Loop-drop visibility.** Before the path vector (§6.6.1), a message dropped as a duplicate was silently swallowed by the dedup LRU — there was no record of it. Loop suppression is now observable:
+
+- **`loop_dropped`** audit events record every message dropped by the **receive-side** guard (this instance was already in the `route`). A steady stream of them is a signal, not noise — in a healthy, fully-upgraded mesh, echoes are stopped send-side (below) and `loop_dropped` should be rare, so a sustained rate points at a real condition: the first-connect handshake window, a pre-upgrade peer, or a misconfiguration.
+- **Send-side** drops — the common case, where an echo is discarded before it leaves the forwarder — are logged at **debug** level by the outbound reader (`dropping echo (dest already in route)`, with the channel, destination identity, and message ID). They are not audited, because the outbound reader has no audit logger.
 
 ### 8.1 Audit Log Rotation
 

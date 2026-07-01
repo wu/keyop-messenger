@@ -47,7 +47,7 @@ func TestNewChannelReader_SanitizesPeerNameForOffsetPath(t *testing.T) {
 	// "../../evil" would otherwise escape offsetDir entirely. The reader is not
 	// started (close() would block waiting on a goroutine that never ran); the
 	// offset file is written during construction, which is all this test checks.
-	_, err := newChannelReader("../../evil", "ch", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	_, err := newChannelReader("../../evil", "ch", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 
 	// No offset file may appear outside offsetDir.
@@ -112,7 +112,7 @@ func TestChannelReader_SkipsOversizedRecord(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 2*1024, requestCh, log)
+	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 2*1024, requestCh, nil, log)
 	require.NoError(t, err)
 
 	small1 := makeEnvelope(t, "big", "small1")
@@ -147,7 +147,7 @@ func TestChannelReader_SkipsUnscannableRecord(t *testing.T) {
 
 	const maxBatch = 2 * 1024
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "huge", channelDir, offsetDir, "fed-", maxBatch, requestCh, log)
+	cr, err := newChannelReader("peer1", "huge", channelDir, offsetDir, "fed-", maxBatch, requestCh, nil, log)
 	require.NoError(t, err)
 
 	small1 := makeEnvelope(t, "huge", "small1")
@@ -182,7 +182,7 @@ func TestChannelReader_SkipsLoneOversizedRecord(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "lone", channelDir, offsetDir, "fed-", 2*1024, requestCh, log)
+	cr, err := newChannelReader("peer1", "lone", channelDir, offsetDir, "fed-", 2*1024, requestCh, nil, log)
 	require.NoError(t, err)
 
 	// A single oversized record, nothing else.
@@ -225,7 +225,7 @@ func TestChannelReader_NewSubscriber_StartsAtEnd(t *testing.T) {
 	writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1, env2})
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "test-ch", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "test-ch", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 
 	// Offset file must exist and point to the end of the channel.
@@ -247,6 +247,48 @@ func TestChannelReader_NewSubscriber_StartsAtEnd(t *testing.T) {
 	}
 }
 
+// TestChannelReader_DropsEchoSendSide verifies the send-side loop guard: a
+// record whose path vector already contains the destination's identity is not
+// forwarded (never crosses the wire), while records that have not visited the
+// destination are delivered. The offset still advances past the dropped record.
+func TestChannelReader_DropsEchoSendSide(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "metrics")
+	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 4)
+	// Destination is "hub-a": a record already routed through hub-a is an echo.
+	cr, err := newChannelReader("peer-hub-a", "metrics", channelDir, offsetDir, "fedout-",
+		65536, requestCh, func() string { return "hub-a" }, log)
+	require.NoError(t, err)
+
+	// echo has hub-a in its route → must be dropped send-side.
+	echo := makeEnvelope(t, "metrics", "echo")
+	echo.AppendRoute("hub-a")
+	// local was published here and has never visited hub-a → must be delivered.
+	local := makeEnvelope(t, "metrics", "local")
+	data := writeTestSegment(t, channelDir, 0, []envelope.Envelope{echo, local})
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	var req sendReq
+	select {
+	case req = <-requestCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("timed out waiting for batch")
+	}
+	require.Len(t, req.rawLines, 1, "only the non-echo record should be forwarded")
+	assert.Contains(t, string(req.rawLines[0]), `"local"`)
+	assert.NotContains(t, string(req.rawLines[0]), `"echo"`)
+	// The offset must advance past both records (the dropped echo included).
+	assert.Equal(t, int64(len(data)), req.newOffset)
+	close(req.doneCh)
+}
+
 // TestChannelReader_DeliveryAndOffsetPersistence verifies that after a batch is
 // acked the offset file is updated to the end of that batch.
 func TestChannelReader_DeliveryAndOffsetPersistence(t *testing.T) {
@@ -258,7 +300,7 @@ func TestChannelReader_DeliveryAndOffsetPersistence(t *testing.T) {
 
 	requestCh := make(chan sendReq, 4)
 	// Create reader before writing any data → starts at offset 0.
-	cr, err := newChannelReader("peer1", "events", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "events", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 
 	// Write messages after the reader is created.
@@ -311,7 +353,7 @@ func TestChannelReader_BatchSizeLimit(t *testing.T) {
 	// Create reader BEFORE writing data so it starts at offset 0.
 	// (channelDir does not exist yet → listChannelSegments returns nil → offset=0)
 	requestCh := make(chan sendReq, 10)
-	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 0 /* placeholder */, requestCh, log)
+	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 0 /* placeholder */, requestCh, nil, log)
 	require.NoError(t, err)
 
 	// Write 5 messages. Compute the per-line byte size from the actual output.
@@ -361,7 +403,7 @@ func TestChannelReader_NotificationWakeup(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "wake", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "wake", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -415,7 +457,7 @@ func TestChannelReader_ResumeFromOffset(t *testing.T) {
 	require.NoError(t, storage.WriteOffset(offsetPath, offsetAfterMsg1))
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "resume", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "resume", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -460,7 +502,7 @@ func TestChannelReader_UndercutResumesAtOldestAvailable(t *testing.T) {
 	require.NoError(t, storage.WriteOffset(offsetPath, 100))
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "undercut", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "undercut", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -487,7 +529,7 @@ func TestChannelReader_MultipleNotificationsCoalesced(t *testing.T) {
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "coalesce", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "coalesce", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 
 	env1 := makeEnvelope(t, "coalesce", "m1")
@@ -533,7 +575,7 @@ func TestChannelReader_Close_StopsGoroutine(t *testing.T) {
 
 	// Use an unbuffered requestCh that no one reads from; the reader will block.
 	requestCh := make(chan sendReq)
-	cr, err := newChannelReader("peer1", "stopchan", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "stopchan", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 
 	env1 := makeEnvelope(t, "stopchan", "m1")
@@ -583,7 +625,7 @@ func TestChannelReader_ConcurrentNotify(t *testing.T) {
 	writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1})
 
 	requestCh := make(chan sendReq, 8)
-	cr, err := newChannelReader("peer1", "concurrent", channelDir, offsetDir, "fed-", 65536, requestCh, log)
+	cr, err := newChannelReader("peer1", "concurrent", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)

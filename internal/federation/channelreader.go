@@ -88,6 +88,16 @@ type channelReader struct {
 	notifyCh      chan struct{}
 	log           logger
 
+	// destInstanceFn returns the destination peer's authenticated identity (its
+	// TLS cert CN), or "" if it is not yet known. It is a function rather than a
+	// fixed string because the client learns the hub's identity asynchronously
+	// during the TLS handshake. When it returns a non-empty value, readBatch
+	// drops any record whose path vector already contains that identity, so an
+	// echo is never sent back to a peer that already holds the message. When it
+	// returns "" (identity not yet known, or a non-TLS connection) filtering is
+	// skipped and the receiver's own loop guard is relied on as a backstop.
+	destInstanceFn func() string
+
 	// offset is the current global byte position; only read/written from the
 	// reader goroutine so no mutex is required.
 	offset int64
@@ -113,6 +123,7 @@ func newChannelReader(
 	peerName, channel, channelDir, offsetDir, offsetPrefix string,
 	maxBatchBytes int,
 	requestCh chan<- sendReq,
+	destInstanceFn func() string,
 	log logger,
 ) (*channelReader, error) {
 	//nolint:gosec // G301: shared data directory; 0755 is appropriate
@@ -148,17 +159,18 @@ func newChannelReader(
 	}
 
 	cr := &channelReader{
-		peerName:      peerName,
-		channel:       channel,
-		channelDir:    channelDir,
-		offsetPath:    offsetPath,
-		maxBatchBytes: maxBatchBytes,
-		requestCh:     requestCh,
-		notifyCh:      make(chan struct{}, 1),
-		log:           log,
-		offset:        offset,
-		stop:          make(chan struct{}),
-		done:          make(chan struct{}),
+		peerName:       peerName,
+		channel:        channel,
+		channelDir:     channelDir,
+		offsetPath:     offsetPath,
+		maxBatchBytes:  maxBatchBytes,
+		requestCh:      requestCh,
+		notifyCh:       make(chan struct{}, 1),
+		log:            log,
+		destInstanceFn: destInstanceFn,
+		offset:         offset,
+		stop:           make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 	// Self-notify so run() drains any backlog already present in the channel
 	// file on startup. New subscribers (offset == stream end) see nothing to
@@ -286,6 +298,14 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 	newOffset = cr.offset
 	totalBytes := 0
 
+	// Resolve the destination's identity once per scan. When known, records whose
+	// path vector already includes it are echoes and are dropped here so they are
+	// never sent across the wire.
+	var destInstance string
+	if cr.destInstanceFn != nil {
+		destInstance = cr.destInstanceFn()
+	}
+
 	for i, seg := range segs {
 		segEnd := seg.startOffset + seg.size
 		if segEnd <= cr.offset {
@@ -345,9 +365,22 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 			}
 
 			// Validate: skip corrupt records but still advance the offset.
-			if _, err := envelope.Unmarshal(line); err != nil {
+			env, err := envelope.Unmarshal(line)
+			if err != nil {
 				cr.log.Error("channelReader: unmarshal corrupt record",
 					"channel", cr.channel, "err", err)
+				lineOffset = next
+				newOffset = next
+				continue
+			}
+
+			// Send-side loop guard: if the destination already appears in this
+			// record's path vector, forwarding it would echo the message back to a
+			// peer that already holds it. Drop it before it reaches the wire and
+			// advance the offset so it is not rescanned.
+			if destInstance != "" && env.RouteContains(destInstance) {
+				cr.log.Debug("channelReader: dropping echo (dest already in route)",
+					"channel", cr.channel, "peer", cr.peerName, "dest", destInstance, "id", env.ID)
 				lineOffset = next
 				newOffset = next
 				continue

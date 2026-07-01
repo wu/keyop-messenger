@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"math/rand"
+	"net"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/latencyhist"
 	"github.com/wu/keyop-messenger/internal/storage"
+	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
 // Client dials a hub over gRPC and maintains two independent streams:
@@ -58,6 +60,13 @@ type Client struct {
 
 	hubAddr        string       // set once in ConnectWithReconnect before the reconnect goroutine starts
 	reconnectCount atomic.Int64 // incremented on each successful reconnect (not the initial dial)
+
+	// hubInstance holds the hub's authenticated identity (its TLS cert CN),
+	// captured during the TLS handshake. Outbound readers use it to drop echoes
+	// send-side. Empty until the first handshake completes, or on a non-TLS
+	// connection; the hub's receive-side loop guard is the backstop for that
+	// window. Accessed via hubInstanceName / setHubInstance.
+	hubInstance atomic.Value // string
 
 	// publish ack round-trip latency aggregate (client→hub transit): summed
 	// send→ack durations and the sample count, measured on the client's own
@@ -205,7 +214,7 @@ func (c *Client) dial(hubAddr string) error {
 		}
 
 		receiver = NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
-			c.localBatchWriter, c.auditL, c.log, hubAddr, c.maxBatchBytes)
+			c.localBatchWriter, c.auditL, c.log, hubAddr, c.instanceName, c.maxBatchBytes)
 	}
 
 	c.mu.Lock()
@@ -241,7 +250,7 @@ func (c *Client) buildOutboundReaders(hubAddr string) ([]*channelReader, map[str
 		offsetDir := filepath.Join(c.dataDir, "subscribers", ch)
 		placeholder := make(chan sendReq, 1)
 		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fedout-",
-			c.maxBatchBytes, placeholder, c.log)
+			c.maxBatchBytes, placeholder, c.hubInstanceName, c.log)
 		if err != nil {
 			return nil, nil, fmt.Errorf("channel %q: %w", ch, err)
 		}
@@ -259,6 +268,19 @@ func sanitizeForFilename(s string) string {
 	return storage.SanitizeForFilename(s)
 }
 
+// setHubInstance records the hub's authenticated identity, captured at the TLS
+// handshake. Safe for concurrent use.
+func (c *Client) setHubInstance(cn string) { c.hubInstance.Store(cn) }
+
+// hubInstanceName returns the hub's authenticated identity, or "" if it is not
+// yet known (handshake pending, or a non-TLS connection).
+func (c *Client) hubInstanceName() string {
+	if v, ok := c.hubInstance.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
 // getOrCreateGRPCConn returns the existing gRPC connection or creates a new one
 // targeting hubAddr. The connection is reused across reconnects.
 func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
@@ -267,7 +289,7 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 	if c.grpcConn != nil {
 		return c.grpcConn, nil
 	}
-	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes)
+	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, c.setHubInstance)
 	if err != nil {
 		return nil, err
 	}
@@ -511,14 +533,42 @@ func minDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
+// cnCapturingCreds wraps a TransportCredentials and reports the server leaf
+// certificate's CN after each successful client handshake via onCN. This lets
+// the client learn the hub's authenticated identity from the same source of
+// truth the hub uses for peers — the TLS certificate — for send-side loop
+// filtering. Clone is overridden so gRPC's internal credential cloning does not
+// strip the wrapper.
+type cnCapturingCreds struct {
+	credentials.TransportCredentials
+	onCN func(string)
+}
+
+func (c cnCapturingCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	conn, authInfo, err := c.TransportCredentials.ClientHandshake(ctx, authority, rawConn)
+	if err == nil && c.onCN != nil {
+		if tlsInfo, ok := authInfo.(credentials.TLSInfo); ok && len(tlsInfo.State.PeerCertificates) > 0 {
+			if cn := tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0]); cn != "" {
+				c.onCN(cn)
+			}
+		}
+	}
+	return conn, authInfo, err
+}
+
+func (c cnCapturingCreds) Clone() credentials.TransportCredentials {
+	return cnCapturingCreds{TransportCredentials: c.TransportCredentials.Clone(), onCN: c.onCN}
+}
+
 // newGRPCClientConn creates a gRPC client connection to target. Uses TLS when
 // tlsCfg is non-nil, otherwise uses insecure (plaintext) credentials.
 // The connection is created with lazy dialing; the actual TCP connection is
-// established on the first RPC call.
-func newGRPCClientConn(target string, tlsCfg *tls.Config, maxBatchBytes int) (*grpc.ClientConn, error) {
+// established on the first RPC call. onCN, when non-nil, is invoked with the
+// hub's certificate CN after each successful TLS handshake.
+func newGRPCClientConn(target string, tlsCfg *tls.Config, maxBatchBytes int, onCN func(string)) (*grpc.ClientConn, error) {
 	var creds credentials.TransportCredentials
 	if tlsCfg != nil {
-		creds = credentials.NewTLS(tlsCfg)
+		creds = cnCapturingCreds{TransportCredentials: credentials.NewTLS(tlsCfg), onCN: onCN}
 	} else {
 		creds = insecure.NewCredentials()
 	}

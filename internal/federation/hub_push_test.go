@@ -34,7 +34,7 @@ func newHubWithData(t *testing.T, cfg federation.HubConfig, dataDir string) (*fe
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub(cfg, nil,
+	hub := federation.NewHub(cfg, nil, "",
 		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 65536, dataDir)
 	return hub, auditL
@@ -80,7 +80,7 @@ func openSubscribeReceiver(t *testing.T, stub federationv1.FederationServiceClie
 	cw := &captureWriter{}
 	dd, _ := dedup.NewLRUDedup(1000)
 	pr := federation.NewPeerReceiver(stream, cancel, nil, dd, cw.write, nil,
-		&fakeAuditLog{}, &testutil.FakeLogger{}, peerName, 65536)
+		&fakeAuditLog{}, &testutil.FakeLogger{}, peerName, "self", 65536)
 	t.Cleanup(func() { cancel(); pr.Close() })
 	return cw
 }
@@ -253,7 +253,7 @@ func TestHubPushBatchSizeLimit(t *testing.T) {
 	require.NoError(t, err)
 	log := &testutil.FakeLogger{}
 	auditL := &fakeAuditLog{}
-	hub := federation.NewHub(cfg, nil,
+	hub := federation.NewHub(cfg, nil, "",
 		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, log, 1000, 512, dataDir)
 
@@ -415,7 +415,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 	cfg := federation.HubConfig{
 		AllowedPeers: []federation.AllowedPeer{{Name: "audit-peer", Subscribe: []string{"ch"}}},
 	}
-	hub := federation.NewHub(cfg, nil,
+	hub := federation.NewHub(cfg, nil, "",
 		func([]*envelope.Envelope) error { return nil },
 		dd, auditL, &testutil.FakeLogger{}, 1000, 65536, dataDir)
 
@@ -438,7 +438,7 @@ func TestHubPushAuditEvents(t *testing.T) {
 	cw := &captureWriter{}
 	subDD, _ := dedup.NewLRUDedup(1000)
 	pr := federation.NewPeerReceiver(subStream, subCancel, nil, subDD, cw.write, nil,
-		&fakeAuditLog{}, &testutil.FakeLogger{}, "audit-peer", 65536)
+		&fakeAuditLog{}, &testutil.FakeLogger{}, "audit-peer", "self", 65536)
 	t.Cleanup(func() { subCancel(); pr.Close() })
 
 	waitForConnected(t, auditL)

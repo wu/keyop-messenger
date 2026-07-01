@@ -92,7 +92,7 @@ func startReceiver(
 	require.NoError(t, err)
 	// Use stream.cancel so that pr.Close() → streamCancel() unblocks stream.Recv().
 	pr := federation.NewPeerReceiver(stream, stream.cancel, policy, dd, writer, nil,
-		auditL, log, "test-peer", maxBatchBytes)
+		auditL, log, "test-peer", "self", maxBatchBytes)
 	t.Cleanup(pr.Close)
 	return pr
 }
@@ -147,7 +147,7 @@ func startReceiverBatch(
 	require.NoError(t, err)
 	pr := federation.NewPeerReceiver(stream, stream.cancel, nil, dd,
 		func(*envelope.Envelope) error { return nil }, batchWriter,
-		auditL, log, "test-peer", 65536)
+		auditL, log, "test-peer", "self", 65536)
 	t.Cleanup(pr.Close)
 	return pr
 }

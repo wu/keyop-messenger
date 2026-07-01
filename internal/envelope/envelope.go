@@ -53,9 +53,43 @@ type Envelope struct {
 	// Preserved across hub forwarding. Omitted from JSON if empty.
 	ServiceName string `json:"service_name,omitempty"`
 
+	// Route is the ordered set of instance identities (TLS cert CNs) that have
+	// durably committed this message: the original publisher followed by every
+	// hub/peer that forwarded it. It is a path vector used to prevent routing
+	// loops across cyclic federation topologies — a node that finds itself
+	// already in Route drops the message as an echo. The list is maintained by
+	// AppendRoute (append-if-absent), so its length is bounded by the network
+	// diameter. Omitted from JSON if empty (e.g. envelopes written by a build
+	// predating this field); such messages fall back to LRU dedup for loop
+	// suppression until they age out.
+	Route []string `json:"route,omitempty"`
+
 	// Payload is the application-defined body. Its structure is described by
 	// PayloadType and decoded via the payload registry.
 	Payload json.RawMessage `json:"payload"`
+}
+
+// RouteContains reports whether id is already present in the envelope's Route.
+// A receiver uses it against its own instance identity to detect a message that
+// has looped back to a node that already holds a durable copy.
+func (e *Envelope) RouteContains(id string) bool {
+	for _, r := range e.Route {
+		if r == id {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendRoute records id in the envelope's Route if it is not already present.
+// It is called by every node that durably commits the message, maintaining the
+// invariant that an envelope in a node's local store always contains that
+// node's identity in Route.
+func (e *Envelope) AppendRoute(id string) {
+	if id == "" || e.RouteContains(id) {
+		return
+	}
+	e.Route = append(e.Route, id)
 }
 
 // DeadLetterPayload is the payload written to a dead-letter channel when a
@@ -140,7 +174,7 @@ func NewEnvelope(channel, origin, payloadType string, payload any) (Envelope, er
 		return Envelope{}, fmt.Errorf("marshal payload: %w", err)
 	}
 
-	return Envelope{
+	env := Envelope{
 		V:           CurrentVersion,
 		ID:          id.String(),
 		Ts:          time.Now().UTC().Round(0), // Round(0) strips the monotonic clock reading
@@ -148,5 +182,10 @@ func NewEnvelope(channel, origin, payloadType string, payload any) (Envelope, er
 		Origin:      origin,
 		PayloadType: payloadType,
 		Payload:     json.RawMessage(raw),
-	}, nil
+	}
+	// Seed the path vector with the original publisher so loop detection has a
+	// starting entry. Guarded against an empty origin (standalone/non-federated
+	// mode) to avoid an empty-string route entry that matches nothing.
+	env.AppendRoute(origin)
+	return env, nil
 }

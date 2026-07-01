@@ -414,6 +414,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		m.hub = federation.NewHub(
 			hubCfg,
 			tlsCfg,
+			m.name,
 			m.writeLocalEnvelopeBatch,
 			dd,
 			auditL,

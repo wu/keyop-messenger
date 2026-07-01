@@ -48,7 +48,7 @@ func TestHubServerEnforcesRaisedRecvLimit(t *testing.T) {
 		}
 		return nil
 	}
-	hub := NewHub(cfg, nil, writer, dd, &fakeAuditLogger2{}, &testutil.FakeLogger{}, 1000, maxBatch, dataDir)
+	hub := NewHub(cfg, nil, "", writer, dd, &fakeAuditLogger2{}, &testutil.FakeLogger{}, 1000, maxBatch, dataDir)
 	require.NoError(t, hub.Listen(":0"))
 	t.Cleanup(func() { _ = hub.Close() })
 
