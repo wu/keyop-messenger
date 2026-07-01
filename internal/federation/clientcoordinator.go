@@ -151,10 +151,11 @@ func (cc *clientCoordinator) sendBatch(req sendReq) error {
 		}
 		// Record hub→peer delivery RTT only on a successful ack; the serial send
 		// loop means this RTT belongs to exactly this batch.
+		sendDur := time.Since(sendStart)
 		if cc.recordAckRTT != nil {
-			cc.recordAckRTT(time.Since(sendStart))
+			cc.recordAckRTT(sendDur)
 		}
-		auditOutboundForwards(cc.auditL, cc.peer, req.rawLines)
+		auditOutboundForwards(cc.auditL, cc.peer, req.rawLines, sendDur)
 		close(req.doneCh)
 		return nil
 	case <-cc.stop:

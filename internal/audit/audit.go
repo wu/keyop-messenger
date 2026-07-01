@@ -45,7 +45,12 @@ type Event struct {
 	Direction string    `json:"direction,omitempty"`
 	Peer      string    `json:"peer,omitempty"`
 	PeerAddr  string    `json:"peer_addr,omitempty"`
-	Detail    string    `json:"detail,omitempty"`
+	// SendDurationMS is the batch send→ack round-trip time in milliseconds,
+	// recorded on outbound forward events. It is a float so sub-millisecond
+	// sends (e.g. colocated peers) are not rounded away. All envelopes in one
+	// batch share the batch's duration since they are sent and acked together.
+	SendDurationMS float64 `json:"send_duration_ms,omitempty"`
+	Detail         string  `json:"detail,omitempty"`
 }
 
 // Logger is the structured logging interface used internally.

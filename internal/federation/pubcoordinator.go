@@ -165,10 +165,11 @@ func (pc *pubCoordinator) sendBatch(req sendReq) error {
 		// Record client→hub transit RTT only on a successful ack, so a stalled or
 		// failed batch does not contribute a spuriously large sample. Serial send
 		// loop means this RTT is for exactly this batch.
+		sendDur := time.Since(sendStart)
 		if pc.recordAckRTT != nil {
-			pc.recordAckRTT(time.Since(sendStart))
+			pc.recordAckRTT(sendDur)
 		}
-		auditOutboundForwards(pc.auditL, pc.peer, req.rawLines)
+		auditOutboundForwards(pc.auditL, pc.peer, req.rawLines, sendDur)
 		close(req.doneCh)
 		return nil
 	case <-pc.stop:

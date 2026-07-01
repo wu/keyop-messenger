@@ -189,7 +189,11 @@ func TestClientCoordinator_SendBatch_AuditsOutboundForward(t *testing.T) {
 		assert.Equal(t, "outbound", e.Direction)
 		assert.Equal(t, "peer-a", e.Peer)
 		assert.Equal(t, "events", e.Channel)
+		// Both envelopes share the batch's send→ack duration, which is recorded.
+		assert.GreaterOrEqual(t, e.SendDurationMS, float64(0))
 	}
+	// The two records came from one batch, so they carry the same duration.
+	assert.Equal(t, fwd[0].SendDurationMS, fwd[1].SendDurationMS)
 	assert.Equal(t, "id1", fwd[0].MessageID)
 	assert.Equal(t, "id2", fwd[1].MessageID)
 }
