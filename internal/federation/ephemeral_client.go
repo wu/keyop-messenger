@@ -9,7 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -26,6 +28,45 @@ var (
 	// before the hub has acknowledged the message.
 	ErrEphemeralConnLost = errors.New("ephemeral client: connection lost before ack")
 )
+
+// connErrBox records the terminal error that ended one connection (nil until
+// the connection drops). It is written by the per-connection goroutines and
+// read by the reconnect loop after the connection's lost-signal fires, so the
+// loop can distinguish a permanent failure (e.g. an allowlist rejection) from a
+// transient disconnect. First non-nil write wins.
+type connErrBox struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (b *connErrBox) set(err error) {
+	if err == nil {
+		return
+	}
+	b.mu.Lock()
+	if b.err == nil {
+		b.err = err
+	}
+	b.mu.Unlock()
+}
+
+func (b *connErrBox) get() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.err
+}
+
+// isFatalConnErr reports whether err is a non-retryable connection failure —
+// one where reconnecting cannot succeed without operator action. The hub
+// rejects a client whose certificate CN is not in its allowlist with
+// PermissionDenied; a malformed/expired identity surfaces as Unauthenticated.
+func isFatalConnErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := status.Code(err)
+	return code == codes.PermissionDenied || code == codes.Unauthenticated
+}
 
 // EphemeralClientConfig holds construction-time settings for EphemeralClient.
 type EphemeralClientConfig struct {
@@ -45,6 +86,12 @@ type EphemeralClientConfig struct {
 	ReconnectMax time.Duration
 	// ReconnectJitter is the fractional jitter on the backoff (0–1). Default: 0.2.
 	ReconnectJitter float64
+	// OnFatal, when set, is invoked once with a non-retryable connection error
+	// (e.g. the hub rejecting this client's identity with PermissionDenied or
+	// Unauthenticated). After it fires the reconnect loop stops rather than
+	// retrying a permanent failure forever. Called from a background goroutine;
+	// the callback must not block. Only consulted in the auto-reconnect path.
+	OnFatal func(error)
 }
 
 // EphemeralClient connects to a hub without maintaining local state.
@@ -66,6 +113,7 @@ type EphemeralClient struct {
 	reconnectBase   time.Duration
 	reconnectMax    time.Duration
 	reconnectJitter float64
+	onFatal         func(error)
 
 	handlersMu sync.RWMutex
 	handlers   map[string][]func(*envelope.Envelope) error
@@ -116,6 +164,7 @@ func NewEphemeralClient(cfg EphemeralClientConfig, log logger) *EphemeralClient 
 		reconnectBase:   cfg.ReconnectBase,
 		reconnectMax:    cfg.ReconnectMax,
 		reconnectJitter: cfg.ReconnectJitter,
+		onFatal:         cfg.OnFatal,
 		handlers:        make(map[string][]func(*envelope.Envelope) error),
 		writeQ:          make(chan ephemeralWriteItem, cfg.WriteQueueSize),
 		stop:            make(chan struct{}),
@@ -134,19 +183,19 @@ func (c *EphemeralClient) AddHandler(channel string, fn func(*envelope.Envelope)
 
 // Connect dials hubAddr once and starts the background goroutines.
 func (c *EphemeralClient) Connect(ctx context.Context, hubAddr string) error {
-	_, err := c.startConn(ctx, hubAddr)
+	_, _, err := c.startConn(ctx, hubAddr)
 	return err
 }
 
 // ConnectWithReconnect dials hubAddr and starts an auto-reconnect loop.
 func (c *EphemeralClient) ConnectWithReconnect(ctx context.Context, hubAddr string) error {
-	connLost, err := c.startConn(ctx, hubAddr)
+	connLost, errBox, err := c.startConn(ctx, hubAddr)
 	if err != nil {
 		return err
 	}
 	c.wg.Add(1)
 	//nolint:gosec // G118: background reconnect loop doesn't need request context
-	go c.reconnectLoop(hubAddr, connLost)
+	go c.reconnectLoop(hubAddr, connLost, errBox)
 	return nil
 }
 
@@ -182,12 +231,16 @@ func (c *EphemeralClient) Close() {
 // startConn dials hubAddr, opens Publish (and optionally Subscribe) gRPC streams,
 // and starts per-connection goroutines. Returns a channel closed when the
 // connection is lost.
-func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, error) {
+func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan struct{}, *connErrBox, error) {
+	// errBox captures the terminal error of this connection so the reconnect
+	// loop can tell a permanent rejection from a transient drop.
+	errBox := &connErrBox{}
+
 	// Ephemeral clients dispatch received messages in-memory and never re-forward
 	// them, so they need no send-side loop filtering and do not capture the hub CN.
 	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, nil)
 	if err != nil {
-		return nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
+		return nil, nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
 	}
 
 	stub := federationv1.NewFederationServiceClient(grpcConn)
@@ -195,7 +248,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 
 	// Propagate caller context cancellation (e.g. timeout, early cancel).
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// connCtx is derived from baseCtx so Close() → baseCancel() terminates streams.
 	// A goroutine bridges ctx → connCtx so the caller's deadline/cancel is respected too.
@@ -213,7 +266,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	if err != nil {
 		connCancel()
 		_ = grpcConn.Close()
-		return nil, fmt.Errorf("ephemeral: open publish stream %s: %w", hubAddr, err)
+		return nil, nil, fmt.Errorf("ephemeral: open publish stream %s: %w", hubAddr, err)
 	}
 
 	// ackCh carries PublishAck messages from the Publish stream to writeLoop.
@@ -233,6 +286,9 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 		for {
 			ack, recvErr := pubStream.Recv()
 			if recvErr != nil {
+				// Record the terminal error (e.g. PermissionDenied when the hub
+				// rejects this client) so the reconnect loop can classify it.
+				errBox.set(recvErr)
 				return
 			}
 			select {
@@ -270,6 +326,9 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 				defer c.wg.Done()
 				select {
 				case <-recv.Done():
+					// Capture a subscribe-stream rejection (e.g. PermissionDenied)
+					// so a subscribe-only client still surfaces a fatal error.
+					errBox.set(recv.Err())
 				case <-c.stop:
 					recv.Close()
 				}
@@ -285,7 +344,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 		c.writeLoop(pubStream, ackCh, connDead)
 	}()
 
-	return connLost, nil
+	return connLost, errBox, nil
 }
 
 // dispatchEnvelope calls all registered handlers for env.Channel in order.
@@ -427,7 +486,10 @@ func (c *EphemeralClient) writeLoop(
 }
 
 // reconnectLoop watches connLost and redials hubAddr with exponential backoff.
-func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}) {
+// If the connection ended with a non-retryable error (e.g. the hub rejecting
+// this client's identity), it invokes OnFatal and stops instead of retrying a
+// permanent failure forever.
+func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}, errBox *connErrBox) {
 	defer c.wg.Done()
 	backoff := c.reconnectBase
 	for {
@@ -435,6 +497,18 @@ func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}
 		case <-c.stop:
 			return
 		case <-connLost:
+		}
+
+		// A permanent rejection cannot be fixed by retrying; surface it and stop.
+		if errBox != nil {
+			if termErr := errBox.get(); isFatalConnErr(termErr) {
+				c.log.Error("ephemeral: fatal connection error, not reconnecting",
+					"hub", hubAddr, "err", termErr)
+				if c.onFatal != nil {
+					c.onFatal(termErr)
+				}
+				return
+			}
 		}
 
 		c.log.Warn("ephemeral: connection lost, reconnecting", "hub", hubAddr)
@@ -453,7 +527,7 @@ func (c *EphemeralClient) reconnectLoop(hubAddr string, connLost <-chan struct{}
 			}
 
 			var err error
-			connLost, err = c.startConn(context.Background(), hubAddr)
+			connLost, errBox, err = c.startConn(context.Background(), hubAddr)
 			if err != nil {
 				c.log.Error("ephemeral: reconnect failed", "hub", hubAddr, "err", err)
 				backoff = min(backoff*2, c.reconnectMax)

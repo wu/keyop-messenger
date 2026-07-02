@@ -33,6 +33,8 @@ type EphemeralConfig struct {
 	TLS TLSConfig
 	// AutoReconnect enables automatic reconnection on disconnect.
 	// When true, ConnectWithReconnect is used; when false, Connect is used.
+	// When true, OnFatal is required: NewEphemeralMessenger returns an error if
+	// AutoReconnect is set without an OnFatal handler.
 	AutoReconnect bool
 	// ReconnectBase is the initial reconnect backoff. Default: 500ms.
 	ReconnectBase time.Duration
@@ -40,6 +42,16 @@ type EphemeralConfig struct {
 	ReconnectMax time.Duration
 	// ReconnectJitter is the fractional backoff jitter (0–1). Default: 0.2.
 	ReconnectJitter float64
+	// OnFatal, when set, is invoked once with a non-retryable connection error —
+	// most importantly the hub rejecting this client because its certificate CN
+	// is not in the hub's allowlist (gRPC PermissionDenied), or an unauthenticated
+	// identity (Unauthenticated). Because the connection is established lazily and
+	// asynchronously, such a rejection cannot be returned from Connect; it is
+	// delivered here instead, and the client stops retrying rather than looping on
+	// a permanent failure. The callback runs on a background goroutine and must not
+	// block. Only consulted when AutoReconnect is true — and required in that
+	// case (see AutoReconnect).
+	OnFatal func(error)
 	// MaxBatchBytes is the maximum WebSocket frame payload in bytes. Default: 4194304 (4 MiB). Set to 0 to disable.
 	MaxBatchBytes int
 	// WriteQueueSize is the outbound buffer depth. Default: 256.
@@ -70,6 +82,13 @@ type EphemeralMessenger struct {
 func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMessenger, error) {
 	if cfg.HubAddr == "" {
 		return nil, errors.New("ephemeral messenger: HubAddr is required")
+	}
+	// With AutoReconnect, a non-retryable rejection (e.g. this client's cert not
+	// being in the hub's allowlist) is delivered only via OnFatal — nothing else
+	// surfaces it, and the loop would otherwise retry a permanent failure forever.
+	// Require OnFatal so that failure mode cannot be silently ignored.
+	if cfg.AutoReconnect && cfg.OnFatal == nil {
+		return nil, errors.New("ephemeral messenger: OnFatal is required when AutoReconnect is enabled")
 	}
 
 	o := defaultOptions()
@@ -112,6 +131,7 @@ func NewEphemeralMessenger(cfg EphemeralConfig, opts ...Option) (*EphemeralMesse
 		ReconnectBase:   cfg.ReconnectBase,
 		ReconnectMax:    cfg.ReconnectMax,
 		ReconnectJitter: cfg.ReconnectJitter,
+		OnFatal:         cfg.OnFatal,
 	}
 
 	return &EphemeralMessenger{

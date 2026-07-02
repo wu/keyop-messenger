@@ -17,6 +17,8 @@ import (
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // newEphemeralTestClient creates an EphemeralClient with minimal reconnect delay.
@@ -113,6 +115,63 @@ func TestEphemeralClient_WriteLoop_BatchesMessages(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 	assert.Greater(t, receivedFrames.Load(), int32(0))
+}
+
+// TestEphemeralClient_ReconnectStopsOnFatalRejection verifies that when the hub
+// rejects the client's identity (PermissionDenied), the reconnect loop invokes
+// OnFatal with the error and stops retrying instead of looping forever.
+func TestEphemeralClient_ReconnectStopsOnFatalRejection(t *testing.T) {
+	t.Parallel()
+	log := &testutil.FakeLogger{}
+
+	var pubAttempts atomic.Int32
+	reject := func() error {
+		return status.Error(codes.PermissionDenied, "not in allowlist")
+	}
+	addr := startMockServer(t, &mockFedServer{
+		publishFn: func(_ grpc.BidiStreamingServer[federationv1.PublishBatch, federationv1.PublishAck]) error {
+			pubAttempts.Add(1)
+			return reject()
+		},
+		subscribeFn: func(_ grpc.BidiStreamingServer[federationv1.SubscribeFrame, federationv1.HubBatch]) error {
+			return reject()
+		},
+	})
+
+	fatalCh := make(chan error, 1)
+	ec := NewEphemeralClient(EphemeralClientConfig{
+		InstanceName:  "rejected-client",
+		Subscribe:     []string{"events"},
+		ReconnectBase: 1 * time.Millisecond,
+		ReconnectMax:  5 * time.Millisecond,
+		OnFatal: func(err error) {
+			select {
+			case fatalCh <- err:
+			default:
+			}
+		},
+	}, log)
+	t.Cleanup(ec.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	require.NoError(t, ec.ConnectWithReconnect(ctx, addr))
+
+	select {
+	case err := <-fatalCh:
+		require.Error(t, err)
+		assert.Equal(t, codes.PermissionDenied, status.Code(err),
+			"OnFatal should receive the hub's PermissionDenied status")
+	case <-time.After(3 * time.Second):
+		t.Fatal("OnFatal was not called on a PermissionDenied rejection")
+	}
+
+	// The loop must have stopped: no further Publish connection attempts after the
+	// fatal error, even after several reconnect-backoff intervals elapse.
+	settled := pubAttempts.Load()
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, settled, pubAttempts.Load(),
+		"reconnect must stop after a fatal rejection, not keep retrying")
 }
 
 // TestEphemeralClient_Close_StopsAllGoroutines verifies close completes quickly.

@@ -255,6 +255,7 @@ func TestEphemeralMessenger_AutoReconnect(t *testing.T) {
 		AutoReconnect: true,
 		ReconnectBase: 50 * time.Millisecond,
 		ReconnectMax:  500 * time.Millisecond,
+		OnFatal:       func(error) {},
 	})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = em.Close() })

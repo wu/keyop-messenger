@@ -3,12 +3,15 @@ package federation
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/testutil"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestNewEphemeralClient_ValidConfig creates a valid EphemeralClient.
@@ -270,4 +273,26 @@ func TestEphemeralClient_Config_LargeDedup(t *testing.T) {
 	ec := NewEphemeralClient(cfg, log)
 	assert.NotNil(t, ec)
 	t.Cleanup(func() { ec.Close() })
+}
+
+// TestIsFatalConnErr classifies which connection errors stop the reconnect loop.
+func TestIsFatalConnErr(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"permission denied (allowlist reject)", status.Error(codes.PermissionDenied, "not in allowlist"), true},
+		{"unauthenticated", status.Error(codes.Unauthenticated, "bad cert"), true},
+		{"unavailable (transient)", status.Error(codes.Unavailable, "hub down"), false},
+		{"canceled (shutdown)", status.Error(codes.Canceled, "canceled"), false},
+		{"plain error (no status)", errors.New("dial tcp: connection refused"), false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isFatalConnErr(tt.err))
+		})
+	}
 }

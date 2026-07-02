@@ -32,6 +32,34 @@ func TestNewEphemeralMessenger_MissingHubAddr(t *testing.T) {
 	assert.ErrorContains(t, err, "HubAddr")
 }
 
+// TestNewEphemeralMessenger_AutoReconnectRequiresOnFatal verifies that enabling
+// AutoReconnect without an OnFatal handler is rejected, so a non-retryable
+// rejection cannot be silently retried forever.
+func TestNewEphemeralMessenger_AutoReconnectRequiresOnFatal(t *testing.T) {
+	t.Parallel()
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:       "hub.example.com:7740",
+		AutoReconnect: true,
+	})
+	assert.Error(t, err)
+	assert.Nil(t, em)
+	assert.ErrorContains(t, err, "OnFatal")
+}
+
+// TestNewEphemeralMessenger_AutoReconnectWithOnFatal verifies that AutoReconnect
+// with an OnFatal handler constructs successfully.
+func TestNewEphemeralMessenger_AutoReconnectWithOnFatal(t *testing.T) {
+	t.Parallel()
+	em, err := newEphemeralForTest(EphemeralConfig{
+		HubAddr:       "hub.example.com:7740",
+		AutoReconnect: true,
+		OnFatal:       func(error) {},
+	})
+	require.NoError(t, err)
+	assert.NotNil(t, em)
+	t.Cleanup(func() { _ = em.Close() })
+}
+
 // TestNewEphemeralMessenger_RequiresTLSOrTestIdentity verifies that without
 // a TLS config (and without the test-only override) NewEphemeralMessenger
 // refuses to construct, since instance identity has no defined source.
