@@ -16,7 +16,11 @@ type Alert struct {
 
 func main() {
 
-	logger := slog.Default()
+	// Without WithLogger(...) the messenger uses a no-op logger that discards ALL
+	// output — including dead-letter and decode errors. Always pass a real logger.
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
 
 	baseDir := os.Getenv("KEYOP_MESSENGER_TMPDIR")
 
