@@ -292,6 +292,41 @@ func TestCompactor_NoConsumersDeletesAllSealedSegments(t *testing.T) {
 	assert.Len(t, segs, 1, "all sealed segments should be deleted when there are no consumers")
 }
 
+// TestCompactor_UnregisteredSubscriberOffsetConstrainsCompaction reproduces the
+// restart-window hole: after a process restart, a subscriber's offset file is
+// still on disk from the previous run, but the subscriber has not re-subscribed
+// yet (so it is absent from the in-memory registered set). Its unconsumed
+// position must still prevent its sealed segments from being deleted, otherwise
+// the subscriber silently loses messages on a channel that never hit a
+// retention cap.
+func TestCompactor_UnregisteredSubscriberOffsetConstrainsCompaction(t *testing.T) {
+	c, channelDir, offsetDir := newTestCompactor(t)
+
+	seg0Size := writeSegment(t, channelDir, 0, 10)
+	seg1Size := writeSegment(t, channelDir, seg0Size, 10)
+	_ = writeSegment(t, channelDir, seg0Size+seg1Size, 5) // active
+
+	// A plain subscriber offset file persists on disk, still within segment 0,
+	// but the subscriber has NOT been registered this process lifetime.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "slowsub.offset"), seg0Size/2))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err := listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 3, "no sealed segment may be deleted while an on-disk subscriber offset is still within segment 0")
+
+	// Advance the persisted offset past segment 0 (as if the subscriber
+	// re-subscribed and caught up); segment 0 becomes eligible for deletion.
+	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "slowsub.offset"), seg0Size+seg1Size/2))
+
+	require.NoError(t, c.MaybeCompact(channelDir))
+
+	segs, err = listSegments(channelDir)
+	require.NoError(t, err)
+	assert.Len(t, segs, 2, "segment 0 becomes deletable once the on-disk offset advances past it")
+}
+
 // ---- MinOffset tests --------------------------------------------------------
 
 // TestMinOffset_SingleSubscriber verifies that MinOffset returns the sole
@@ -376,15 +411,15 @@ func TestMinOffset_FedOffsetAboveLocal(t *testing.T) {
 	assert.Equal(t, int64(50), off, "fed offset above local must not raise the minimum")
 }
 
-// ---- fedMinOffset branch tests (exercised via MaybeCompact) -----------------
+// ---- persistedMinOffset branch tests (exercised via MaybeCompact) -----------
 
 // TestMaybeCompact_OffsetDirNotExist verifies that MaybeCompact succeeds when
-// the offset directory does not exist; fedMinOffset must treat a non-existent
-// directory as having no peer offsets and return MaxInt64 without error.
+// the offset directory does not exist; persistedMinOffset must treat a
+// non-existent directory as having no offsets and return MaxInt64 without error.
 func TestMaybeCompact_OffsetDirNotExist(t *testing.T) {
 	base := t.TempDir()
 	channelDir := filepath.Join(base, "orders")
-	// offsetDir intentionally absent — covers the os.IsNotExist branch in fedMinOffset.
+	// offsetDir intentionally absent — covers the os.IsNotExist branch in persistedMinOffset.
 	offsetDir := filepath.Join(base, "nonexistent-offsets")
 	c := NewCompactor(offsetDir, 0, 0, nil)
 

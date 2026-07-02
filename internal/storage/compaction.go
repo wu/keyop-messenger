@@ -98,39 +98,52 @@ func (c *Compactor) MinOffset() (int64, error) {
 		}
 	}
 
-	// Include federation peer offsets (fed-*.offset).
-	if fedMin, err := c.fedMinOffset(); err == nil && fedMin < minOffset {
-		minOffset = fedMin
+	// Include every persisted offset file on disk (see persistedMinOffset).
+	if diskMin, err := c.persistedMinOffset(); err == nil && diskMin < minOffset {
+		minOffset = diskMin
 	}
 
 	return minOffset, nil
 }
 
-// fedMinOffset returns the minimum byte offset across all federation offset
-// files in c.offsetDir. This covers both hub-side inbound peer offsets
-// ("fed-*.offset", written by hub channelReaders) and client-side outbound
-// publish offsets ("fedout-*.offset", written by client channelReaders).
-// Returns (math.MaxInt64, nil) when none are present, and (0, err) on a read
-// error that prevents a safe calculation.
-func (c *Compactor) fedMinOffset() (int64, error) {
+// persistedMinOffset returns the minimum byte offset across every *.offset file
+// in c.offsetDir. This deliberately covers all offset-file kinds:
+//
+//   - plain subscriber offsets ("{subscriber-id}.offset", written by the
+//     subscriber goroutine)
+//   - hub-side inbound federation peer offsets ("fed-*.offset")
+//   - client-side outbound federation publish offsets ("fedout-*.offset")
+//
+// Scanning by file — rather than by the in-memory registered-subscriber set —
+// is what makes compaction safe across a process restart: a subscriber's offset
+// file persists on disk even before that subscriber re-subscribes in the new
+// process, so its unconsumed position still constrains deletion during the
+// restart window. Restricting the scan to registered subscribers would leave a
+// hole where a not-yet-re-subscribed consumer's sealed segments are deleted out
+// from under it (silent at-least-once data loss).
+//
+// Returns (math.MaxInt64, nil) when no offset files are present, and (0, err) on
+// a read error that prevents a safe calculation. Callers treat a non-nil error
+// as "cannot lower the minimum from disk" and skip the result rather than
+// aborting compaction.
+func (c *Compactor) persistedMinOffset() (int64, error) {
 	entries, err := os.ReadDir(c.offsetDir)
 	if os.IsNotExist(err) {
 		return math.MaxInt64, nil
 	}
 	if err != nil {
-		return 0, fmt.Errorf("read offset dir for fed offsets: %w", err)
+		return 0, fmt.Errorf("read offset dir: %w", err)
 	}
 	minOffset := int64(math.MaxInt64)
 	for _, e := range entries {
+		// The ".offset" suffix check excludes in-flight ".offset.tmp" files
+		// written by WriteOffset's atomic rename.
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".offset") {
-			continue
-		}
-		if !strings.HasPrefix(e.Name(), "fed-") && !strings.HasPrefix(e.Name(), "fedout-") {
 			continue
 		}
 		off, err := ReadOffset(filepath.Join(c.offsetDir, e.Name()))
 		if err != nil {
-			return 0, fmt.Errorf("read fed offset %q: %w", e.Name(), err)
+			return 0, fmt.Errorf("read offset %q: %w", e.Name(), err)
 		}
 		if off < minOffset {
 			minOffset = off
@@ -172,11 +185,15 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 		}
 	}
 
-	// Also include federation peer offset files (fed-*.offset) in the minimum.
-	// These are written by channelReader goroutines and must be respected to
-	// prevent compacting data that federation peers have not yet consumed.
-	if fedMin, err := c.fedMinOffset(); err == nil && fedMin < minOffset {
-		minOffset = fedMin
+	// Also fold in every persisted offset file on disk. Beyond the in-memory
+	// registered subscribers above (whose files this re-reads harmlessly), this
+	// captures federation peer offsets and — critically — plain subscriber
+	// offset files whose owner has not re-subscribed yet this process lifetime.
+	// Without it, a subscriber that is slow to initialize after a restart would
+	// have its unconsumed sealed segments deleted (silent data loss). A read
+	// error (e.g. a corrupt fed offset) is ignored so it cannot block deletion.
+	if diskMin, err := c.persistedMinOffset(); err == nil && diskMin < minOffset {
+		minOffset = diskMin
 	}
 
 	// Nothing to delete if there is only the active segment.
