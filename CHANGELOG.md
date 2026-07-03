@@ -1,6 +1,37 @@
 ## [1.24.0](https://github.com/wu/keyop-messenger/compare/v1.23.0...v1.24.0) (2026-07-02)
 
+### Features
+
+* **ephemeral:** stop reconnecting on non-retryable hub rejections via OnFatal ([d71a784](https://github.com/wu/keyop-messenger/commit/d71a784d5a046b419b48655bdd22d054ddaefb03))
+
+### Bug Fixes
+
+* **storage:** honor persisted subscriber offsets during compaction across restarts ([52d6920](https://github.com/wu/keyop-messenger/commit/52d6920b291a494def21e60019050794df1009fa))
+
 ## [1.23.0](https://github.com/wu/keyop-messenger/compare/v1.22.0...v1.23.0) (2026-07-01)
+
+### ⚠ BREAKING CHANGES
+
+* **storage:** the storage.max_channel_size_mb config option is removed and
+replaced by storage.max_files. Disk-bounding is now on by default
+(10 log files per channel, including the active one); set max_files: 0 to
+restore the previous unbounded, pure consumption-based behavior.
+
+### Features
+
+* **audit:** log outbound forwards in addition to inbound ([23f12fe](https://github.com/wu/keyop-messenger/commit/23f12fef8b4764a5eedef2dd1889b915a5e6bceb))
+* **audit:** record send→ack duration on outbound forwards ([c60be30](https://github.com/wu/keyop-messenger/commit/c60be30bb99aa2e1f0cb8519450397440af5b4ee))
+* **federation:** prevent routing loops with a path-vector on the envelope ([8e40c2b](https://github.com/wu/keyop-messenger/commit/8e40c2bd153402c3e479b847a4a38d094bb32eca))
+* **storage:** replace max_channel_size_mb with max_files (default 10) ([1b28ab5](https://github.com/wu/keyop-messenger/commit/1b28ab5dd445ed6c17da0d23f465b86f24534c2b))
+
+### Bug Fixes
+
+* **federation:** enforce MaxBatchBytes on hub ingest and ephemeral publish ([49f5d8f](https://github.com/wu/keyop-messenger/commit/49f5d8fd7ab7c19ab6bada957e078f2ebf72f1d1))
+* **federation:** reap orphaned fedout- offset files on startup ([5562415](https://github.com/wu/keyop-messenger/commit/5562415177d770fc1e8615d7aa0c36fbd9fb4be0))
+
+### Refactoring
+
+* **federation:** remove dead AllowForward policy code ([2e9bd7c](https://github.com/wu/keyop-messenger/commit/2e9bd7c061c90cb7b92871b0ebf505baf2a22d96))
 
 ## [1.22.0](https://github.com/wu/keyop-messenger/compare/v1.21.0...v1.22.0) (2026-06-26)
 
