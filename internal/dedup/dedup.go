@@ -5,12 +5,9 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2"
 )
 
-// Deduplicator is the seen-ID set.
-type Deduplicator interface {
-	SeenOrAdd(id string) bool // returns true if already seen
-}
-
 // LRUDedup is a thread-safe, fixed-capacity LRU set of message IDs.
+// Consumers depend on it via their own local interfaces (e.g.
+// federation.Deduplicator) rather than one exported here.
 type LRUDedup struct {
 	cache *lru.Cache[string, struct{}]
 }
