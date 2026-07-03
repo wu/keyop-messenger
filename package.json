@@ -1,0 +1,16 @@
+{
+  "name": "keyop-messenger-release",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Release tooling for keyop-messenger (semantic-release). Not published.",
+  "license": "MIT",
+  "devDependencies": {
+    "@semantic-release/changelog": "6.0.3",
+    "@semantic-release/commit-analyzer": "13.0.1",
+    "@semantic-release/git": "10.0.1",
+    "@semantic-release/github": "12.0.9",
+    "@semantic-release/release-notes-generator": "14.1.1",
+    "conventional-changelog-conventionalcommits": "9.3.1",
+    "semantic-release": "25.0.5"
+  }
+}

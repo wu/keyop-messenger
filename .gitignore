@@ -2,3 +2,4 @@ memory
 coverage*.out
 .claude
 .idea
+node_modules

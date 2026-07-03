@@ -71,17 +71,17 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: "lts/*"
+          cache: npm
 
       - name: Install semantic-release and plugins
-        run: |
-          npm install --no-save \
-            semantic-release \
-            @semantic-release/changelog \
-            @semantic-release/commit-analyzer \
-            @semantic-release/git \
-            @semantic-release/github \
-            @semantic-release/release-notes-generator \
-            conventional-changelog-conventionalcommits
+        # Reproducible install from the committed package-lock.json. The exact
+        # versions (and the whole conventional-changelog transitive tree) are
+        # pinned in package.json / package-lock.json — do NOT switch back to an
+        # unpinned `npm install`. An unpinned install broke changelog generation
+        # for 1.23.0/1.24.0 when conventional-changelog-conventionalcommits@10
+        # (writer@9 API) got pulled into release-notes-generator@14 (writer@8),
+        # rendering empty release notes.
+        run: npm ci
 
       - name: Run semantic-release
         id: release
