@@ -37,7 +37,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends nodejs
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Cache Go modules
         uses: actions/cache@v6
@@ -73,7 +73,7 @@ jobs:
     runs-on: linux-armv6
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Cache Go modules
         uses: actions/cache@v6
@@ -105,7 +105,7 @@ jobs:
     runs-on: darwin-arm64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Cache Go modules
         uses: actions/cache@v6
@@ -143,7 +143,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends nodejs
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Cache Go modules
         uses: actions/cache@v6
@@ -180,7 +180,7 @@ jobs:
         run: apt-get update && apt-get install -y --no-install-recommends nodejs curl make
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Cache Go modules
         uses: actions/cache@v6
