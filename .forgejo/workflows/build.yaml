@@ -25,7 +25,7 @@ jobs:
           - { arch: arm64, runner: linux-arm64,  race_flag: "" }
     runs-on: ${{ matrix.runner }}
     container:
-      image: golang:1.25
+      image: golang:1.26
       # --init: tini as PID 1 reaps zombies so child processes are cleaned up.
       # --tmpfs /tmp:exec,size=2g: RAM-backed /tmp for fast fsync (messenger has
       # throughput tests that fsync on every message). exec is required because
@@ -136,7 +136,7 @@ jobs:
     name: Lint
     runs-on: docker
     container:
-      image: golang:1.25
+      image: golang:1.26
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Install Node.js (required by JS-based actions)
@@ -173,7 +173,7 @@ jobs:
     name: Coverage
     runs-on: docker
     container:
-      image: golang:1.25
+      image: golang:1.26
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Install Node.js (required by JS-based actions), curl and make
