@@ -309,14 +309,22 @@ func (s *Subscriber) Offset() int64 {
 // delivery age of successfully consumed messages: the summed age in nanoseconds
 // and the sample count. The mean is sumNanos/count (guard count == 0).
 func (s *Subscriber) ConsumeAgeAggregate() (sumNanos, count int64) {
-	return s.consumeAgeSumNs.Load(), s.consumeAgeCount.Load()
+	// count is read first because dispatch() writes it last; observing the new
+	// count here guarantees the sumNanos read below (and any window read that
+	// follows in the caller) sees data at least as fresh, per Go's atomics
+	// happens-before rule.
+	count = s.consumeAgeCount.Load()
+	sumNanos = s.consumeAgeSumNs.Load()
+	return
 }
 
 // HandlerLatencyAggregate returns the running latency aggregate for time spent
 // inside the handler for successfully consumed messages: the summed duration in
 // nanoseconds and the sample count.
 func (s *Subscriber) HandlerLatencyAggregate() (sumNanos, count int64) {
-	return s.handlerLatencySumNs.Load(), s.handlerLatencyCount.Load()
+	count = s.handlerLatencyCount.Load()
+	sumNanos = s.handlerLatencySumNs.Load()
+	return
 }
 
 // ConsumeWindowBuckets returns this subscriber's consume-age histogram buckets
@@ -798,16 +806,19 @@ func (s *Subscriber) dispatch(handler HandlerFunc, env *envelope.Envelope, paylo
 			// and retried attempts don't skew the average. Consume age spans the
 			// publisher and consumer clocks; clamp skew-induced negatives to zero.
 			handlerDur := time.Since(handlerStart)
-			s.handlerLatencySumNs.Add(int64(handlerDur))
-			s.handlerLatencyCount.Add(1)
 			s.handlerWindow.Observe(handlerDur)
+			s.handlerLatencySumNs.Add(int64(handlerDur))
+			// Count is incremented last so a concurrent Stats() reader that observes
+			// the new Count is guaranteed to also see this sample in SumNanos and the
+			// window histogram (avoids a Count/WindowCount mismatch under a race).
+			s.handlerLatencyCount.Add(1)
 			age := time.Since(env.Ts)
 			if age < 0 {
 				age = 0
 			}
+			s.consumeWindow.Observe(age)
 			s.consumeAgeSumNs.Add(int64(age))
 			s.consumeAgeCount.Add(1)
-			s.consumeWindow.Observe(age)
 			s.advanceOffset(nextOffset)
 			return false
 		}
