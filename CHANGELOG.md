@@ -1,3 +1,5 @@
+## [1.24.2](https://github.com/wu/keyop-messenger/compare/v1.24.1...v1.24.2) (2026-07-21)
+
 ## [1.24.1](https://github.com/wu/keyop-messenger/compare/v1.24.0...v1.24.1) (2026-07-18)
 
 ## [1.24.0](https://github.com/wu/keyop-messenger/compare/v1.23.0...v1.24.0) (2026-07-02)
