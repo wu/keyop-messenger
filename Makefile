@@ -1,4 +1,4 @@
-.PHONY: all build test test-integration test-fast coverage bench lint loc clean release help
+.PHONY: all build test test-integration test-fast coverage bench lint security loc clean release help
 
 # Default target
 all: test build
@@ -37,6 +37,16 @@ bench:
 lint:
 	golangci-lint run ./...
 
+# Run static analysis security scanners.
+# This assumes govulncheck and gosec are installed:
+#   go install golang.org/x/vuln/cmd/govulncheck@latest
+#   go install github.com/securego/gosec/v2/cmd/gosec@latest
+security:
+	@echo "== govulncheck (known vulnerabilities in reachable code) =="
+	govulncheck ./...
+	@echo "== gosec (security-focused static analysis) =="
+	gosec ./...
+
 # Count lines of code by category (requires cloc).
 # Hand-written: Go files excluding tests and generated code.
 # Test: *_test.go files. Generated: the gen/ tree (protobuf output).
@@ -69,6 +79,7 @@ help:
 	@echo "  coverage         - Run tests and show coverage (excludes example and testutil)"
 	@echo "  bench            - Run benchmarks"
 	@echo "  lint             - Run golangci-lint"
+	@echo "  security         - Run govulncheck and gosec"
 	@echo "  loc              - Count lines of code by category (requires cloc)"
 	@echo "  release          - Run all pre-release checks (test, test-integration, lint, bench)"
 	@echo "  clean            - Clean build artifacts and coverage files"
