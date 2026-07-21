@@ -159,10 +159,53 @@ jobs:
         run: go mod download
 
       - name: Install golangci-lint (built against container Go)
-        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
+        run: |
+          # renovate: datasource=go depName=github.com/golangci/golangci-lint
+          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Security runs once, on amd64 only — findings are architecture-independent.
+  # govulncheck flags known CVEs reachable from our code; gosec flags
+  # security-sensitive code patterns (weak TLS config, path traversal, etc.).
+  # ─────────────────────────────────────────────────────────────────────────────
+  security:
+    name: Security
+    runs-on: docker
+    container:
+      image: golang:1.26
+      options: "--init --tmpfs /tmp:exec,size=2g"
+    steps:
+      - name: Install Node.js (required by JS-based actions)
+        run: apt-get update && apt-get install -y --no-install-recommends nodejs
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache Go modules
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-amd64-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-amd64-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install govulncheck and gosec (built against container Go)
+        run: |
+          # renovate: datasource=go depName=golang.org/x/vuln
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          # renovate: datasource=go depName=github.com/securego/gosec/v2
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
+
+      - name: Run security scanners
+        run: make security
 
   # ─────────────────────────────────────────────────────────────────────────────
   # Coverage runs once on amd64 (coverage % is architecture- and race-independent)

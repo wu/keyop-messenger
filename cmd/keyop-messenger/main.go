@@ -1,6 +1,4 @@
 // Command keyop-messenger provides the CLI for keyop-messenger key management.
-//
-//nolint:gosec // G304/G703: keygen reads/writes cert files (trusted, not user-controlled attacks)
 package main
 
 import (
@@ -143,11 +141,11 @@ func keygenInstanceCmd() *cobra.Command {
 			if err := checkOverwrite(force, outCert, outKey); err != nil {
 				return err
 			}
-			caCertPEM, err := os.ReadFile(caFile)
+			caCertPEM, err := os.ReadFile(caFile) // #nosec G304 -- CLI flag, trusted operator input
 			if err != nil {
 				return fmt.Errorf("read CA cert %q: %w", caFile, err)
 			}
-			caKeyPEM, err := os.ReadFile(caKey)
+			caKeyPEM, err := os.ReadFile(caKey) // #nosec G304 -- CLI flag, trusted operator input
 			if err != nil {
 				return fmt.Errorf("read CA key %q: %w", caKey, err)
 			}
@@ -193,7 +191,7 @@ func checkOverwrite(force bool, files ...string) error {
 
 // writePEM writes data to path with mode 0600.
 func writePEM(path string, data []byte) error {
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil { // #nosec G703 -- CLI flag, trusted operator input
 		return fmt.Errorf("write %q: %w", path, err)
 	}
 	return nil

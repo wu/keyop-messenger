@@ -9,6 +9,16 @@
     "minimumReleaseAge": null
   },
   "postUpdateOptions": ["gomodTidy"],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Version pins preceded by a `# renovate:` marker comment (forgejo workflows)",
+      "managerFilePatterns": ["/\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z0-9-]+) depName=(?<depName>\\S+)(?: versioning=(?<versioning>\\S+))?(?: extractVersion=(?<extractVersion>\\S+))?\\n\\s*go install \\S+@v(?<currentValue>\\S+)"
+      ]
+    }
+  ],
   "packageRules": [
     {
       "matchUpdateTypes": ["major"],

@@ -237,7 +237,7 @@ func NewSubscriber(
 	if log == nil {
 		log = nopLogger{}
 	}
-	//nolint:gosec // G301: 0o755 is appropriate for shared data directories
+	// #nosec G301 -- 0o755 is appropriate for shared data directories
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create offset dir %q: %w", offsetDir, err)
 	}
@@ -733,7 +733,7 @@ func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset in
 // read so far) when no terminating newline is present, which indicates an
 // in-flight write rather than a complete record.
 func recordLenAt(path string, localOffset int64) (int64, error) {
-	//nolint:gosec // G304: segment path is a trusted, library-constructed data file path
+	// #nosec G304 -- segment path is a trusted, library-constructed data file path
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err

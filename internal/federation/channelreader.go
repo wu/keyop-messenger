@@ -126,7 +126,7 @@ func newChannelReader(
 	destInstanceFn func() string,
 	log logger,
 ) (*channelReader, error) {
-	//nolint:gosec // G301: shared data directory; 0755 is appropriate
+	// #nosec G301 -- shared data directory; 0755 is appropriate
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("newChannelReader: mkdir %q: %w", offsetDir, err)
 	}

@@ -334,7 +334,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 			c.log.Warn("federation: client disconnected, reconnecting",
 				"hub", hubAddr, "unacked_bytes", unacked)
 
-			//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
+			// #nosec G404 -- math/rand is appropriate for non-cryptographic jitter
 			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 			sleep := backoff + jitter
 			if sleep < 0 {
@@ -367,7 +367,7 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 					Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, dErr.Error()),
 				})
 				backoff = minDuration(backoff*2, c.reconnectMax)
-				//nolint:gosec // G404: math/rand is appropriate for non-cryptographic jitter
+				// #nosec G404 -- math/rand is appropriate for non-cryptographic jitter
 				jitter = time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
 				sleep = backoff + jitter
 				if sleep < 0 {

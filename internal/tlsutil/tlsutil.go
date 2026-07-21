@@ -47,7 +47,7 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		return nil, fmt.Errorf("tlsutil: load key pair: %w", err)
 	}
 
-	caPEM, err := os.ReadFile(caFile)
+	caPEM, err := os.ReadFile(caFile) // #nosec G304 -- reads CA file from trusted config path
 	if err != nil {
 		return nil, fmt.Errorf("tlsutil: read CA file: %w", err)
 	}

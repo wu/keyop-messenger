@@ -1,4 +1,3 @@
-//nolint:gosec // G301/G302/G304/G315: data file operations with trusted paths
 package storage
 
 import (
@@ -65,11 +64,11 @@ type segmentFactory interface {
 type osSegmentFactory struct{}
 
 func (osSegmentFactory) openSegment(path string) (fileWriter, error) {
-	return os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	return os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644) // #nosec G302 G304 -- trusted, library-constructed segment path; 0o644 is intentional
 }
 
 func (osSegmentFactory) createSegment(path string) (fileWriter, error) {
-	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644) // #nosec G302 G304 -- trusted, library-constructed segment path; 0o644 is intentional
 }
 
 type writeRequest struct {
@@ -104,7 +103,7 @@ type channelWriter struct {
 //
 //nolint:revive // unexported-return is acceptable for unexported implementation of exported interface
 func NewChannelWriter(channelDir string, maxSegmentBytes int64, syncIntervalMS int, notifyFn func(), log logger) (*channelWriter, error) {
-	if err := os.MkdirAll(channelDir, 0o755); err != nil {
+	if err := os.MkdirAll(channelDir, 0o755); err != nil { // #nosec G301 -- 0o755 is appropriate for shared data directories
 		return nil, fmt.Errorf("create channel directory %q: %w", channelDir, err)
 	}
 	return newChannelWriterWithFactory(channelDir, maxSegmentBytes, osSegmentFactory{}, syncIntervalMS, notifyFn, log), nil
@@ -287,7 +286,7 @@ func truncatePartialTrailing(path string, currentSize int64, log logger) (int64,
 	if currentSize == 0 {
 		return 0, nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	f, err := os.OpenFile(path, os.O_RDWR, 0) // #nosec G304 -- segment path is a trusted, library-constructed data file path
 	if err != nil {
 		return 0, fmt.Errorf("open for recovery: %w", err)
 	}

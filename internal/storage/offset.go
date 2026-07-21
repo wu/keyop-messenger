@@ -1,4 +1,3 @@
-//nolint:gosec // G301/G302/G304/G306: data file operations with trusted paths
 package storage
 
 import (
@@ -11,7 +10,7 @@ import (
 // ReadOffset reads the byte offset stored at path. The file must contain a
 // decimal integer as written by WriteOffset.
 func ReadOffset(path string) (int64, error) {
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) // #nosec G304 -- trusted, library-constructed offset file path
 	if err != nil {
 		return 0, fmt.Errorf("read offset file %q: %w", path, err)
 	}
@@ -28,7 +27,7 @@ func ReadOffset(path string) (int64, error) {
 func WriteOffset(path string, offset int64) error {
 	tmp := path + ".tmp"
 
-	f, err := os.Create(tmp)
+	f, err := os.Create(tmp) // #nosec G304 -- trusted, library-constructed offset file path
 	if err != nil {
 		return fmt.Errorf("create tmp offset file: %w", err)
 	}
