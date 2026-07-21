@@ -1,0 +1,51 @@
+name: CodeQL
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GitHub-only: CodeQL / code scanning runs on GitHub's Advanced Security
+# backend, which isn't available on Forgejo. Gated the same way as
+# release.yaml so the Forgejo mirror of this file (if any) is a no-op.
+# ──────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly scan catches newly published CodeQL query/CVE updates even when
+    # nothing in the repo has changed.
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: CodeQL Analyze
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"
