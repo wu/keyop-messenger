@@ -1,6 +1,14 @@
 ## [1.24.2](https://github.com/wu/keyop-messenger/compare/v1.24.1...v1.24.2) (2026-07-21)
 
+### Bug Fixes
+
+* **tlsutil:** disable TLS session resumption to close gosec G123 gap ([261c3cf](https://github.com/wu/keyop-messenger/commit/261c3dfad69b7ff5255e01d4acde9b247d345af3))
+
 ## [1.24.1](https://github.com/wu/keyop-messenger/compare/v1.24.0...v1.24.1) (2026-07-18)
+
+### Bug Fixes
+
+* **deps:** update module google.golang.org/grpc to v1.82.0 ([fa698fd](https://github.com/wu/keyop-messenger/commit/fa698fd17e0bb3aef1cd1883852c199a88d4ac9e))
 
 ## [1.24.0](https://github.com/wu/keyop-messenger/compare/v1.23.0...v1.24.0) (2026-07-02)
 

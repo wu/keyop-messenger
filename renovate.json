@@ -28,6 +28,12 @@
       "matchManagers": ["gomod"],
       "matchUpdateTypes": ["minor", "patch"],
       "groupName": "go dependencies"
+    },
+    {
+      "description": "conventional-changelog-conventionalcommits v10 is incompatible with @semantic-release/release-notes-generator@14 (still bundles writer@8) -- empty changelogs result. Tracked upstream: semantic-release/release-notes-generator#992, fix in #996. Remove once release-notes-generator ships a writer@9-compatible release.",
+      "matchPackageNames": ["conventional-changelog-conventionalcommits"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ]
 }
