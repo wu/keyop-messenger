@@ -1,3 +1,9 @@
+## [1.24.3](https://github.com/wu/keyop-messenger/compare/v1.24.2...v1.24.3) (2026-07-21)
+
+### Bug Fixes
+
+* order latency Count updates after window/sum in dispatch ([ede427a](https://github.com/wu/keyop-messenger/commit/ede427a31843a35f682caf2c0fbc21c316e81e88))
+
 ## [1.24.2](https://github.com/wu/keyop-messenger/compare/v1.24.1...v1.24.2) (2026-07-21)
 
 ### Bug Fixes
