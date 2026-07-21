@@ -1,4 +1,3 @@
-//nolint:gosec // G304: reads cert/CA files from trusted config paths
 package tlsutil
 
 import (
@@ -97,13 +96,18 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 	}
 
 	return &tls.Config{
-		Certificates:          []tls.Certificate{cert},
-		ClientCAs:             caPool,
-		RootCAs:               caPool,
-		ClientAuth:            tls.RequireAndVerifyClientCert,
-		MinVersion:            tls.VersionTLS13,
-		InsecureSkipVerify:    true, //nolint:gosec // chain is verified by VerifyPeerCertificate; hostname matching is intentionally disabled
+		Certificates: []tls.Certificate{cert},
+		ClientCAs:    caPool,
+		RootCAs:      caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		MinVersion:   tls.VersionTLS13,
+		// #nosec G402 -- chain is verified by VerifyPeerCertificate; hostname matching is intentionally disabled
+		InsecureSkipVerify:    true,
 		VerifyPeerCertificate: verifyChainOnly,
+		// Resumed sessions would skip VerifyPeerCertificate above, silently
+		// bypassing peer verification if a ClientSessionCache is ever added.
+		// Disabling tickets keeps every connection on the full handshake path.
+		SessionTicketsDisabled: true,
 	}, nil
 }
 
