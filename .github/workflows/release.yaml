@@ -1,7 +1,14 @@
 name: Release
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Trigger: every push to main.
+# Trigger: every push to main, and every PR targeting main.
+#
+# `test` runs on both, giving PR-level feedback before merge. `codeql-gate`
+# and `semantic-release` are restricted to push/release/workflow_dispatch —
+# releases only ever happen from main, and codeql-gate's job is specifically
+# to gate that release, so there's nothing for it to do on a PR (codeql.yaml
+# already runs its own PR-triggered scan independently, for inline
+# annotations on the PR itself).
 #
 # semantic-release analyses Conventional Commits, bumps the version,
 # creates a git tag, publishes a GitHub Release, and commits CHANGELOG.md.
@@ -10,6 +17,8 @@ name: Release
 
 on:
   push:
+    branches: ["main"]
+  pull_request:
     branches: ["main"]
   release:
     types: [ published ]
@@ -45,13 +54,88 @@ jobs:
         run: go test -race -tags integration -timeout 5m ./...
 
   # ────────────────────────────────────────────────────────────────────────────
-  # Job – semantic-release (only runs if tests pass)
+  # Job – CodeQL gate (runs in parallel with test)
+  #
+  # CodeQL runs as its own workflow (.github/workflows/codeql.yaml), triggered
+  # by the same push, so this job can't just query alerts immediately — that
+  # run may still be in progress. It polls the Actions API for the CodeQL
+  # workflow run tied to this exact commit, waits for it to complete, then
+  # queries the Code Scanning alerts API for open alerts on main.
+  #
+  # Fails open (does not block release) whenever CodeQL's own result is
+  # unavailable or inconclusive: no run found within the wait window, the run
+  # didn't conclude successfully, or the alerts API call itself fails. Only a
+  # confirmed open alert blocks release.
+  # ────────────────────────────────────────────────────────────────────────────
+  codeql-gate:
+    name: CodeQL Gate
+    if: github.server_url == 'https://github.com' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: read
+
+    steps:
+      - name: Wait for CodeQL run and check for open alerts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail  # no -e: every failure path below must fail open, not abort the script
+          api="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}"
+
+          echo "Waiting for the CodeQL workflow run for commit ${SHA}..."
+          status=""
+          conclusion=""
+          # Poll for up to ~10 minutes for a completed CodeQL run tied to this commit.
+          for i in $(seq 1 60); do
+            resp=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+              "$api/actions/workflows/codeql.yaml/runs?head_sha=${SHA}&per_page=5") || resp=""
+            status=$(echo "$resp" | jq -r '.workflow_runs[0].status // empty' 2>/dev/null)
+            conclusion=$(echo "$resp" | jq -r '.workflow_runs[0].conclusion // empty' 2>/dev/null)
+            if [ "$status" = "completed" ]; then
+              echo "CodeQL run completed with conclusion: $conclusion"
+              break
+            fi
+            echo "  (attempt $i/60) status=${status:-none} — waiting 10s"
+            sleep 10
+          done
+
+          if [ "$status" != "completed" ]; then
+            echo "::warning::No completed CodeQL run found for ${SHA} after waiting — treating as unavailable, not blocking release"
+            exit 0
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::warning::CodeQL run concluded '${conclusion}' (not success) — treating as unavailable, not blocking release"
+            exit 0
+          fi
+
+          resp=$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer ${GITHUB_TOKEN}" -H "Accept: application/vnd.github+json" \
+            "$api/code-scanning/alerts?state=open&ref=refs/heads/main&tool_name=CodeQL&per_page=100") || resp=$'\n000'
+          code=$(echo "$resp" | tail -1)
+          body=$(echo "$resp" | sed '$d')
+          if [ "$code" != "200" ]; then
+            echo "::warning::Code scanning alerts API returned HTTP ${code} — treating as unavailable, not blocking release"
+            exit 0
+          fi
+
+          count=$(echo "$body" | jq 'length' 2>/dev/null || echo 0)
+          echo "Open CodeQL alerts on main: ${count}"
+          if [ "$count" -gt 0 ]; then
+            echo "$body" | jq -r '.[] | "- " + .rule.id + ": " + .most_recent_instance.message.text + " (" + .html_url + ")"'
+            echo "::error::${count} open CodeQL alert(s) on main — blocking release until resolved"
+            exit 1
+          fi
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Job – semantic-release (only runs if tests pass and CodeQL gate clears)
   # ────────────────────────────────────────────────────────────────────────────
   semantic-release:
     name: Semantic Release
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, codeql-gate]
 
     outputs:
       # "true" when a new release was actually published this run.
