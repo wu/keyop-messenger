@@ -136,12 +136,12 @@ jobs:
     name: Lint
     runs-on: docker
     container:
-      image: golang:1.26
+      # geekfarm-ci ships golangci-lint prebuilt against its own Go toolchain,
+      # plus the nodejs the JS-based actions need. Built from geekfarm-ci/ in
+      # the geektank-k8s repo; re-pin with bin/pin-geekfarm-ci.sh.
+      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.08.14.0752
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
-      - name: Install Node.js (required by JS-based actions)
-        run: apt-get update && apt-get install -y --no-install-recommends nodejs
-
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -157,11 +157,6 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
-
-      - name: Install golangci-lint (built against container Go)
-        run: |
-          # renovate: datasource=go depName=github.com/golangci/golangci-lint
-          go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.2
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
@@ -175,12 +170,12 @@ jobs:
     name: Security
     runs-on: docker
     container:
-      image: golang:1.26
+      # geekfarm-ci ships govulncheck and gosec prebuilt against its own Go
+      # toolchain, plus the nodejs and make this job needs. Built from
+      # geekfarm-ci/ in the geektank-k8s repo; re-pin with bin/pin-geekfarm-ci.sh.
+      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.08.14.0752
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
-      - name: Install Node.js (required by JS-based actions)
-        run: apt-get update && apt-get install -y --no-install-recommends nodejs
-
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -196,13 +191,6 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
-
-      - name: Install govulncheck and gosec (built against container Go)
-        run: |
-          # renovate: datasource=go depName=golang.org/x/vuln
-          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
-          # renovate: datasource=go depName=github.com/securego/gosec/v2
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.28.0
 
       - name: Run security scanners
         run: make security
