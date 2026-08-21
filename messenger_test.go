@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -662,6 +663,32 @@ func TestRegisterPayloadTypeDuplicate(t *testing.T) {
 	err = m.RegisterPayloadType("test.Evt", Evt{})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrPayloadTypeAlreadyRegistered)
+}
+
+// TestPayloadPrototype verifies the read side of RegisterPayloadType: the type
+// reported is the one a subscriber's handler will actually receive, so callers
+// can inspect a payload's shape without decoding a message.
+func TestPayloadPrototype(t *testing.T) {
+	dir := t.TempDir()
+	m, err := newForTest(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	type Evt struct {
+		Name string `json:"name"`
+	}
+	require.NoError(t, m.RegisterPayloadType("test.Evt", &Evt{}))
+
+	got, ok := m.PayloadPrototype("test.Evt")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf(Evt{}), got, "a pointer registration reports the element type")
+
+	field, found := got.FieldByName("Name")
+	require.True(t, found, "the reported type must be inspectable field by field")
+	assert.Equal(t, "name", field.Tag.Get("json"))
+
+	_, ok = m.PayloadPrototype("test.Unregistered")
+	assert.False(t, ok)
 }
 
 // TestInstanceNameFromTestIdentity verifies that WithTestIdentity sets the

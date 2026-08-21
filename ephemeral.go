@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -154,6 +155,13 @@ func (m *EphemeralMessenger) RegisterPayloadType(typeStr string, prototype any) 
 		return err
 	}
 	return nil
+}
+
+// PayloadPrototype returns the Go type registered for typeStr, or false when
+// typeStr is not registered. It is the read side of RegisterPayloadType; see
+// Messenger.PayloadPrototype.
+func (m *EphemeralMessenger) PayloadPrototype(typeStr string) (reflect.Type, bool) {
+	return m.reg.Prototype(typeStr)
 }
 
 // Subscribe registers handler for inbound messages on channel.

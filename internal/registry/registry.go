@@ -39,6 +39,12 @@ type PayloadRegistry interface {
 
 	// KnownTypes returns all registered type strings in sorted order.
 	KnownTypes() []string
+
+	// Prototype returns the Go type registered for typeStr, or false when
+	// typeStr is not registered. The type returned is the same one Decode
+	// produces values of, so callers can inspect a payload's shape without
+	// having a message in hand.
+	Prototype(typeStr string) (reflect.Type, bool)
 }
 
 // defaultRegistry is the production implementation of PayloadRegistry. It is a
@@ -97,6 +103,15 @@ func (r *defaultRegistry) Decode(typeStr string, raw json.RawMessage) (any, erro
 		return nil, fmt.Errorf("decode payload %q: %w", typeStr, err)
 	}
 	return ptr.Elem().Interface(), nil
+}
+
+// Prototype implements PayloadRegistry.
+func (r *defaultRegistry) Prototype(typeStr string) (reflect.Type, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	t, ok := r.entries[typeStr]
+	return t, ok
 }
 
 // KnownTypes implements PayloadRegistry.

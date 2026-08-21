@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
 	"sync"
@@ -520,6 +521,17 @@ func (m *Messenger) RegisterPayloadType(typeStr string, prototype any) error {
 		return err
 	}
 	return nil
+}
+
+// PayloadPrototype returns the Go type registered for typeStr, or false when
+// typeStr is not registered.
+//
+// This is the read side of RegisterPayloadType. It exists so callers can reason
+// about a payload's shape without a message to decode -- validating
+// configuration that names payload fields, for instance, at startup rather than
+// on the first message that happens to arrive.
+func (m *Messenger) PayloadPrototype(typeStr string) (reflect.Type, bool) {
+	return m.reg.Prototype(typeStr)
 }
 
 // Publish creates an envelope for payload, writes it to channel's storage

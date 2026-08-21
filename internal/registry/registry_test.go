@@ -3,6 +3,7 @@ package registry
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -140,6 +141,61 @@ func TestDecode_MultipleTypes(t *testing.T) {
 
 // ---- KnownTypes -------------------------------------------------------
 
+// ---- Prototype --------------------------------------------------------
+
+func TestPrototype_RegisteredType(t *testing.T) {
+	r := newReg(t)
+	require.NoError(t, r.Register("order.created", orderCreated{}))
+
+	got, ok := r.Prototype("order.created")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf(orderCreated{}), got)
+}
+
+// Prototype must report the same type Decode produces values of, so a caller
+// inspecting a payload's shape sees what a subscriber will actually receive.
+func TestPrototype_PointerRegistration_ReturnsElementType(t *testing.T) {
+	r := newReg(t)
+	require.NoError(t, r.Register("order.created", &orderCreated{}))
+
+	got, ok := r.Prototype("order.created")
+	require.True(t, ok)
+	assert.Equal(t, reflect.TypeOf(orderCreated{}), got)
+	assert.NotEqual(t, reflect.Pointer, got.Kind())
+
+	decoded, err := r.Decode("order.created", rawJSON(t, orderCreated{OrderID: "1"}))
+	require.NoError(t, err)
+	assert.Equal(t, got, reflect.TypeOf(decoded))
+}
+
+func TestPrototype_UnregisteredType(t *testing.T) {
+	r := newReg(t)
+	require.NoError(t, r.Register("order.created", orderCreated{}))
+
+	got, ok := r.Prototype("payment.received")
+	assert.False(t, ok)
+	assert.Nil(t, got)
+
+	got, ok = r.Prototype("")
+	assert.False(t, ok)
+	assert.Nil(t, got)
+}
+
+func TestPrototype_MultipleTypes(t *testing.T) {
+	r := newReg(t)
+	require.NoError(t, r.Register("order.created", orderCreated{}))
+	require.NoError(t, r.Register("payment.received", &paymentReceived{}))
+
+	for name, want := range map[string]reflect.Type{
+		"order.created":    reflect.TypeOf(orderCreated{}),
+		"payment.received": reflect.TypeOf(paymentReceived{}),
+	} {
+		got, ok := r.Prototype(name)
+		require.True(t, ok, name)
+		assert.Equal(t, want, got, name)
+	}
+}
+
 func TestKnownTypes_Sorted(t *testing.T) {
 	reg := newReg(t)
 	require.NoError(t, reg.Register("com.keyop.Z", orderCreated{}))
@@ -195,6 +251,7 @@ func TestRegistry_Concurrent(t *testing.T) {
 			// Ignore duplicate errors — some goroutines may share a suffix.
 			_ = reg.Register(typeStr, orderCreated{})
 			_ = reg.KnownTypes()
+			_, _ = reg.Prototype("com.keyop.OrderCreated")
 		}()
 	}
 
