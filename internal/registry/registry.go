@@ -64,7 +64,7 @@ func (r *defaultRegistry) Register(typeStr string, prototype any) error {
 	}
 	// If the caller passes a pointer, store the element type so that Decode
 	// always returns a value (not a pointer), keeping the API consistent.
-	if t.Kind() == reflect.Ptr {
+	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 
