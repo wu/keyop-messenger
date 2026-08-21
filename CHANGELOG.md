@@ -1,3 +1,9 @@
+## [1.25.0](https://github.com/wu/keyop-messenger/compare/v1.24.3...v1.25.0) (2026-08-21)
+
+### Features
+
+* expose the payload type registry for inspection ([7c6d053](https://github.com/wu/keyop-messenger/commit/7c6d053a8276ba610157a2d2b05ef46fccaee927))
+
 ## [1.24.3](https://github.com/wu/keyop-messenger/compare/v1.24.2...v1.24.3) (2026-07-21)
 
 ### Bug Fixes
