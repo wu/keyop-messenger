@@ -151,12 +151,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-amd64-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-amd64-geekfarm-ci-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-amd64-go-
-
-      - name: Download dependencies
-        run: go mod download
+            ${{ runner.os }}-amd64-geekfarm-ci-go-
 
       - name: Run golangci-lint
         run: golangci-lint run ./...
@@ -185,12 +182,9 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-amd64-go-${{ hashFiles('**/go.sum') }}
+          key: ${{ runner.os }}-amd64-geekfarm-ci-go-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            ${{ runner.os }}-amd64-go-
-
-      - name: Download dependencies
-        run: go mod download
+            ${{ runner.os }}-amd64-geekfarm-ci-go-
 
       - name: Run security scanners
         run: make security
