@@ -1,3 +1,9 @@
+## [1.25.1](https://github.com/wu/keyop-messenger/compare/v1.25.0...v1.25.1) (2026-09-04)
+
+### Bug Fixes
+
+* **deps:** bump google.golang.org/grpc to v1.83.1 for CVE fix ([b0f1a3b](https://github.com/wu/keyop-messenger/commit/b0f1a3bea0f360fcc7fa6ca97d9c6b3dcf34253f))
+
 ## [1.25.0](https://github.com/wu/keyop-messenger/compare/v1.24.3...v1.25.0) (2026-08-21)
 
 ### Features
