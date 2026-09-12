@@ -124,11 +124,10 @@ type Subscriber struct {
 	closeOnce sync.Once
 
 	// committedEnd reports the channel's committed end — the offset just past the
-	// last complete record its writer has written. Scans are bounded by it, so a
-	// record still being appended is never even read. nil, or a zero return,
-	// means "unknown" (no writer for this channel in this process yet) and the
-	// scan falls back to reading to EOF, where scanCompleteLines is what keeps a
-	// partial tail from being consumed.
+	// last complete record its writer has written. Every scan is bounded by it,
+	// so a record still being appended is never read. Startup recovery records a
+	// value for every channel before any subscriber exists, so there is no
+	// "unknown" case to fall back from.
 	committedEnd func() int64
 
 	// cursor frames records from the channel's segment files. It is owned by this
@@ -244,6 +243,7 @@ func NewSubscriber(
 	reg payloadDecoder,
 	maxRetries int,
 	dlWriter ChannelWriter,
+	committedEnd func() int64, // the channel's committed end; see the field of the same name
 	log logger,
 	flushInterval time.Duration,
 ) (*Subscriber, error) {
@@ -296,10 +296,11 @@ func NewSubscriber(
 		doneCh:        make(chan struct{}),
 		retryDelay:    defaultRetryDelay,
 		writeOffsetFn: WriteOffset,
+		committedEnd:  committedEnd,
 		consumeWindow: latencyhist.NewWindow(),
 		// No per-record cap: a subscriber delivers whatever it can read, so only
 		// a record too large to scan at all is stepped over.
-		cursor: NewCursor(channelDir, CursorOpts{
+		cursor: NewCursor(channelDir, committedEnd, CursorOpts{
 			ScanLimit:      maxLineSize,
 			InitialBufSize: scanInitialBufSize,
 		}),
@@ -380,13 +381,6 @@ func (s *Subscriber) Stop() {
 // skipped. Must be called before Start.
 func (s *Subscriber) SetMaxAge(d time.Duration) { s.maxAge = d }
 
-// SetCommittedEnd supplies the channel's committed-end accessor. Must be called
-// before Start. See the committedEnd field.
-func (s *Subscriber) SetCommittedEnd(fn func() int64) {
-	s.committedEnd = fn
-	s.cursor.CommittedEndFunc(fn)
-}
-
 // SetRetryBackoff configures the exponential-backoff schedule applied between
 // handler retry attempts: delay = base * 2^(attempt-1), capped at max. Non-positive
 // values fall back to the defaults (100ms base, 5s cap). Must be called before Start.
@@ -457,7 +451,7 @@ func (s *Subscriber) applyStartupMaxAge() {
 	offset := s.offset
 	s.mu.Unlock()
 
-	newOffset, err := fastForwardToCutoff(s.channelDir, offset, cutoff)
+	newOffset, err := fastForwardToCutoff(s.channelDir, offset, cutoff, s.committedEnd())
 	if err != nil {
 		s.log.Error("startup max-age fast-forward failed; delivering full backlog",
 			"subscriber", s.id, "err", err)
@@ -478,7 +472,9 @@ func (s *Subscriber) applyStartupMaxAge() {
 // (by file mtime) are skipped without reading their contents; the boundary
 // segment is scanned line-by-line by envelope timestamp. If every record is older
 // than cutoff, the channel's current stream end is returned.
-func fastForwardToCutoff(channelDir string, startOffset int64, cutoff time.Time) (int64, error) {
+//
+// committedEnd bounds every record it reads, like every other reader.
+func fastForwardToCutoff(channelDir string, startOffset int64, cutoff time.Time, committedEnd int64) (int64, error) {
 	segs, err := listSegments(channelDir)
 	if err != nil {
 		return startOffset, err
@@ -502,7 +498,7 @@ func fastForwardToCutoff(channelDir string, startOffset int64, cutoff time.Time)
 		if seg.startOffset > from {
 			from = seg.startOffset
 		}
-		found, pos, err := firstOffsetAtOrAfter(seg, from, cutoff)
+		found, pos, err := firstOffsetAtOrAfter(seg, from, cutoff, committedEnd)
 		if err != nil {
 			return startOffset, err
 		}
@@ -517,7 +513,11 @@ func fastForwardToCutoff(channelDir string, startOffset int64, cutoff time.Time)
 // firstOffsetAtOrAfter scans seg from the global offset `from` and returns the
 // offset of the first record whose timestamp is at or after cutoff. If no such
 // record exists, it returns found=false and the offset of the segment's end.
-func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, int64, error) {
+//
+// committedEnd bounds the scan: like every other reader this one must not see a
+// record the writer has not finished, since it would frame the in-flight bytes
+// as a stale record and step the subscriber past them.
+func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time, committedEnd int64) (bool, int64, error) {
 	f, err := os.Open(seg.path)
 	if err != nil {
 		return false, 0, err
@@ -527,7 +527,10 @@ func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, 
 	if _, err := f.Seek(from-seg.startOffset, io.SeekStart); err != nil {
 		return false, 0, err
 	}
-	scanner := bufio.NewScanner(f)
+	if committedEnd <= from {
+		return false, from, nil // nothing committed beyond this point
+	}
+	scanner := bufio.NewScanner(&io.LimitedReader{R: f, N: committedEnd - from})
 	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
 	scanner.Split(scanCompleteLines)
 
@@ -552,7 +555,7 @@ func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time) (bool, 
 // subscriber is caught up (offset == stream end) or the offset fell outside the
 // surviving segments after compaction. It is best-effort; a read or parse error
 // is returned so the caller can log and fall back to "unknown".
-func OldestPendingTimestamp(channelDir string, offset int64) (time.Time, bool, error) {
+func OldestPendingTimestamp(channelDir string, offset int64, committedEnd int64) (time.Time, bool, error) {
 	segs, err := listSegments(channelDir)
 	if err != nil {
 		return time.Time{}, false, err
@@ -563,14 +566,15 @@ func OldestPendingTimestamp(channelDir string, offset int64) (time.Time, bool, e
 		if offset < seg.startOffset || offset >= seg.startOffset+seg.size {
 			continue
 		}
-		return readTimestampAt(seg, offset)
+		return readTimestampAt(seg, offset, committedEnd)
 	}
 	return time.Time{}, false, nil
 }
 
 // readTimestampAt reads the one record beginning at the given global offset
-// within seg and returns its envelope timestamp.
-func readTimestampAt(seg segmentInfo, offset int64) (time.Time, bool, error) {
+// within seg and returns its envelope timestamp. The read is bounded by the
+// channel's committed end, so a record still being appended is not read.
+func readTimestampAt(seg segmentInfo, offset, committedEnd int64) (time.Time, bool, error) {
 	f, err := os.Open(seg.path)
 	if err != nil {
 		return time.Time{}, false, err
@@ -580,7 +584,10 @@ func readTimestampAt(seg segmentInfo, offset int64) (time.Time, bool, error) {
 	if _, err := f.Seek(offset-seg.startOffset, io.SeekStart); err != nil {
 		return time.Time{}, false, err
 	}
-	scanner := bufio.NewScanner(f)
+	if committedEnd <= offset {
+		return time.Time{}, false, nil // the record at offset is not committed yet
+	}
+	scanner := bufio.NewScanner(&io.LimitedReader{R: f, N: committedEnd - offset})
 	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
 	scanner.Split(scanCompleteLines)
 	if scanner.Scan() {

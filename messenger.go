@@ -783,6 +783,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		m.reg,
 		maxRetries,
 		countingWriter{ChannelWriter: dlState.writer, count: &dlState.publishCount},
+		func() int64 { return m.channelCommittedEnd(channel) },
 		m.log,
 		time.Duration(m.cfg.Storage.OffsetFlushIntervalMS)*time.Millisecond,
 	)
@@ -791,7 +792,6 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		return fmt.Errorf("subscribe %q/%q: %w", channel, subscriberID, err)
 	}
 	sub.SetMaxAge(so.maxAge)
-	sub.SetCommittedEnd(func() int64 { return m.channelCommittedEnd(channel) })
 	sub.SetRetryBackoff(retryBase, retryMax)
 
 	entry := &subscriberEntry{sub: sub, notifier: notifier, cancel: cancel}
@@ -1007,7 +1007,8 @@ func (m *Messenger) Stats() Stats {
 			// stalled consumer on a low-rate channel). Best-effort: log and skip on error.
 			var oldestMs int64
 			if off < streamEnd {
-				if ts, ok, terr := storage.OldestPendingTimestamp(m.channelDir(name), off); terr != nil {
+				if ts, ok, terr := storage.OldestPendingTimestamp(
+					m.channelDir(name), off, m.channelCommittedEnd(name)); terr != nil {
 					m.log.Warn("stats: read oldest pending timestamp",
 						"channel", name, "subscriber", id, "err", terr)
 				} else if ok {

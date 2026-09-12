@@ -48,12 +48,6 @@ type CursorOpts struct {
 	// defaultScanInitialBufSize.
 	InitialBufSize int
 
-	// CommittedEnd reports the channel's committed end, bounding every read so
-	// bytes of a record still being appended are never in the buffer. nil, or a
-	// zero return, means "unknown" and reads run to EOF — where the complete-line
-	// rule is what keeps a partial tail from being consumed.
-	CommittedEnd func() int64
-
 	// OnSkip is called for each skipped record. Optional.
 	OnSkip func(SkipInfo)
 }
@@ -92,8 +86,9 @@ type Record struct {
 // of kilobytes and allocating it per pass dominates a reader's allocation.
 // A Cursor is not safe for concurrent use.
 type Cursor struct {
-	channelDir string
-	opts       CursorOpts
+	channelDir   string
+	committedEnd func() int64
+	opts         CursorOpts
 
 	buf  []byte // reused scan buffer
 	segs []segmentInfo
@@ -113,9 +108,15 @@ type Cursor struct {
 	offset int64
 }
 
-// NewCursor returns a cursor over channelDir. It performs no I/O; call Reset to
-// position it.
-func NewCursor(channelDir string, opts CursorOpts) *Cursor {
+// NewCursor returns a cursor over channelDir, bounded by committedEnd. It
+// performs no I/O; call Reset to position it.
+//
+// committedEnd is required, not optional: a cursor reads only what the channel's
+// writer has confirmed complete, so there is no unbounded mode to fall back to.
+// A channel with nothing committed reports 0 and yields no records, which is the
+// correct answer rather than a special case. A nil func is a programming error
+// and is treated as "nothing committed".
+func NewCursor(channelDir string, committedEnd func() int64, opts CursorOpts) *Cursor {
 	if opts.ScanLimit <= 0 {
 		opts.ScanLimit = defaultScanLimit
 	}
@@ -125,10 +126,14 @@ func NewCursor(channelDir string, opts CursorOpts) *Cursor {
 	if opts.InitialBufSize > opts.ScanLimit {
 		opts.InitialBufSize = opts.ScanLimit
 	}
+	if committedEnd == nil {
+		committedEnd = func() int64 { return 0 }
+	}
 	return &Cursor{
-		channelDir: channelDir,
-		opts:       opts,
-		buf:        make([]byte, opts.InitialBufSize),
+		channelDir:   channelDir,
+		committedEnd: committedEnd,
+		opts:         opts,
+		buf:          make([]byte, opts.InitialBufSize),
 	}
 }
 
@@ -149,7 +154,12 @@ func (c *Cursor) Reset(offset int64) error {
 // CommittedEndFunc sets the committed-end accessor after construction, for a
 // consumer that learns it later than it builds its cursor. Not safe to call once
 // the cursor is in use.
-func (c *Cursor) CommittedEndFunc(fn func() int64) { c.opts.CommittedEnd = fn }
+func (c *Cursor) CommittedEndFunc(fn func() int64) {
+	if fn == nil {
+		fn = func() int64 { return 0 }
+	}
+	c.committedEnd = fn
+}
 
 // OnSkipFunc sets the skip callback after construction, for a consumer whose
 // reporting needs a reference to itself. Not safe to call once the cursor is in
@@ -281,12 +291,8 @@ func (c *Cursor) openAtOffset() (bool, error) {
 			return false, fmt.Errorf("seek segment %q to %d: %w", seg.path, c.offset, err)
 		}
 
-		var src io.Reader = f
-		if limit > 0 {
-			c.limitReader = io.LimitedReader{R: f, N: limit}
-			src = &c.limitReader
-		}
-		scanner := bufio.NewScanner(src)
+		c.limitReader = io.LimitedReader{R: f, N: limit}
+		scanner := bufio.NewScanner(&c.limitReader)
 		scanner.Buffer(c.buf, c.opts.ScanLimit)
 		scanner.Split(scanCompleteLines)
 
@@ -298,16 +304,9 @@ func (c *Cursor) openAtOffset() (bool, error) {
 }
 
 // readLimit returns how many bytes may be read from the current offset: the
-// distance to the committed end, 0 when nothing new is committed, or -1 when the
-// committed end is unknown and reads run to EOF.
+// distance to the committed end, or 0 when nothing beyond it is committed.
 func (c *Cursor) readLimit() int64 {
-	if c.opts.CommittedEnd == nil {
-		return -1
-	}
-	end := c.opts.CommittedEnd()
-	if end <= 0 {
-		return -1
-	}
+	end := c.committedEnd()
 	if end <= c.offset {
 		return 0
 	}

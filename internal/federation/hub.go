@@ -290,10 +290,21 @@ func (h *Hub) SetCommittedEndFn(fn func(channel string) int64) { h.committedEndF
 // channelCommittedEndFn binds committedEndFn to one channel for a reader, or
 // returns nil when no accessor was supplied.
 func (h *Hub) channelCommittedEndFn(channel string) func() int64 {
-	if h.committedEndFn == nil {
-		return nil
+	if h.committedEndFn != nil {
+		return func() int64 { return h.committedEndFn(channel) }
 	}
-	return func() int64 { return h.committedEndFn(channel) }
+	// No owner supplied one. Readers must still be bounded — an absent bound is
+	// not "read everything", it is "read nothing" — so fall back to deriving it
+	// from disk. That costs a tail read per scan, which is why a messenger
+	// supplies its in-memory value instead.
+	channelDir := h.layout.ChannelDir(channel)
+	return func() int64 {
+		end, err := storage.ChannelCommittedEnd(channelDir)
+		if err != nil {
+			return 0
+		}
+		return end
+	}
 }
 
 // NotifyChannel wakes all channelReader goroutines registered for channel.

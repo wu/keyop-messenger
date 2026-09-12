@@ -365,7 +365,8 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	ackCh := make(chan struct{}, 4)
 
 	placeholder := make(chan sendReq, 1)
-	reader, err := newChannelReader(layout, "peer1", "feed", storage.OffsetPrefixFedIn, 65536, placeholder, nil, nil, log)
+	reader, err := newChannelReader(layout, "peer1", "feed", storage.OffsetPrefixFedIn, 65536, placeholder,
+		nil, committedAll(layout, "feed"), log)
 	require.NoError(t, err)
 
 	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil, nil, nil, "")

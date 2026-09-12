@@ -401,10 +401,21 @@ func (c *Client) SetCommittedEndFn(fn func(channel string) int64) { c.committedE
 // channelCommittedEndFn binds committedEndFn to one channel for a reader, or
 // returns nil when no accessor was supplied.
 func (c *Client) channelCommittedEndFn(channel string) func() int64 {
-	if c.committedEndFn == nil {
-		return nil
+	if c.committedEndFn != nil {
+		return func() int64 { return c.committedEndFn(channel) }
 	}
-	return func() int64 { return c.committedEndFn(channel) }
+	// No owner supplied one. Readers must still be bounded — an absent bound is
+	// not "read everything", it is "read nothing" — so fall back to deriving it
+	// from disk. That costs a tail read per scan, which is why a messenger
+	// supplies its in-memory value instead.
+	channelDir := c.layout.ChannelDir(channel)
+	return func() int64 {
+		end, err := storage.ChannelCommittedEnd(channelDir)
+		if err != nil {
+			return 0
+		}
+		return end
+	}
 }
 
 // NotifyChannel wakes the channelReader for channel, if this client has one.

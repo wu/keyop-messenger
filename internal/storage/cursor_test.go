@@ -21,6 +21,19 @@ func writeCursorSegment(t *testing.T, channelDir string, startOffset int64, data
 		filepath.Join(channelDir, segmentName(startOffset)), []byte(data), 0o600))
 }
 
+// committedAll bounds a cursor at the channel's current stream end — correct for
+// a fixture written in one go, where every byte on disk is a complete record.
+// Tests that care about the bound itself supply their own.
+func committedAll(channelDir string) func() int64 {
+	return func() int64 {
+		end, err := ChannelStreamEnd(channelDir)
+		if err != nil {
+			return 0
+		}
+		return end
+	}
+}
+
 // drainCursor collects every record the cursor yields in one pass.
 func drainCursor(t *testing.T, c *Cursor, from int64) []Record {
 	t.Helper()
@@ -55,7 +68,7 @@ func TestCursor_ReadsCompleteRecords(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\nbb\ncccc\n")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	recs := drainCursor(t, c, 0)
@@ -74,7 +87,7 @@ func TestCursor_PartialTailIsNotARecord(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\npart")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	recs := drainCursor(t, c, 0)
@@ -92,7 +105,7 @@ func TestCursor_ResumesFromOffset(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\nbbb\nccc\n")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	assert.Equal(t, []string{"bbb", "ccc"}, recordBodies(drainCursor(t, c, 4)))
@@ -106,7 +119,7 @@ func TestCursor_SkipsGapBetweenSegments(t *testing.T) {
 	writeCursorSegment(t, dir, 0, "aaa\n")
 	writeCursorSegment(t, dir, 100, "bbb\n") // gap: 4..100
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	recs := drainCursor(t, c, 0)
@@ -121,7 +134,7 @@ func TestCursor_StartsInLaterSegment(t *testing.T) {
 	writeCursorSegment(t, dir, 0, "aaa\n")
 	writeCursorSegment(t, dir, 4, "bbb\nccc\n")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	assert.Equal(t, []string{"ccc"}, recordBodies(drainCursor(t, c, 8)))
@@ -136,7 +149,7 @@ func TestCursor_SkipsOversizedRecord(t *testing.T) {
 	writeCursorSegment(t, dir, 0, "aaa\n"+big+"\nbbb\n")
 
 	var skips []SkipInfo
-	c := NewCursor(dir, CursorOpts{
+	c := NewCursor(dir, committedAll(dir), CursorOpts{
 		MaxRecordBytes: 16,
 		OnSkip:         func(s SkipInfo) { skips = append(skips, s) },
 	})
@@ -159,7 +172,7 @@ func TestCursor_SkipsUnscannableRecord(t *testing.T) {
 	writeCursorSegment(t, dir, 0, "aaa\n"+huge+"\nbbb\n")
 
 	var skips []SkipInfo
-	c := NewCursor(dir, CursorOpts{
+	c := NewCursor(dir, committedAll(dir), CursorOpts{
 		ScanLimit:      64,
 		InitialBufSize: 16,
 		OnSkip:         func(s SkipInfo) { skips = append(skips, s) },
@@ -183,7 +196,7 @@ func TestCursor_UnscannableWithoutNewlineHolds(t *testing.T) {
 	writeCursorSegment(t, dir, 0, "aaa\n"+strings.Repeat("x", 4096))
 
 	var skips []SkipInfo
-	c := NewCursor(dir, CursorOpts{
+	c := NewCursor(dir, committedAll(dir), CursorOpts{
 		ScanLimit:      64,
 		InitialBufSize: 16,
 		OnSkip:         func(s SkipInfo) { skips = append(skips, s) },
@@ -204,7 +217,7 @@ func TestCursor_BoundedByCommittedEnd(t *testing.T) {
 
 	var end atomic.Int64
 	end.Store(4)
-	c := NewCursor(dir, CursorOpts{CommittedEnd: end.Load})
+	c := NewCursor(dir, end.Load, CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	assert.Equal(t, []string{"aaa"}, recordBodies(drainCursor(t, c, 0)))
@@ -224,34 +237,40 @@ func TestCursor_CommittedEndBoundsAcrossSegments(t *testing.T) {
 
 	var end atomic.Int64
 	end.Store(8) // through "bbb" only
-	c := NewCursor(dir, CursorOpts{CommittedEnd: end.Load})
+	c := NewCursor(dir, end.Load, CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
 	assert.Equal(t, []string{"aaa", "bbb"}, recordBodies(drainCursor(t, c, 0)))
 	assert.Equal(t, int64(8), c.Offset(), "must not read into the next segment past the bound")
 }
 
-func TestCursor_UnknownCommittedEndReadsToEOF(t *testing.T) {
+// TestCursor_NothingCommittedYieldsNothing pins the contract that replaced the
+// old "unknown committed end → read to EOF" fallback. A channel with nothing
+// committed is not a special case needing a fallback: there is nothing its
+// readers may see, and saying so is the whole point of the bound.
+func TestCursor_NothingCommittedYieldsNothing(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\nbbb\n")
 
-	c := NewCursor(dir, CursorOpts{CommittedEnd: func() int64 { return 0 }})
+	c := NewCursor(dir, func() int64 { return 0 }, CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
-	assert.Equal(t, []string{"aaa", "bbb"}, recordBodies(drainCursor(t, c, 0)),
-		"an unknown committed end must not bound the scan")
+	assert.Empty(t, drainCursor(t, c, 0),
+		"records on disk are not readable until the writer commits them")
+	assert.Equal(t, int64(0), c.Offset(), "and the position does not move")
 }
 
 func TestCursor_EmptyAndMissingChannel(t *testing.T) {
 	t.Parallel()
-	missing := NewCursor(filepath.Join(t.TempDir(), "absent"), CursorOpts{})
+	missingDir := filepath.Join(t.TempDir(), "absent")
+	missing := NewCursor(missingDir, committedAll(missingDir), CursorOpts{})
 	t.Cleanup(func() { _ = missing.Close() })
 	assert.Empty(t, drainCursor(t, missing, 0))
 
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "")
-	empty := NewCursor(dir, CursorOpts{})
+	empty := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = empty.Close() })
 	assert.Empty(t, drainCursor(t, empty, 0))
 }
@@ -262,7 +281,7 @@ func TestCursor_ReusesScanBuffer(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\nbbb\n")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 	drainCursor(t, c, 0) // first pass allocates nothing extra to measure
 
@@ -291,7 +310,7 @@ func TestCursor_NextDoesNotAllocatePerRecord(t *testing.T) {
 	}
 	writeCursorSegment(t, dir, 0, sb.String())
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 	require.NoError(t, c.Reset(0))
 	_, _, err := c.Next() // open the segment outside the measured loop
@@ -312,7 +331,7 @@ func TestCursor_ResetRelistsSegments(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\n")
 
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 	assert.Equal(t, []string{"aaa"}, recordBodies(drainCursor(t, c, 0)))
 
@@ -325,7 +344,7 @@ func TestCursor_ReportsScanError(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\n")
-	c := NewCursor(dir, CursorOpts{})
+	c := NewCursor(dir, committedAll(dir), CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 	require.NoError(t, c.Reset(0))
 
@@ -344,13 +363,13 @@ func TestCursor_ReportsScanError(t *testing.T) {
 
 func TestCursor_OptionDefaults(t *testing.T) {
 	t.Parallel()
-	c := NewCursor("dir", CursorOpts{})
+	c := NewCursor("dir", nil, CursorOpts{})
 	assert.Equal(t, defaultScanLimit, c.opts.ScanLimit)
 	assert.Equal(t, defaultScanInitialBufSize, c.opts.InitialBufSize)
 
 	// An initial buffer larger than the ceiling would make Scanner's effective
 	// maximum the buffer size, silently raising the limit.
-	c = NewCursor("dir", CursorOpts{ScanLimit: 100, InitialBufSize: 1000})
+	c = NewCursor("dir", nil, CursorOpts{ScanLimit: 100, InitialBufSize: 1000})
 	assert.Equal(t, 100, c.opts.InitialBufSize)
 	assert.Len(t, c.buf, 100)
 }

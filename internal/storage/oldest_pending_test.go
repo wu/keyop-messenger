@@ -25,13 +25,13 @@ func TestOldestPendingTimestamp(t *testing.T) {
 	writeTestEnvelope(t, channelDir, makeEnvAt(t, "events", t2, map[string]any{"v": 2}))
 
 	// At offset 0 the oldest pending record is the first envelope.
-	ts, ok, err := OldestPendingTimestamp(channelDir, 0)
+	ts, ok, err := OldestPendingTimestamp(channelDir, 0, committedAll(channelDir)())
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.True(t, ts.Equal(t1), "want %v, got %v", t1, ts)
 
 	// At the start of the second record the oldest pending is the second envelope.
-	ts, ok, err = OldestPendingTimestamp(channelDir, n1)
+	ts, ok, err = OldestPendingTimestamp(channelDir, n1, committedAll(channelDir)())
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.True(t, ts.Equal(t2), "want %v, got %v", t2, ts)
@@ -39,7 +39,7 @@ func TestOldestPendingTimestamp(t *testing.T) {
 	// At stream end there is nothing pending.
 	end, err := ChannelStreamEnd(channelDir)
 	require.NoError(t, err)
-	_, ok, err = OldestPendingTimestamp(channelDir, end)
+	_, ok, err = OldestPendingTimestamp(channelDir, end, committedAll(channelDir)())
 	require.NoError(t, err)
 	assert.False(t, ok, "caught-up offset should report no pending record")
 }
@@ -48,7 +48,7 @@ func TestOldestPendingTimestamp(t *testing.T) {
 // reports no pending record rather than erroring.
 func TestOldestPendingTimestamp_EmptyChannel(t *testing.T) {
 	dir := t.TempDir()
-	_, ok, err := OldestPendingTimestamp(filepath.Join(dir, "nope"), 0)
+	_, ok, err := OldestPendingTimestamp(filepath.Join(dir, "nope"), 0, 0)
 	require.NoError(t, err)
 	assert.False(t, ok)
 }

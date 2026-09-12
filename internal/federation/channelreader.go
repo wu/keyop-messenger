@@ -140,10 +140,9 @@ func newChannelReader(
 	// The cursor owns framing for this reader: the per-record cap is what a gRPC
 	// frame can carry, and the scan ceiling sits above it so a record that is too
 	// big to send can still be read far enough to be stepped over.
-	cursor := storage.NewCursor(channelDir, storage.CursorOpts{
+	cursor := storage.NewCursor(channelDir, committedEndFn, storage.CursorOpts{
 		MaxRecordBytes: maxRecordBytes,
 		ScanLimit:      grpcMessageLimit(maxBatchBytes),
-		CommittedEnd:   committedEndFn,
 	})
 
 	cr := &channelReader{

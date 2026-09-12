@@ -106,7 +106,7 @@ func newTestSub(
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
-	sub, err := NewSubscriber(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, log, 0)
+	sub, err := NewSubscriber(id, channelDir, offsetDir, mapDecoder{}, maxRetries, dlWriter, committedAll(channelDir), log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 	return sub, notifyC, dlWriter
@@ -398,7 +398,7 @@ func TestSubscriber_RetryLater_PausesAndResumes(t *testing.T) {
 	// message from the unadvanced offset.
 	notifier := NewLocalNotifier()
 	dlWriter := &testutil.FakeChannelWriter{}
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 3, dlWriter, &testutil.FakeLogger{}, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 3, dlWriter, committedAll(channelDir), &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -527,7 +527,7 @@ func TestSubscriber_StartupMaxAge_SkipsStaleBacklog(t *testing.T) {
 	notifyC, err := watcher.Watch(channelDir)
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, &testutil.FakeLogger{}, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, committedAll(channelDir), &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 	sub.SetMaxAge(time.Hour) // skip anything older than 1h on startup
 	sub.retryDelay = func(int) time.Duration { return 0 }
@@ -570,7 +570,7 @@ func TestSubscriber_PanicRecovery(t *testing.T) {
 	// Use a LocalNotifier so we can push a notification after writing the second message.
 	notifier := NewLocalNotifier()
 	dlWriter := &testutil.FakeChannelWriter{}
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, &testutil.FakeLogger{}, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, committedAll(channelDir), &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -605,7 +605,7 @@ func TestSubscriber_DeadLetterChannel_NoRecursion(t *testing.T) {
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, committedAll(channelDir), log, 0)
 	require.NoError(t, err)
 
 	writeTestEnvelope(t, channelDir, makeEnv(t, "orders.dead-letter", map[string]string{"k": "v"}))
@@ -741,7 +741,7 @@ func TestSubscriber_RetryBackoff(t *testing.T) {
 	require.NoError(t, err)
 	dlWriter := &testutil.FakeChannelWriter{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, &testutil.FakeLogger{}, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 2, dlWriter, committedAll(channelDir), &testutil.FakeLogger{}, 0)
 	require.NoError(t, err)
 
 	const minDelay = 20 * time.Millisecond
@@ -787,7 +787,7 @@ func TestSubscriber_DeadLetter_WriterError(t *testing.T) {
 	dlWriter.SetError(fmt.Errorf("dead-letter storage unavailable"))
 
 	log := &testutil.FakeLogger{}
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, log, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0, dlWriter, committedAll(channelDir), log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -831,7 +831,7 @@ func TestSubscriber_OffsetWriteFailure_ProbeSucceeds(t *testing.T) {
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, committedAll(channelDir), log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -889,7 +889,7 @@ func TestSubscriber_OffsetWriteFailure_PausesAndResumes(t *testing.T) {
 	dlWriter := &testutil.FakeChannelWriter{}
 	log := &testutil.FakeLogger{}
 
-	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, log, 0)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 1, dlWriter, committedAll(channelDir), log, 0)
 	require.NoError(t, err)
 	sub.retryDelay = func(int) time.Duration { return 0 }
 
@@ -1144,18 +1144,24 @@ func TestSubscriber_BoundedByCommittedEnd(t *testing.T) {
 	offsetDir := filepath.Join(dir, "offsets")
 	require.NoError(t, os.MkdirAll(channelDir, 0o750))
 
-	// The subscriber must exist before the records are written, or it starts at
-	// the stream end and has nothing to read.
-	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 0)
+	// The bound is supplied at construction, so the subscriber must exist before
+	// the records are written — which is also what keeps it from starting at the
+	// stream end with nothing to read.
+	var end atomic.Int64
+	watcher := &testutil.FakeChannelWatcher{}
+	notifyC, err := watcher.Watch(channelDir)
+	require.NoError(t, err)
+	sub, err := NewSubscriber("s", channelDir, offsetDir, mapDecoder{}, 0,
+		&testutil.FakeChannelWriter{}, end.Load, &testutil.FakeLogger{}, 0)
+	require.NoError(t, err)
+	sub.retryDelay = func(int) time.Duration { return 0 }
 
 	env1 := makeEnv(t, "ch", map[string]any{"n": 1})
 	env2 := makeEnv(t, "ch", map[string]any{"n": 2})
 	n1 := writeTestEnvelope(t, channelDir, env1)
 	n2 := writeTestEnvelope(t, channelDir, env2)
 
-	var end atomic.Int64
 	end.Store(n1) // only the first record is committed
-	sub.SetCommittedEnd(end.Load)
 
 	got := make(chan string, 4)
 	sub.Start(notifyC, func(env *envelope.Envelope, _ any) error {
