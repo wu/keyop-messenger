@@ -2,7 +2,6 @@ package storage
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -27,30 +26,6 @@ import (
 // data behind the unadvanced offset. Unlike an ordinary handler error, it is
 // not counted against the retry budget.
 var ErrRetryLater = errors.New("transient downstream failure; retry later")
-
-// scanCompleteLines is like bufio.ScanLines but never returns a partial line
-// at EOF. ScanLines's behaviour of emitting an unterminated final token is a
-// feature for text-file consumers and a bug for a streaming append-only log:
-// when the subscriber races a concurrent writer, Linux's regular-file read
-// can observe an extended i_size before the page cache is fully populated,
-// yielding bytes that lack the trailing newline. With ScanLines, those bytes
-// get dispatched as a "line", fail unmarshal, and the subscriber advances
-// past them — losing the real message that the writer is mid-flight on.
-// scanCompleteLines instead stalls until the newline arrives, which the next
-// poll or notify will surface.
-func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
-	}
-	if i := bytes.IndexByte(data, '\n'); i >= 0 {
-		return i + 1, data[0:i], nil
-	}
-	// No newline. Wait for more data even at EOF — partial bytes here are an
-	// in-flight write, not a truly unterminated final line. The subscriber's
-	// next processAvailable will re-read from the same offset and pick up the
-	// complete line.
-	return 0, nil, nil
-}
 
 // Default exponential-backoff parameters used between handler retry attempts
 // when the messenger does not configure them explicitly.
@@ -532,7 +507,6 @@ func firstOffsetAtOrAfter(seg segmentInfo, from int64, cutoff time.Time, committ
 	}
 	scanner := bufio.NewScanner(&io.LimitedReader{R: f, N: committedEnd - from})
 	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
-	scanner.Split(scanCompleteLines)
 
 	pos := from
 	for scanner.Scan() {
@@ -589,7 +563,6 @@ func readTimestampAt(seg segmentInfo, offset, committedEnd int64) (time.Time, bo
 	}
 	scanner := bufio.NewScanner(&io.LimitedReader{R: f, N: committedEnd - offset})
 	scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
-	scanner.Split(scanCompleteLines)
 	if scanner.Scan() {
 		env, uerr := envelope.Unmarshal(scanner.Bytes())
 		if uerr != nil {

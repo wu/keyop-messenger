@@ -291,10 +291,14 @@ func (c *Cursor) openAtOffset() (bool, error) {
 			return false, fmt.Errorf("seek segment %q to %d: %w", seg.path, c.offset, err)
 		}
 
+		// The read region is [offset, committedEnd), and both ends are record
+		// boundaries: the offset advances only by whole records, and the committed
+		// end is only ever set one byte past a '\n'. So the last token always ends
+		// with its newline and the stdlib split function cannot emit a partial
+		// record — there is no in-flight write inside the region to emit.
 		c.limitReader = io.LimitedReader{R: f, N: limit}
 		scanner := bufio.NewScanner(&c.limitReader)
 		scanner.Buffer(c.buf, c.opts.ScanLimit)
-		scanner.Split(scanCompleteLines)
 
 		c.file, c.scanner, c.segPath = f, scanner, seg.path
 		c.segStart, c.segEnd = seg.startOffset, seg.startOffset+seg.size

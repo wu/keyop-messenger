@@ -79,25 +79,30 @@ func TestCursor_ReadsCompleteRecords(t *testing.T) {
 	assert.Equal(t, int64(12), c.Offset())
 }
 
-// TestCursor_PartialTailIsNotARecord is the invariant the 2026-09-11 incident
-// came down to: the bytes past the last newline belong to a record the writer is
-// still appending, and consuming them loses that record and mis-frames the rest.
-func TestCursor_PartialTailIsNotARecord(t *testing.T) {
+// TestCursor_InFlightRecordIsUnreachable is what replaced the partial-tail
+// guard. The 2026-09-11 incident was a reader consuming the bytes of a record
+// the writer had not finished; the fix then was to refuse to emit an
+// unterminated token. The stronger property now is that those bytes are outside
+// the readable region entirely — the committed end sits on the last complete
+// record, so a scan cannot reach an in-flight write to mis-frame it.
+func TestCursor_InFlightRecordIsUnreachable(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "ch")
 	writeCursorSegment(t, dir, 0, "aaa\npart")
 
-	c := NewCursor(dir, committedAll(dir), CursorOpts{})
+	// The writer has committed only the first record; "part" is in flight.
+	var end atomic.Int64
+	end.Store(4)
+	c := NewCursor(dir, end.Load, CursorOpts{})
 	t.Cleanup(func() { _ = c.Close() })
 
-	recs := drainCursor(t, c, 0)
-	assert.Equal(t, []string{"aaa"}, recordBodies(recs))
+	assert.Equal(t, []string{"aaa"}, recordBodies(drainCursor(t, c, 0)))
 	assert.Equal(t, int64(4), c.Offset(), "position holds at the record boundary")
 
-	// The writer finishes the record; it is delivered whole on the next pass.
+	// The writer finishes the record and commits it; it is delivered whole.
 	writeCursorSegment(t, dir, 0, "aaa\npartial\n")
-	recs = drainCursor(t, c, 4)
-	assert.Equal(t, []string{"partial"}, recordBodies(recs))
+	end.Store(12)
+	assert.Equal(t, []string{"partial"}, recordBodies(drainCursor(t, c, 4)))
 }
 
 func TestCursor_ResumesFromOffset(t *testing.T) {
