@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -154,6 +155,29 @@ func Unmarshal(data []byte) (Envelope, error) {
 		return env, fmt.Errorf("%w: %d", ErrUnknownVersion, env.V)
 	}
 	return env, nil
+}
+
+// DefaultPreviewBytes is the number of leading bytes Preview keeps when the
+// caller does not specify a limit.
+const DefaultPreviewBytes = 256
+
+// Preview renders up to maxBytes of a raw record for diagnostic logging. The
+// bytes are Go-quoted so control characters, newlines and invalid UTF-8 are
+// escaped instead of corrupting the log line, and truncation is reported with
+// the number of omitted bytes. Pass maxBytes <= 0 for DefaultPreviewBytes.
+//
+// Always log a preview alongside an Unmarshal failure: the error text alone
+// ("unexpected end of JSON input", "invalid character 'a' ...") cannot
+// distinguish a truncated in-flight write from a mid-record offset or from
+// genuine on-disk corruption, but the bytes can.
+func Preview(data []byte, maxBytes int) string {
+	if maxBytes <= 0 {
+		maxBytes = DefaultPreviewBytes
+	}
+	if len(data) <= maxBytes {
+		return strconv.Quote(string(data))
+	}
+	return fmt.Sprintf("%s...(+%d more bytes)", strconv.Quote(string(data[:maxBytes])), len(data)-maxBytes)
 }
 
 // NewEnvelope constructs a ready-to-publish Envelope. It generates a UUID v7

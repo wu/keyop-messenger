@@ -52,6 +52,17 @@ func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err 
 	return 0, nil, nil
 }
 
+// ScanCompleteLines is scanCompleteLines exported for readers outside this
+// package that tail the same append-only segment files (the federation
+// channelReader). Every such reader must use it as its bufio.Scanner split
+// function: the stdlib bufio.ScanLines hands back an in-flight partial write as
+// if it were a complete record, which makes the reader log an unmarshal failure
+// and advance its offset into the middle of the record the writer is still
+// flushing — losing that message and then mis-framing every record after it.
+func ScanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	return scanCompleteLines(data, atEOF)
+}
+
 // Default exponential-backoff parameters used between handler retry attempts
 // when the messenger does not configure them explicitly.
 const (
@@ -660,8 +671,16 @@ func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset in
 
 			env, err := envelope.Unmarshal(line)
 			if err != nil {
+				// The record is dropped here, so log everything needed to find and
+				// inspect it after the fact: the segment file, the byte range it
+				// occupied, and a quoted preview of the bytes. The json error on
+				// its own cannot tell corruption apart from a mis-framed offset.
 				s.unmarshalSkipped.Add(1)
-				s.log.Error("unmarshal envelope", "err", err, "line_len", len(line), "next_offset", nextOffset)
+				s.log.Error("unmarshal envelope",
+					"subscriber", s.id, "path", seg.path, "seg_start", seg.startOffset,
+					"offset", offset, "next_offset", nextOffset,
+					"line_len", len(line), "record", envelope.Preview(line, 0),
+					"err", err)
 				s.advanceOffset(nextOffset)
 				offset = nextOffset
 				continue

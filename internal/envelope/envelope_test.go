@@ -3,6 +3,7 @@ package envelope
 import (
 	"encoding/json"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -241,4 +242,33 @@ func TestRoute_SurvivesRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, le.Route)
 	assert.False(t, le.RouteContains("anyone"))
+}
+
+// TestPreview covers the diagnostic rendering used when a record fails to
+// unmarshal: short records are quoted whole, long ones are truncated with the
+// omitted byte count, and control/invalid bytes are escaped so a corrupt record
+// cannot break the log line it is written to.
+func TestPreview(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		data     []byte
+		maxBytes int
+		want     string
+	}{
+		{"empty", []byte(""), 0, `""`},
+		{"short", []byte(`{"v":1}`), 0, `"{\"v\":1}"`},
+		{"truncated", []byte("abcdef"), 3, `"abc"...(+3 more bytes)`},
+		{"exact limit", []byte("abc"), 3, `"abc"`},
+		{"escapes newline", []byte("a\nb"), 0, `"a\nb"`},
+		{"escapes invalid utf8", []byte{0xff, 0xfe}, 0, `"\xff\xfe"`},
+		{"negative max uses default", make([]byte, DefaultPreviewBytes+1), -1,
+			strconv.Quote(string(make([]byte, DefaultPreviewBytes))) + "...(+1 more bytes)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, Preview(tc.data, tc.maxBytes))
+		})
+	}
 }

@@ -651,3 +651,129 @@ func TestChannelReader_ConcurrentNotify(t *testing.T) {
 		}
 	}
 }
+
+// TestChannelReader_PartialTailNotConsumed reproduces the corrupt-record report
+// from a live channel: the reader tails a segment the writer is still appending
+// to, so the bytes past the last newline are half of a record in flight. With
+// bufio.ScanLines those bytes were returned as a complete record — the reader
+// logged "unmarshal corrupt record" ("unexpected end of JSON input"), advanced
+// its offset past them, and then resumed reading from the middle of the record
+// the writer had since finished, producing a second unmarshal error ("invalid
+// character ... looking for beginning of value") and losing the message.
+//
+// The reader must instead stall at the record boundary and deliver the record
+// once its newline lands.
+func TestChannelReader_PartialTailNotConsumed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "metrics")
+	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
+	require.NoError(t, err)
+
+	// One complete record followed by an in-flight partial write (no newline).
+	complete := makeEnvelope(t, "metrics", "complete")
+	inflight := makeEnvelope(t, "metrics", "inflight")
+	completeBytes, err := envelope.Marshal(complete)
+	require.NoError(t, err)
+	inflightBytes, err := envelope.Marshal(inflight)
+	require.NoError(t, err)
+	half := len(inflightBytes) / 2
+
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	segPath := filepath.Join(channelDir, fmt.Sprintf("%020d.jsonl", 0))
+	var buf []byte
+	buf = append(buf, completeBytes...)
+	buf = append(buf, '\n')
+	buf = append(buf, inflightBytes[:half]...)
+	require.NoError(t, os.WriteFile(segPath, buf, 0o600))
+	boundary := int64(len(completeBytes) + 1)
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	// Only the complete record may be delivered, and the offset must stop at the
+	// record boundary rather than running into the partial tail.
+	select {
+	case req := <-requestCh:
+		require.Len(t, req.rawLines, 1, "only the newline-terminated record is deliverable")
+		assert.Equal(t, boundary, req.newOffset, "offset must stop at the record boundary")
+		close(req.doneCh)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the first batch")
+	}
+	assert.False(t, log.HasError("unmarshal corrupt record"),
+		"an in-flight partial write is not a corrupt record")
+
+	// The writer finishes the record; the reader must now deliver it intact.
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test-constructed temp path
+	require.NoError(t, err)
+	_, err = f.Write(append(inflightBytes[half:], '\n'))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	total := boundary + int64(len(inflightBytes)+1)
+
+	cr.notify()
+	select {
+	case req := <-requestCh:
+		require.Len(t, req.rawLines, 1)
+		assert.Equal(t, inflightBytes, req.rawLines[0], "the completed record is delivered intact")
+		assert.Equal(t, total, req.newOffset)
+		close(req.doneCh)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the completed record")
+	}
+	assert.False(t, log.HasError("unmarshal corrupt record"))
+}
+
+// TestChannelReader_CorruptRecordLogsDiagnostics verifies that a genuinely
+// corrupt (newline-terminated, non-JSON) record is skipped with enough context
+// in the log to locate and inspect it: channel, peer, segment file, byte offset
+// and a preview of the bytes.
+func TestChannelReader_CorruptRecordLogsDiagnostics(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "metrics")
+	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	log := &testutil.FakeLogger{}
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
+	require.NoError(t, err)
+
+	good := makeEnvelope(t, "metrics", "good")
+	goodBytes, err := envelope.Marshal(good)
+	require.NoError(t, err)
+
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	segPath := filepath.Join(channelDir, fmt.Sprintf("%020d.jsonl", 0))
+	garbage := []byte(`abc-not-json`)
+	var buf []byte
+	buf = append(buf, garbage...)
+	buf = append(buf, '\n')
+	buf = append(buf, goodBytes...)
+	buf = append(buf, '\n')
+	require.NoError(t, os.WriteFile(segPath, buf, 0o600))
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	delivered := drainUntilOffset(t, requestCh, int64(len(buf)))
+	assert.Equal(t, 1, delivered, "the good record is still delivered")
+
+	require.True(t, log.HasError("unmarshal corrupt record"), "corruption must be logged")
+	var entry string
+	for _, e := range log.Entries() {
+		if strings.Contains(e, "unmarshal corrupt record") {
+			entry = e
+		}
+	}
+	for _, want := range []string{"metrics", "peer1", segPath, "abc-not-json", "record_len"} {
+		assert.Contains(t, entry, want, "corrupt-record log must carry %q", want)
+	}
+}

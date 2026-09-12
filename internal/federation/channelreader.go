@@ -291,7 +291,8 @@ func (cr *channelReader) drainAndSend() {
 func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMore bool, ok bool) {
 	segs, err := listChannelSegments(cr.channelDir)
 	if err != nil {
-		cr.log.Error("channelReader: list segments", "channel", cr.channel, "err", err)
+		cr.log.Error("channelReader: list segments",
+			"channel", cr.channel, "peer", cr.peerName, "dir", cr.channelDir, "err", err)
 		return nil, cr.offset, false, false
 	}
 
@@ -314,7 +315,9 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 
 		f, err := os.Open(seg.path)
 		if err != nil {
-			cr.log.Error("channelReader: open segment", "path", seg.path, "err", err)
+			cr.log.Error("channelReader: open segment",
+				"channel", cr.channel, "peer", cr.peerName, "path", seg.path,
+				"offset", cr.offset, "err", err)
 			return nil, cr.offset, false, false
 		}
 
@@ -324,7 +327,9 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 			lineOffset = seg.startOffset
 		}
 		if _, err := f.Seek(lineOffset-seg.startOffset, io.SeekStart); err != nil {
-			cr.log.Error("channelReader: seek", "path", seg.path, "err", err)
+			cr.log.Error("channelReader: seek",
+				"channel", cr.channel, "peer", cr.peerName, "path", seg.path,
+				"seg_start", seg.startOffset, "offset", lineOffset, "err", err)
 			_ = f.Close()
 			return nil, cr.offset, false, false
 		}
@@ -340,6 +345,13 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 		}
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, initBuf), maxLine)
+		// Never treat an unterminated tail as a record: this reader tails segment
+		// files while the writer is still appending to them, so the bytes past the
+		// last '\n' are an in-flight write, not a short final line. With the
+		// stdlib bufio.ScanLines those bytes would be handed back as a "record",
+		// fail to unmarshal, and the offset would advance into the middle of the
+		// record being written — losing it and mis-framing everything after it.
+		scanner.Split(storage.ScanCompleteLines)
 
 		for scanner.Scan() {
 			line := scanner.Bytes()
@@ -364,11 +376,19 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 				return rawLines, newOffset, true, true
 			}
 
-			// Validate: skip corrupt records but still advance the offset.
+			// Validate: skip corrupt records but still advance the offset. Log
+			// enough to locate and inspect the record afterwards — segment file,
+			// byte range, length and a quoted preview of the bytes — because the
+			// json error alone cannot distinguish on-disk corruption from a
+			// mis-framed offset, and the record is dropped for good below.
 			env, err := envelope.Unmarshal(line)
 			if err != nil {
 				cr.log.Error("channelReader: unmarshal corrupt record",
-					"channel", cr.channel, "err", err)
+					"channel", cr.channel, "peer", cr.peerName,
+					"segment", seg.path, "seg_start", seg.startOffset,
+					"offset", lineOffset, "next_offset", next,
+					"record_len", len(line), "record", envelope.Preview(line, 0),
+					"err", err)
 				lineOffset = next
 				newOffset = next
 				continue
@@ -402,7 +422,8 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 				_ = f.Close()
 				if serr != nil {
 					cr.log.Error("channelReader: locate oversized record end",
-						"channel", cr.channel, "err", serr)
+						"channel", cr.channel, "peer", cr.peerName, "path", seg.path,
+						"offset", lineOffset, "err", serr)
 					return rawLines, newOffset, len(rawLines) > 0, true
 				}
 				if !found {
@@ -417,7 +438,9 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 				// Loop again from the advanced offset to pick up later records.
 				return rawLines, newOffset, true, true
 			}
-			cr.log.Error("channelReader: scan", "path", seg.path, "err", scanErr)
+			cr.log.Error("channelReader: scan",
+				"channel", cr.channel, "peer", cr.peerName, "path", seg.path,
+				"offset", lineOffset, "err", scanErr)
 		}
 		_ = f.Close()
 

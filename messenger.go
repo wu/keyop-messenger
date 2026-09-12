@@ -127,8 +127,10 @@ type Message struct {
 	CorrelationID string
 	// ServiceName is the name of the service that published this message.
 	ServiceName string
-	// Payload is the decoded payload. Its concrete type is the prototype
-	// registered via RegisterPayloadType, or map[string]any for unknown types.
+	// Payload is the decoded payload. Its concrete type is always the prototype
+	// registered via RegisterPayloadType, as a value (never a pointer, even when a
+	// pointer was registered). An unregistered payload type is not delivered at
+	// all: durable subscribers dead-letter it, ephemeral subscribers skip it.
 	Payload any
 	// Timestamp is the UTC time the message was published.
 	Timestamp time.Time
