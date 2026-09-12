@@ -945,3 +945,25 @@ func TestChannelReader_UnknownCommittedEndReadsToEOF(t *testing.T) {
 	delivered := drainUntilOffset(t, requestCh, int64(len(data)))
 	assert.Equal(t, 2, delivered, "an unknown committed end must not bound the scan")
 }
+
+// TestNewChannelReader_RejectsInvalidChannelName pins the last guard before
+// MkdirAll: whatever the callers filter, a reader is never constructed for a
+// name that cannot be a directory component, so no path can escape the data dir.
+func TestNewChannelReader_RejectsInvalidChannelName(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	layout := storage.NewLayout(dir)
+	requestCh := make(chan sendReq, 1)
+
+	for _, channel := range []string{"../../evil", "a/b", "", strings.Repeat("x", 256)} {
+		_, err := newChannelReader(layout, "peer1", channel, storage.OffsetPrefixFedIn,
+			65536, requestCh, nil, nil, &testutil.FakeLogger{})
+		require.Error(t, err, "channel %q must be rejected", channel)
+		assert.ErrorIs(t, err, storage.ErrInvalidChannelName)
+	}
+
+	// Nothing may have been created outside the channel and subscriber trees.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "a rejected channel must not create any directory")
+}

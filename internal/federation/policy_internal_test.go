@@ -142,3 +142,33 @@ func TestIntersectChannels(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveSubscribeChannels_RejectsPathTraversal covers the case where a
+// peer's Subscribe allowlist is unrestricted, so its requested channel list was
+// previously used verbatim. A channel name becomes a directory component under
+// the data directory, so an authenticated peer could otherwise have the hub
+// create directories and offset files outside it.
+func TestEffectiveSubscribeChannels_RejectsPathTraversal(t *testing.T) {
+	t.Parallel()
+	cfg := HubConfig{AllowedPeers: []AllowedPeer{{Name: "peer1"}}} // empty Subscribe = unrestricted
+
+	got := effectiveSubscribeChannels(
+		[]string{"metrics", "../../../etc/foo", "a/b", "", "events"}, "peer1", cfg)
+
+	assert.Equal(t, []string{"metrics", "events"}, got,
+		"only names usable as a directory component survive")
+}
+
+// TestEffectiveSubscribeChannels_RejectsPathTraversalWithAllowlist verifies the
+// same filtering applies on the intersecting path, in case an allowlist itself
+// carries an unusable name.
+func TestEffectiveSubscribeChannels_RejectsPathTraversalWithAllowlist(t *testing.T) {
+	t.Parallel()
+	cfg := HubConfig{AllowedPeers: []AllowedPeer{
+		{Name: "peer1", Subscribe: []string{"metrics", "../evil"}},
+	}}
+
+	got := effectiveSubscribeChannels([]string{"metrics", "../evil"}, "peer1", cfg)
+
+	assert.Equal(t, []string{"metrics"}, got)
+}

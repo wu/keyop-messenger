@@ -1,12 +1,41 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
+
+// ErrInvalidChannelName is returned by ValidateChannelName for a name that
+// cannot be used as a directory component.
+var ErrInvalidChannelName = errors.New("invalid channel name")
+
+var channelNameRE = regexp.MustCompile(`^[a-zA-Z0-9._\-]+$`)
+
+// ValidateChannelName returns a wrapped ErrInvalidChannelName if name is empty,
+// exceeds 255 bytes, or contains characters outside [a-zA-Z0-9._-].
+//
+// A channel name becomes a directory component under the data directory, so
+// this is a path-safety check as much as a naming rule: the character allowlist
+// excludes '/' and therefore "../.." traversal. It lives here, beside Layout,
+// because every caller that turns a name into a path must apply the same rule —
+// including internal/federation, which cannot import the root package.
+func ValidateChannelName(name string) error {
+	if name == "" {
+		return fmt.Errorf("%w: name must not be empty", ErrInvalidChannelName)
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("%w: name exceeds 255 bytes", ErrInvalidChannelName)
+	}
+	if !channelNameRE.MatchString(name) {
+		return fmt.Errorf("%w: %q contains characters outside [a-zA-Z0-9._-]", ErrInvalidChannelName, name)
+	}
+	return nil
+}
 
 // Offset-file prefixes. A plain subscriber offset has no prefix; federation
 // offsets are prefixed so the compactor can include every kind in its minimum

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,7 +34,7 @@ var (
 
 	// ErrInvalidChannelName is returned when a channel name is empty, exceeds
 	// 255 bytes, or contains characters outside [a-zA-Z0-9._-].
-	ErrInvalidChannelName = errors.New("invalid channel name")
+	ErrInvalidChannelName = storage.ErrInvalidChannelName
 
 	// ErrReservedChannelName is returned by Publish and PublishBatch when the
 	// target channel uses the reserved ".dead-letter" suffix. Dead-letter
@@ -71,22 +70,10 @@ const deadLetterSuffix = ".dead-letter"
 // oldest sealed segments. See channelRetention.
 const defaultDeadLetterRetention = 7 * 24 * time.Hour
 
-var channelNameRE = regexp.MustCompile(`^[a-zA-Z0-9._\-]+$`)
-
 // ValidateChannelName returns a wrapped ErrInvalidChannelName if name is empty,
-// exceeds 255 bytes, or contains characters outside [a-zA-Z0-9._-].
-func ValidateChannelName(name string) error {
-	if name == "" {
-		return fmt.Errorf("%w: name must not be empty", ErrInvalidChannelName)
-	}
-	if len(name) > 255 {
-		return fmt.Errorf("%w: name exceeds 255 bytes", ErrInvalidChannelName)
-	}
-	if !channelNameRE.MatchString(name) {
-		return fmt.Errorf("%w: %q contains characters outside [a-zA-Z0-9._-]", ErrInvalidChannelName, name)
-	}
-	return nil
-}
+// exceeds 255 bytes, or contains characters outside [a-zA-Z0-9._-]. The rule
+// lives in internal/storage, which owns the paths these names become.
+func ValidateChannelName(name string) error { return storage.ValidateChannelName(name) }
 
 // validateInboundChannel applies the same channel-name rules as Publish to a
 // channel name that arrived over federation. A federated envelope's Channel is

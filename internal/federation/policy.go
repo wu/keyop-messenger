@@ -1,6 +1,7 @@
 package federation
 
 import (
+	"github.com/wu/keyop-messenger/internal/storage"
 	"sync/atomic"
 )
 
@@ -81,14 +82,28 @@ func effectiveSubscribeChannels(requested []string, peerName string, cfg HubConf
 	for _, peer := range cfg.AllowedPeers {
 		if peer.Name == peerName {
 			if len(peer.Subscribe) == 0 {
-				out := make([]string, len(requested))
-				copy(out, requested)
-				return out
+				return validChannelNames(requested)
 			}
-			return intersectChannels(requested, peer.Subscribe)
+			return validChannelNames(intersectChannels(requested, peer.Subscribe))
 		}
 	}
 	return nil
+}
+
+// validChannelNames drops names that cannot be used as a directory component.
+// The requested list is peer-supplied and, for a peer with an unrestricted
+// Subscribe allowlist, is otherwise used verbatim — so without this a name like
+// "../../etc" would become a channel directory outside the data dir. Invalid
+// names are dropped rather than failing the whole subscription, matching how the
+// inbound publish path drops a bad channel and keeps the stream alive.
+func validChannelNames(channels []string) []string {
+	out := channels[:0:0]
+	for _, ch := range channels {
+		if storage.ValidateChannelName(ch) == nil {
+			out = append(out, ch)
+		}
+	}
+	return out
 }
 
 // publishChannelsFor returns the Publish allowlist for peerName.

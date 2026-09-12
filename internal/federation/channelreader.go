@@ -142,6 +142,15 @@ func newChannelReader(
 	committedEndFn func() int64,
 	log logger,
 ) (*channelReader, error) {
+	// channel reaches the filesystem as a directory component. On the hub side it
+	// is peer-supplied (a Subscribe request's channel list is returned verbatim
+	// when the peer's allowlist is unrestricted), so it is attacker-influenced
+	// data and is validated here as the last guard before MkdirAll. The callers
+	// filter invalid names out earlier; this makes it impossible to bypass.
+	if err := storage.ValidateChannelName(channel); err != nil {
+		return nil, fmt.Errorf("newChannelReader %s: %w", peerName, err)
+	}
+
 	channelDir := layout.ChannelDir(channel)
 	offsetDir := layout.OffsetDir(channel)
 	// #nosec G301 -- shared data directory; 0755 is appropriate
