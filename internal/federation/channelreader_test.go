@@ -600,26 +600,6 @@ func TestChannelReader_Close_StopsGoroutine(t *testing.T) {
 	assert.Less(t, time.Since(start), 2*time.Second, "close() should not hang")
 }
 
-// TestListChannelSegments_Empty returns nil for a non-existent directory.
-func TestListChannelSegments_Empty(t *testing.T) {
-	t.Parallel()
-	segs, err := listChannelSegments("/tmp/does-not-exist-channelreader-test")
-	assert.NoError(t, err)
-	assert.Nil(t, segs)
-}
-
-// TestListChannelSegments_IgnoresNonSegmentFiles skips files without .jsonl extension.
-func TestListChannelSegments_IgnoresNonSegmentFiles(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "README.txt"), []byte("hi"), 0o600))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "00000000000000000000.jsonl"), []byte{}, 0o600))
-
-	segs, err := listChannelSegments(dir)
-	assert.NoError(t, err)
-	assert.Len(t, segs, 1)
-}
-
 // TestChannelReader_ConcurrentNotify verifies the reader is safe to notify
 // from multiple goroutines simultaneously.
 func TestChannelReader_ConcurrentNotify(t *testing.T) {

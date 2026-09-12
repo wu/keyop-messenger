@@ -52,17 +52,6 @@ func scanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err 
 	return 0, nil, nil
 }
 
-// ScanCompleteLines is scanCompleteLines exported for readers outside this
-// package that tail the same append-only segment files (the federation
-// channelReader). Every such reader must use it as its bufio.Scanner split
-// function: the stdlib bufio.ScanLines hands back an in-flight partial write as
-// if it were a complete record, which makes the reader log an unmarshal failure
-// and advance its offset into the middle of the record the writer is still
-// flushing — losing that message and then mis-framing every record after it.
-func ScanCompleteLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	return scanCompleteLines(data, atEOF)
-}
-
 // Default exponential-backoff parameters used between handler retry attempts
 // when the messenger does not configure them explicitly.
 const (
@@ -142,10 +131,10 @@ type Subscriber struct {
 	// partial tail from being consumed.
 	committedEnd func() int64
 
-	// limitReader bounds a scan to the committed end. It is a reused field rather
-	// than an io.LimitReader call per pass: that allocates, and this is the
-	// delivery hot path. Only the subscriber goroutine touches it.
-	limitReader io.LimitedReader
+	// cursor frames records from the channel's segment files. It is owned by this
+	// subscriber and reused across passes: it holds the scan buffer, and
+	// allocating one of those per wake-up dominated this path's allocation.
+	cursor *Cursor
 
 	// retryDelay returns the backoff duration before retry attempt n (1-based).
 	// Defaults to defaultRetryDelay; tests may override to zero for speed.
@@ -308,9 +297,22 @@ func NewSubscriber(
 		retryDelay:    defaultRetryDelay,
 		writeOffsetFn: WriteOffset,
 		consumeWindow: latencyhist.NewWindow(),
+		// No per-record cap: a subscriber delivers whatever it can read, so only
+		// a record too large to scan at all is stepped over.
+		cursor: NewCursor(channelDir, CursorOpts{
+			ScanLimit:      maxLineSize,
+			InitialBufSize: scanInitialBufSize,
+		}),
 		handlerWindow: latencyhist.NewWindow(),
 	}
 	s.flushedOffset.Store(offset)
+	s.cursor.OnSkipFunc(func(info SkipInfo) {
+		s.oversizedSkipped.Add(1)
+		s.log.Error("record exceeds max line size; skipping",
+			"subscriber", s.id, "path", info.Segment, "offset", info.Offset,
+			"max_line_size", maxLineSize, "record_len", info.NextOffset-info.Offset)
+	})
+
 	return s, nil
 }
 
@@ -380,23 +382,9 @@ func (s *Subscriber) SetMaxAge(d time.Duration) { s.maxAge = d }
 
 // SetCommittedEnd supplies the channel's committed-end accessor. Must be called
 // before Start. See the committedEnd field.
-func (s *Subscriber) SetCommittedEnd(fn func() int64) { s.committedEnd = fn }
-
-// readLimit returns the number of bytes that may be read from offset: the
-// distance to the committed end, or -1 when it is unknown and the reader should
-// go to EOF. A zero return means nothing new is committed.
-func (s *Subscriber) readLimit(offset int64) int64 {
-	if s.committedEnd == nil {
-		return -1
-	}
-	end := s.committedEnd()
-	if end <= 0 {
-		return -1
-	}
-	if end <= offset {
-		return 0
-	}
-	return end - offset
+func (s *Subscriber) SetCommittedEnd(fn func() int64) {
+	s.committedEnd = fn
+	s.cursor.CommittedEndFunc(fn)
 }
 
 // SetRetryBackoff configures the exponential-backoff schedule applied between
@@ -410,6 +398,9 @@ func (s *Subscriber) SetRetryBackoff(base, maxDelay time.Duration) {
 
 func (s *Subscriber) run(notifyC <-chan struct{}, handler HandlerFunc) {
 	defer close(s.doneCh)
+	// The cursor is touched only by this goroutine, so it is closed here rather
+	// than in Stop, which may be called concurrently.
+	defer func() { _ = s.cursor.Close() }()
 	// On clean shutdown flush any in-memory offset that hasn't reached disk yet,
 	// so a restart doesn't needlessly replay already-delivered messages.
 	defer s.flushOnStop()
@@ -609,27 +600,27 @@ func readTimestampAt(seg segmentInfo, offset int64) (time.Time, bool, error) {
 // from the subscriber's current global offset and dispatches them.
 func (s *Subscriber) processAvailable(handler HandlerFunc) {
 	s.processCalls.Add(1)
-	segs, err := listSegments(s.channelDir)
-	if err != nil {
-		s.log.Error("list channel segments", "dir", s.channelDir, "err", err)
-		return
-	}
-	if len(segs) == 0 {
-		return
-	}
 
 	s.mu.Lock()
 	offset := s.offset
 	s.mu.Unlock()
 
+	if err := s.cursor.Reset(offset); err != nil {
+		s.log.Error("list channel segments", "dir", s.channelDir, "err", err)
+		return
+	}
+	earliest := s.cursor.EarliestOffset()
+	if earliest < 0 {
+		return // no segments yet
+	}
+
 	// If retention compaction deleted segments below our offset, the earliest
-	// surviving segment now starts past where we are. Fast-forward to its start
-	// to avoid a negative seek (which would wedge delivery) and report the gap of
-	// permanently-dropped messages.
-	if earliest := segs[0].startOffset; offset < earliest {
-		dropped := earliest - offset
+	// surviving segment now starts past where we are. Report the gap of
+	// permanently-dropped messages; the cursor steps forward to it regardless.
+	if offset < earliest {
 		s.log.Warn("subscriber offset undercut by retention compaction; skipping dropped messages",
-			"subscriber", s.id, "old_offset", offset, "new_offset", earliest, "dropped_bytes", dropped)
+			"subscriber", s.id, "old_offset", offset, "new_offset", earliest,
+			"dropped_bytes", earliest-offset)
 		s.compactionDrops.Add(1)
 		offset = earliest
 		s.advanceOffset(offset)
@@ -648,187 +639,76 @@ func (s *Subscriber) processAvailable(handler HandlerFunc) {
 		s.lastFlush = time.Now()
 	}
 
-	for i, seg := range segs {
-		segEnd := seg.startOffset + seg.size
-		if segEnd <= offset {
-			continue // subscriber is already past this entire segment
+	for {
+		rec, ok, err := s.cursor.Next()
+		if err != nil {
+			// Leave the offset unadvanced and retry on the next notify or poll
+			// rather than reading on past data we could not frame.
+			s.log.Error("read channel", "subscriber", s.id, "offset", offset, "err", err)
+			return
 		}
-
-		newOffset, stop := s.scanSegment(seg, handler, offset)
-		offset = newOffset
-		if stop {
+		if !ok {
+			// Trailing records the cursor stepped over are consumed, so record
+			// that progress; otherwise they would be rescanned on every wake-up.
+			if end := s.cursor.Offset(); end > offset {
+				s.advanceOffset(end)
+			}
 			return
 		}
 
-		// If there is a next segment, advance to its start offset. This handles
-		// the gap between a sealed segment's end and the next segment's start
-		// (in the normal case these are equal, so this is a no-op on offset).
-		if i+1 < len(segs) {
-			offset = segs[i+1].startOffset
+		// Records the cursor stepped over lie between offset and this one.
+		if rec.Offset > offset {
+			offset = rec.Offset
+			s.advanceOffset(offset)
 		}
-	}
-}
 
-// scanSegment reads and dispatches complete records from seg starting at the
-// subscriber's current global offset. It returns the updated offset and whether
-// delivery should halt for now (an ErrRetryLater pause, an unrecoverable read
-// error, or an in-flight partial write at the tail).
-//
-// A record larger than maxLineSize cannot be returned by the scanner, which
-// would otherwise wedge the subscriber on that offset forever. Such records are
-// skipped: the offset advances past them with an error log and the
-// oversizedSkipped counter is incremented, mirroring how unmarshal/decode
-// failures are skipped. Because a scanner is single-use after returning
-// ErrTooLong, the segment is re-opened to resume scanning past the skipped
-// record.
-func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset int64) (int64, bool) {
-	for {
-		f, err := os.Open(seg.path)
+		env, err := envelope.Unmarshal(rec.Bytes)
 		if err != nil {
-			s.log.Error("open segment", "path", seg.path, "err", err)
-			return offset, true
+			// The record is dropped here, so log everything needed to find and
+			// inspect it after the fact: the segment file, the byte range it
+			// occupied, and a quoted preview of the bytes. The json error on its
+			// own cannot tell corruption apart from a mis-framed offset.
+			s.unmarshalSkipped.Add(1)
+			s.log.Error("unmarshal envelope",
+				"subscriber", s.id, "path", rec.Segment,
+				"offset", rec.Offset, "next_offset", rec.NextOffset,
+				"line_len", len(rec.Bytes), "record", envelope.Preview(rec.Bytes, 0),
+				"err", err)
+			s.advanceOffset(rec.NextOffset)
+			offset = rec.NextOffset
+			continue
 		}
 
-		localOffset := offset - seg.startOffset
-		if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
-			s.log.Error("seek in segment", "path", seg.path, "local_offset", localOffset, "err", err)
-			_ = f.Close()
-			return offset, true
-		}
-
-		// Read no further than the committed end, so bytes of a record the writer
-		// is still appending are never in the buffer to begin with.
-		var src io.Reader = f
-		if limit := s.readLimit(offset); limit >= 0 {
-			if limit == 0 {
-				_ = f.Close()
-				return offset, false
-			}
-			s.limitReader = io.LimitedReader{R: f, N: limit}
-			src = &s.limitReader
-		}
-
-		scanner := bufio.NewScanner(src)
-		scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
-		scanner.Split(scanCompleteLines)
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			nextOffset := offset + int64(len(line)) + 1 // +1 for '\n'
-
-			env, err := envelope.Unmarshal(line)
-			if err != nil {
-				// The record is dropped here, so log everything needed to find and
-				// inspect it after the fact: the segment file, the byte range it
-				// occupied, and a quoted preview of the bytes. The json error on
-				// its own cannot tell corruption apart from a mis-framed offset.
-				s.unmarshalSkipped.Add(1)
-				s.log.Error("unmarshal envelope",
-					"subscriber", s.id, "path", seg.path, "seg_start", seg.startOffset,
-					"offset", offset, "next_offset", nextOffset,
-					"line_len", len(line), "record", envelope.Preview(line, 0),
-					"err", err)
-				s.advanceOffset(nextOffset)
-				offset = nextOffset
-				continue
-			}
-
-			payload, err := s.reg.Decode(env.PayloadType, env.Payload)
-			if err != nil {
-				// Undecodable payload (unregistered type or malformed JSON). Route
-				// it to the dead-letter queue instead of silently advancing past it,
-				// so a registration oversight or corrupt payload is recoverable
-				// rather than permanently lost. A message already on a dead-letter
-				// channel is only logged — re-dead-lettering would loop into
-				// channel.dead-letter.dead-letter.
-				s.decodeSkipped.Add(1)
-				if strings.HasSuffix(env.Channel, ".dead-letter") {
-					s.log.Error("dead-letter message failed to decode, skipping",
-						"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
-				} else {
-					s.log.Error("decode payload failed; dead-lettering",
-						"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
-					s.sendToDeadLetter(&env, err)
-				}
-				s.advanceOffset(nextOffset)
-				offset = nextOffset
-				continue
-			}
-
-			s.dispatched.Add(1)
-			if s.dispatch(handler, &env, payload, nextOffset) {
-				// Transient downstream failure (ErrRetryLater): leave the offset
-				// unadvanced and halt the batch. The next notify/poll re-reads
-				// from the same offset; the durable log buffers the backlog.
-				_ = f.Close()
-				return offset, true
-			}
-			offset = nextOffset
-		}
-		serr := scanner.Err()
-		_ = f.Close()
-
-		if serr == nil {
-			return offset, false
-		}
-		if !errors.Is(serr, bufio.ErrTooLong) {
-			s.log.Error("scan segment", "path", seg.path, "err", serr)
-			return offset, false
-		}
-
-		// The record at offset exceeds maxLineSize. Measure it by reading to the
-		// next newline so we can advance past it instead of stalling forever.
-		recLen, rerr := recordLenAt(seg.path, offset-seg.startOffset)
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				// The oversized record has no terminating newline yet: it is an
-				// in-flight write, not a complete poison record. Wait for the
-				// next poll rather than skipping a message mid-flight.
-				return offset, true
-			}
-			s.log.Error("measure oversized record; halting to avoid skipping data",
-				"subscriber", s.id, "path", seg.path, "offset", offset, "err", rerr)
-			return offset, true
-		}
-
-		s.oversizedSkipped.Add(1)
-		s.log.Error("record exceeds max line size; skipping",
-			"subscriber", s.id, "path", seg.path, "offset", offset,
-			"max_line_size", maxLineSize, "record_len", recLen)
-		offset += recLen
-		s.advanceOffset(offset)
-		// Loop: re-open the segment and resume scanning after the skipped record.
-	}
-}
-
-// recordLenAt returns the byte length, including the trailing newline, of the
-// record beginning at localOffset within the segment file. It is used to skip a
-// record too large for the scanner buffer. It returns io.EOF (with the bytes
-// read so far) when no terminating newline is present, which indicates an
-// in-flight write rather than a complete record.
-func recordLenAt(path string, localOffset int64) (int64, error) {
-	// #nosec G304 -- segment path is a trusted, library-constructed data file path
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = f.Close() }()
-	if _, err := f.Seek(localOffset, io.SeekStart); err != nil {
-		return 0, err
-	}
-	r := bufio.NewReader(f)
-	var n int64
-	for {
-		b, err := r.ReadByte()
+		payload, err := s.reg.Decode(env.PayloadType, env.Payload)
 		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return n, io.EOF
+			// Undecodable payload (unregistered type or malformed JSON). Route it
+			// to the dead-letter queue instead of silently advancing past it, so a
+			// registration oversight or corrupt payload is recoverable rather than
+			// permanently lost. A message already on a dead-letter channel is only
+			// logged — re-dead-lettering would loop into
+			// channel.dead-letter.dead-letter.
+			s.decodeSkipped.Add(1)
+			if strings.HasSuffix(env.Channel, ".dead-letter") {
+				s.log.Error("dead-letter message failed to decode, skipping",
+					"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
+			} else {
+				s.log.Error("decode payload failed; dead-lettering",
+					"channel", env.Channel, "type", env.PayloadType, "id", env.ID, "err", err)
+				s.sendToDeadLetter(&env, err)
 			}
-			return 0, err
+			s.advanceOffset(rec.NextOffset)
+			offset = rec.NextOffset
+			continue
 		}
-		n++
-		if b == '\n' {
-			return n, nil
+
+		s.dispatched.Add(1)
+		if s.dispatch(handler, &env, payload, rec.NextOffset) {
+			// Transient downstream failure (ErrRetryLater): leave the offset
+			// unadvanced and halt. The next notify/poll re-reads from the same
+			// offset; the durable log buffers the backlog.
+			return
 		}
+		offset = rec.NextOffset
 	}
 }
 

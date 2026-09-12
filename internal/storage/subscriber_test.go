@@ -164,7 +164,11 @@ func TestSubscriber_Offset(t *testing.T) {
 
 	streamEnd, err := ChannelStreamEnd(channelDir)
 	require.NoError(t, err)
-	assert.Equal(t, streamEnd, sub.Offset(), "offset should match stream end after full delivery")
+	// The offset advances after the handler returns, so observing the last
+	// delivery does not mean it has been recorded yet. Poll rather than racing
+	// the subscriber goroutine.
+	require.Eventually(t, func() bool { return sub.Offset() == streamEnd }, testTimeout, time.Millisecond,
+		"offset should match stream end after full delivery, got %d want %d", sub.Offset(), streamEnd)
 }
 
 func TestSubscriber_HappyPath(t *testing.T) {
