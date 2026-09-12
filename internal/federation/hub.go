@@ -111,6 +111,11 @@ type Hub struct {
 	grpcSrv *grpc.Server
 	lis     net.Listener
 
+	// committedEndFn reports a channel's committed end, supplied by the owning
+	// messenger via SetCommittedEndFn. nil until set, and it returns 0 for a
+	// channel with no local writer yet; readers treat either as "unknown".
+	committedEndFn func(channel string) int64
+
 	// notifyMu protects notifyRegistry; use RLock for reads (NotifyChannel),
 	// Lock for writes (Subscribe handler register/deregister).
 	notifyMu       sync.RWMutex
@@ -272,6 +277,20 @@ func (h *Hub) Addr() string {
 		return ""
 	}
 	return h.lis.Addr().String()
+}
+
+// SetCommittedEndFn supplies the accessor readers use to bound their scans to
+// complete records. Call before Start; nil disables bounding, which falls back
+// to reading to EOF.
+func (h *Hub) SetCommittedEndFn(fn func(channel string) int64) { h.committedEndFn = fn }
+
+// channelCommittedEndFn binds committedEndFn to one channel for a reader, or
+// returns nil when no accessor was supplied.
+func (h *Hub) channelCommittedEndFn(channel string) func() int64 {
+	if h.committedEndFn == nil {
+		return nil
+	}
+	return func() int64 { return h.committedEndFn(channel) }
 }
 
 // NotifyChannel wakes all channelReader goroutines registered for channel.
@@ -626,7 +645,8 @@ func (h *Hub) buildChannelReaders(
 		// send-side by the reader.
 		destInstance := peerName
 		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fed-",
-			h.maxBatchBytes, placeholder, func() string { return destInstance }, h.log)
+			h.maxBatchBytes, placeholder, func() string { return destInstance },
+			h.channelCommittedEndFn(ch), h.log)
 		if err != nil {
 			return nil, fmt.Errorf("channel %q: %w", ch, err)
 		}

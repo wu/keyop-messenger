@@ -134,6 +134,19 @@ type Subscriber struct {
 	doneCh    chan struct{}
 	closeOnce sync.Once
 
+	// committedEnd reports the channel's committed end — the offset just past the
+	// last complete record its writer has written. Scans are bounded by it, so a
+	// record still being appended is never even read. nil, or a zero return,
+	// means "unknown" (no writer for this channel in this process yet) and the
+	// scan falls back to reading to EOF, where scanCompleteLines is what keeps a
+	// partial tail from being consumed.
+	committedEnd func() int64
+
+	// limitReader bounds a scan to the committed end. It is a reused field rather
+	// than an io.LimitReader call per pass: that allocates, and this is the
+	// delivery hot path. Only the subscriber goroutine touches it.
+	limitReader io.LimitedReader
+
 	// retryDelay returns the backoff duration before retry attempt n (1-based).
 	// Defaults to defaultRetryDelay; tests may override to zero for speed.
 	retryDelay func(attempt int) time.Duration
@@ -364,6 +377,27 @@ func (s *Subscriber) Stop() {
 // backlog. Filtering happens only at startup — steady-state messages are never
 // skipped. Must be called before Start.
 func (s *Subscriber) SetMaxAge(d time.Duration) { s.maxAge = d }
+
+// SetCommittedEnd supplies the channel's committed-end accessor. Must be called
+// before Start. See the committedEnd field.
+func (s *Subscriber) SetCommittedEnd(fn func() int64) { s.committedEnd = fn }
+
+// readLimit returns the number of bytes that may be read from offset: the
+// distance to the committed end, or -1 when it is unknown and the reader should
+// go to EOF. A zero return means nothing new is committed.
+func (s *Subscriber) readLimit(offset int64) int64 {
+	if s.committedEnd == nil {
+		return -1
+	}
+	end := s.committedEnd()
+	if end <= 0 {
+		return -1
+	}
+	if end <= offset {
+		return 0
+	}
+	return end - offset
+}
 
 // SetRetryBackoff configures the exponential-backoff schedule applied between
 // handler retry attempts: delay = base * 2^(attempt-1), capped at max. Non-positive
@@ -662,7 +696,19 @@ func (s *Subscriber) scanSegment(seg segmentInfo, handler HandlerFunc, offset in
 			return offset, true
 		}
 
-		scanner := bufio.NewScanner(f)
+		// Read no further than the committed end, so bytes of a record the writer
+		// is still appending are never in the buffer to begin with.
+		var src io.Reader = f
+		if limit := s.readLimit(offset); limit >= 0 {
+			if limit == 0 {
+				_ = f.Close()
+				return offset, false
+			}
+			s.limitReader = io.LimitedReader{R: f, N: limit}
+			src = &s.limitReader
+		}
+
+		scanner := bufio.NewScanner(src)
 		scanner.Buffer(make([]byte, scanInitialBufSize), maxLineSize)
 		scanner.Split(scanCompleteLines)
 		for scanner.Scan() {

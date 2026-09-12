@@ -96,10 +96,27 @@ func (f *FakeLogger) Reset() {
 // FakeChannelWriter records Write calls for assertion in tests. It implements
 // the same interface as storage.ChannelWriter via structural compatibility.
 type FakeChannelWriter struct {
-	mu       sync.Mutex
-	written  []*envelope.Envelope
-	writeErr error // if non-nil, Write returns this error
-	closed   bool
+	mu           sync.Mutex
+	written      []*envelope.Envelope
+	writeErr     error // if non-nil, Write returns this error
+	closed       bool
+	committedEnd int64
+}
+
+// CommittedEnd implements storage.ChannelWriter. The fake writes nothing to
+// disk, so this is whatever SetCommittedEnd was given, and zero by default —
+// which readers treat as "unknown", their pre-existing behaviour.
+func (f *FakeChannelWriter) CommittedEnd() int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.committedEnd
+}
+
+// SetCommittedEnd sets the value CommittedEnd reports.
+func (f *FakeChannelWriter) SetCommittedEnd(end int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.committedEnd = end
 }
 
 // Write appends a copy of env to the recorded list, or returns writeErr if set.

@@ -1130,3 +1130,54 @@ func TestSetRetryBackoff_OverridesSchedule(t *testing.T) {
 	assert.Equal(t, 10*time.Millisecond, sub.retryDelay(1))
 	assert.Equal(t, 40*time.Millisecond, sub.retryDelay(5), "capped at the configured max")
 }
+
+// TestSubscriber_BoundedByCommittedEnd verifies the subscriber stops at the
+// committed end rather than at EOF: a record already on disk but not yet
+// committed is deferred, not skipped.
+func TestSubscriber_BoundedByCommittedEnd(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "ch")
+	offsetDir := filepath.Join(dir, "offsets")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+
+	// The subscriber must exist before the records are written, or it starts at
+	// the stream end and has nothing to read.
+	sub, notifyC, _ := newTestSub(t, "s", channelDir, offsetDir, 0)
+
+	env1 := makeEnv(t, "ch", map[string]any{"n": 1})
+	env2 := makeEnv(t, "ch", map[string]any{"n": 2})
+	n1 := writeTestEnvelope(t, channelDir, env1)
+	n2 := writeTestEnvelope(t, channelDir, env2)
+
+	var end atomic.Int64
+	end.Store(n1) // only the first record is committed
+	sub.SetCommittedEnd(end.Load)
+
+	got := make(chan string, 4)
+	sub.Start(notifyC, func(env *envelope.Envelope, _ any) error {
+		got <- env.ID
+		return nil
+	})
+	t.Cleanup(sub.Stop)
+
+	select {
+	case id := <-got:
+		assert.Equal(t, env1.ID, id)
+	case <-time.After(testTimeout):
+		t.Fatal("committed record was not delivered")
+	}
+
+	select {
+	case id := <-got:
+		t.Fatalf("uncommitted record %s must not be delivered yet", id)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	end.Store(n1 + n2)
+	select {
+	case id := <-got:
+		assert.Equal(t, env2.ID, id, "record is delivered once committed")
+	case <-time.After(testTimeout):
+		t.Fatal("newly committed record was not delivered")
+	}
+}

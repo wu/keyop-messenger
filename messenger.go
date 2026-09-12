@@ -427,6 +427,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 			cfg.Storage.DataDir,
 		)
 		m.hub.SetFedClientOffsetTTL(cfg.Hub.FedClientOffsetTTL.Duration)
+		m.hub.SetCommittedEndFn(m.channelCommittedEnd)
 		if err := m.hub.Listen(cfg.Hub.ListenAddr); err != nil {
 			return nil, fmt.Errorf("start hub listener: %w", err)
 		}
@@ -469,6 +470,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				ref.Publish,
 				cfg.Storage.DataDir,
 			)
+			c.SetCommittedEndFn(m.channelCommittedEnd)
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
 				c.Close()
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)
@@ -745,6 +747,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 		return fmt.Errorf("subscribe %q/%q: %w", channel, subscriberID, err)
 	}
 	sub.SetMaxAge(so.maxAge)
+	sub.SetCommittedEnd(func() int64 { return m.channelCommittedEnd(channel) })
 	sub.SetRetryBackoff(retryBase, retryMax)
 
 	entry := &subscriberEntry{sub: sub, notifier: notifier, cancel: cancel}
@@ -1084,6 +1087,24 @@ func (m *Messenger) isClosed() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.closed
+}
+
+// channelCommittedEnd reports the committed end of a channel's log: the offset
+// just past the last complete record its writer has written. Readers bound their
+// scans by it so they never read bytes of a record still being appended.
+//
+// It returns 0 — meaning "unknown", which sends readers back to scanning to EOF
+// — for a channel with no writer in this process yet. Writers are created lazily
+// on first publish or subscribe, so this is the normal state for an inbound
+// federation channel that has seen no traffic since startup.
+func (m *Messenger) channelCommittedEnd(channel string) int64 {
+	m.mu.RLock()
+	cs, ok := m.channels[channel]
+	m.mu.RUnlock()
+	if !ok || cs.writer == nil {
+		return 0
+	}
+	return cs.writer.CommittedEnd()
 }
 
 func (m *Messenger) channelDir(channel string) string {

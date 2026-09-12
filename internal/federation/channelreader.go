@@ -98,6 +98,20 @@ type channelReader struct {
 	// skipped and the receiver's own loop guard is relied on as a backstop.
 	destInstanceFn func() string
 
+	// committedEnd reports this channel's committed end — the offset just past
+	// the last complete record the local writer has written. Scans are bounded by
+	// it, so bytes of a record still being appended are never read. nil, or a
+	// zero return, means "unknown" (no writer for this channel in this process
+	// yet, which is the case after a restart until the channel next sees
+	// traffic) and the scan falls back to EOF, where the complete-line split
+	// function is what keeps a partial tail from being consumed.
+	committedEnd func() int64
+
+	// limitReader bounds a scan to the committed end. Reused rather than calling
+	// io.LimitReader per segment per pass, which allocates on the read hot path.
+	// Only the reader goroutine touches it.
+	limitReader io.LimitedReader
+
 	// offset is the current global byte position; only read/written from the
 	// reader goroutine so no mutex is required.
 	offset int64
@@ -124,6 +138,7 @@ func newChannelReader(
 	maxBatchBytes int,
 	requestCh chan<- sendReq,
 	destInstanceFn func() string,
+	committedEndFn func() int64,
 	log logger,
 ) (*channelReader, error) {
 	// #nosec G301 -- shared data directory; 0755 is appropriate
@@ -172,6 +187,7 @@ func newChannelReader(
 		notifyCh:       make(chan struct{}, 1),
 		log:            log,
 		destInstanceFn: destInstanceFn,
+		committedEnd:   committedEndFn,
 		offset:         offset,
 		stop:           make(chan struct{}),
 		done:           make(chan struct{}),
@@ -285,6 +301,23 @@ func (cr *channelReader) drainAndSend() {
 	}
 }
 
+// readLimit returns the number of bytes that may be read from offset: the
+// distance to the committed end, or -1 when it is unknown and the reader should
+// go to EOF. A zero return means nothing new is committed.
+func (cr *channelReader) readLimit(offset int64) int64 {
+	if cr.committedEnd == nil {
+		return -1
+	}
+	end := cr.committedEnd()
+	if end <= 0 {
+		return -1
+	}
+	if end <= offset {
+		return 0
+	}
+	return end - offset
+}
+
 // readBatch scans segment files from the current offset, accumulating JSONL
 // lines up to maxBatchBytes. Returns:
 //   - rawLines: the raw bytes of each envelope line to send
@@ -347,7 +380,19 @@ func (cr *channelReader) readBatch() (rawLines [][]byte, newOffset int64, hasMor
 		if maxLine < initBuf {
 			initBuf = maxLine
 		}
-		scanner := bufio.NewScanner(f)
+		// Read no further than the committed end, so bytes of a record the writer
+		// is still appending are never in the buffer to begin with.
+		var src io.Reader = f
+		if limit := cr.readLimit(lineOffset); limit >= 0 {
+			if limit == 0 {
+				_ = f.Close()
+				return rawLines, newOffset, false, true
+			}
+			cr.limitReader = io.LimitedReader{R: f, N: limit}
+			src = &cr.limitReader
+		}
+
+		scanner := bufio.NewScanner(src)
 		scanner.Buffer(make([]byte, initBuf), maxLine)
 		// Never treat an unterminated tail as a record: this reader tails segment
 		// files while the writer is still appending to them, so the bytes past the

@@ -41,16 +41,20 @@ import (
 // so any message published locally during the disconnect is delivered on
 // reconnect — there is no in-memory unacked window to lose.
 type Client struct {
-	instanceName      string
-	tlsCfg            *tls.Config
-	policy            *AtomicPolicy
-	localWriter       func(*envelope.Envelope) error
-	localBatchWriter  func([]*envelope.Envelope) error
-	dedup             Deduplicator
-	auditL            audit.AuditLogger
-	log               logger
-	maxBatchBytes     int
-	dataDir           string
+	instanceName     string
+	tlsCfg           *tls.Config
+	policy           *AtomicPolicy
+	localWriter      func(*envelope.Envelope) error
+	localBatchWriter func([]*envelope.Envelope) error
+	dedup            Deduplicator
+	auditL           audit.AuditLogger
+	log              logger
+	maxBatchBytes    int
+	dataDir          string
+
+	// committedEndFn reports a channel's committed end, supplied by the owning
+	// messenger via SetCommittedEndFn. See Hub.committedEndFn.
+	committedEndFn    func(channel string) int64
 	subscribeChannels []string
 	publishChannels   []string
 
@@ -250,7 +254,8 @@ func (c *Client) buildOutboundReaders(hubAddr string) ([]*channelReader, map[str
 		offsetDir := filepath.Join(c.dataDir, "subscribers", ch)
 		placeholder := make(chan sendReq, 1)
 		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fedout-",
-			c.maxBatchBytes, placeholder, c.hubInstanceName, c.log)
+			c.maxBatchBytes, placeholder, c.hubInstanceName,
+			c.channelCommittedEndFn(ch), c.log)
 		if err != nil {
 			return nil, nil, fmt.Errorf("channel %q: %w", ch, err)
 		}
@@ -386,6 +391,20 @@ func (c *Client) ConnectWithReconnect(hubAddr string) error {
 		}
 	}()
 	return nil
+}
+
+// SetCommittedEndFn supplies the accessor readers use to bound their scans to
+// complete records. Call before Start; nil disables bounding, which falls back
+// to reading to EOF.
+func (c *Client) SetCommittedEndFn(fn func(channel string) int64) { c.committedEndFn = fn }
+
+// channelCommittedEndFn binds committedEndFn to one channel for a reader, or
+// returns nil when no accessor was supplied.
+func (c *Client) channelCommittedEndFn(channel string) func() int64 {
+	if c.committedEndFn == nil {
+		return nil
+	}
+	return func() int64 { return c.committedEndFn(channel) }
 }
 
 // NotifyChannel wakes the channelReader for channel, if this client has one.

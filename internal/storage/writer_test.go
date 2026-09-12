@@ -929,3 +929,63 @@ func TestWriter_OpenActive_CleanSegmentNoTruncation(t *testing.T) {
 	assert.False(t, log.HasWarn("recovered fully-corrupt segment"),
 		"clean segment must not trigger fully-corrupt recovery warning")
 }
+
+// TestChannelWriter_CommittedEndSeededBeforeGoroutineRuns pins the ordering the
+// whole mechanism depends on: a reader may attach the instant NewChannelWriter
+// returns, so the committed end must already be valid then, not once the writer
+// goroutine has scheduled and opened the segment.
+func TestChannelWriter_CommittedEndSeededBeforeGoroutineRuns(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "seeded")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	// An existing log ending in a complete record plus a partial one, as a crash
+	// would leave it.
+	require.NoError(t, os.WriteFile(filepath.Join(channelDir, segmentName(0)),
+		[]byte("aaaa\nbbbb\npartial"), 0o600))
+
+	w, err := NewChannelWriter(channelDir, 0, 200, nil, &testutil.FakeLogger{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	assert.Equal(t, int64(10), w.CommittedEnd(),
+		"committed end must exclude the partial record and be valid immediately")
+}
+
+// TestChannelWriter_CommittedEndAdvancesPerRecord verifies the value tracks
+// complete records, and that it is published before the notification a reader
+// wakes on — if it lagged, a woken reader would read a stale bound, deliver
+// nothing, and the message would wait for the next write.
+func TestChannelWriter_CommittedEndAdvancesPerRecord(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "advancing")
+
+	seen := make(chan int64, 8)
+	var w *channelWriter
+	notify := func() { seen <- w.CommittedEnd() }
+
+	var err error
+	w, err = NewChannelWriter(channelDir, 0, 0, notify, &testutil.FakeLogger{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	var want int64
+	for i := 0; i < 3; i++ {
+		env, eerr := envelope.NewEnvelope("advancing", "origin", "test.Type", map[string]any{"i": i})
+		require.NoError(t, eerr)
+		raw, merr := envelope.Marshal(env)
+		require.NoError(t, merr)
+		want += int64(len(raw)) + 1
+
+		require.NoError(t, w.Write(context.Background(), &env))
+
+		select {
+		case got := <-seen:
+			assert.Equal(t, want, got, "committed end must be published before the notify")
+		case <-time.After(5 * time.Second):
+			t.Fatal("no notification")
+		}
+		assert.Equal(t, want, w.CommittedEnd())
+	}
+}

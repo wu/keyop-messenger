@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wu/keyop-messenger/internal/envelope"
@@ -32,6 +33,18 @@ import (
 type ChannelWriter interface {
 	Write(ctx context.Context, env *envelope.Envelope) error
 	WriteBatch(ctx context.Context, envs []*envelope.Envelope) error
+
+	// CommittedEnd returns the offset just past the last complete record this
+	// writer has written: the furthest point a reader may safely read to. It is
+	// a fact about records, unlike the file size, which counts the bytes of a
+	// record still being appended. Readers bound their scans by it so they never
+	// see a partial record at all.
+	//
+	// It is valid from construction (seeded from the channel's existing committed
+	// end) and advances only after a record is fully written, and fsynced when
+	// the channel syncs per write.
+	CommittedEnd() int64
+
 	Close() error
 }
 
@@ -94,7 +107,17 @@ type channelWriter struct {
 	doneCh          chan struct{}
 	closeOnce       sync.Once
 	log             logger
+
+	// committedEnd is the offset just past the last complete record written to
+	// this channel. Seeded synchronously at construction so it is valid before
+	// the writer goroutine has started, then owned by that goroutine, which
+	// stores to it after each successful write and always before notifying.
+	// Readers load it to bound their scans; see ChannelWriter.CommittedEnd.
+	committedEnd atomic.Int64
 }
+
+// CommittedEnd implements ChannelWriter.
+func (w *channelWriter) CommittedEnd() int64 { return w.committedEnd.Load() }
 
 // NewChannelWriter creates channelDir if needed and starts the writer goroutine.
 // maxSegmentBytes controls when the writer rolls to a new segment file; 0 means
@@ -124,6 +147,17 @@ func newChannelWriterWithFactory(channelDir string, maxSegmentBytes int64, sf se
 		stopCh:          make(chan struct{}),
 		doneCh:          make(chan struct{}),
 		log:             log,
+	}
+	// Seed before starting the goroutine: a reader may attach the instant this
+	// constructor returns, and a zero committed end would send it back to
+	// reading to EOF. The channel's existing committed end is what run() will
+	// arrive at anyway, since openActive truncates to the same boundary.
+	if channelDir != "" {
+		if end, err := ChannelCommittedEnd(channelDir); err == nil {
+			w.committedEnd.Store(end)
+		} else {
+			log.Warn("seed committed end", "dir", channelDir, "err", err)
+		}
 	}
 	go w.run(syncIntervalMS, notifyFn)
 	return w
@@ -208,6 +242,8 @@ func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 		return
 	}
 	defer func() { _ = f.Close() }()
+	// Authoritative after recovery: openActive has truncated any partial tail.
+	w.committedEnd.Store(segStart + segSize)
 
 	var tickCh <-chan time.Time
 	if syncIntervalMS > 0 {
@@ -454,6 +490,11 @@ func (w *channelWriter) doWriteSingle(f fileWriter, segStart, segSize int64, req
 			return f, segStart, segSize, nil
 		}
 	}
+	// Store before notifying: the notifier coalesces on a capacity-1 channel, so
+	// a reader woken by this signal must be guaranteed to see this store. The
+	// reverse order lets it wake, read a stale end, deliver nothing, and find the
+	// notification already consumed.
+	w.committedEnd.Store(segStart + segSize)
 	if notifyFn != nil {
 		notifyFn()
 	}
@@ -501,6 +542,8 @@ func (w *channelWriter) doWriteBatch(f fileWriter, segStart, segSize int64, req 
 			return f, segStart, segSize, nil
 		}
 	}
+	// Store before notifying; see doWriteSingle.
+	w.committedEnd.Store(segStart + segSize)
 	if notifyFn != nil {
 		notifyFn()
 	}
