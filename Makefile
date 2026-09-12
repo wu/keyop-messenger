@@ -1,5 +1,13 @@
 .PHONY: all build test test-integration test-fast coverage bench lint security loc clean release help
 
+# This module is released separately and consumed as an external dependency, so
+# it is deliberately absent from the keyopx go.work. Without this, a checkout
+# nested under that workspace resolves ./... against it, finds no modules, and
+# every target below fails with "directory prefix . does not contain modules
+# listed in go.work". Pinning module mode keeps the build identical here and in
+# a standalone clone, and keeps it that way if a workspace above ever changes.
+export GOWORK := off
+
 # Default target
 all: test build
 
