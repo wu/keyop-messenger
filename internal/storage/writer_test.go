@@ -772,8 +772,11 @@ func TestWriter_OpenActive_CreateError(t *testing.T) {
 	require.NoError(t, w.Close())
 	assert.True(t, log.HasError("open active segment on startup"))
 
-	// stopCh is closed; subsequent writes must return ErrWriterClosed.
-	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
+	// The writer stopped because it could not create its first segment, so a
+	// publisher is told that rather than the less useful "closed".
+	err := w.Write(context.Background(), makeTestEnvelope(t, "ord"))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, w.FatalErr())
 }
 
 // TestWriter_OpenActive_OpenError verifies that an openSegment failure on an
@@ -790,7 +793,45 @@ func TestWriter_OpenActive_OpenError(t *testing.T) {
 	require.NoError(t, w.Close())
 	assert.True(t, log.HasError("open active segment on startup"))
 
-	require.ErrorIs(t, w.Write(context.Background(), makeTestEnvelope(t, "ord")), ErrWriterClosed)
+	// A publisher must be told why the channel is unwritable, not left to block
+	// on a goroutine that is gone, and not fobbed off with a generic "closed".
+	err := w.Write(context.Background(), makeTestEnvelope(t, "ord"))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "open active segment")
+	assert.ErrorIs(t, err, w.FatalErr())
+}
+
+// TestWriter_FatalErrorIsReportedNotHung covers the failure mode this replaced:
+// once the writer goroutine stops fatally, nothing receives on its request
+// channel, so a publish used to block until the caller's context expired — or
+// forever, for a background context. It must return the cause promptly instead.
+func TestWriter_FatalErrorIsReportedNotHung(t *testing.T) {
+	channelDir := filepath.Join(t.TempDir(), "ch")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	require.NoError(t, os.WriteFile(filepath.Join(channelDir, segmentName(0)), nil, 0o600))
+
+	w := newChannelWriterWithFactory(channelDir, 0, failOpenFactory{}, 0, nil, &testutil.FakeLogger{})
+	t.Cleanup(func() { _ = w.Close() })
+
+	select {
+	case <-w.Failed():
+	case <-time.After(2 * time.Second):
+		t.Fatal("writer did not report that it had stopped")
+	}
+	require.Error(t, w.FatalErr())
+
+	done := make(chan error, 1)
+	go func() {
+		// A background context: if Write blocks on the dead goroutine, nothing
+		// will ever release it.
+		done <- w.Write(context.Background(), makeTestEnvelope(t, "ord"))
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, w.FatalErr())
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write blocked on a writer goroutine that had already stopped")
+	}
 }
 
 // TestWriter_OpenActive_TruncatesPartialTrailing verifies that when the active

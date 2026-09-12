@@ -192,6 +192,24 @@ func (m *Messenger) DiagnosticStats(channel, subscriberID string) DiagnosticStat
 	}
 }
 
+// FatalHandler is called when a channel's writer stops with an unrecoverable
+// error. See WithFatalHandler.
+type FatalHandler func(channel string, err error)
+
+// defaultFatalHandler terminates the process. A writer stops fatally only when
+// its channel can no longer be written to for the life of the process — the
+// active segment ends in bytes that could not be rolled back, or it could not be
+// opened at all. Only startup recovery clears that, so staying up guarantees the
+// condition persists: publishes to that channel fail while the rest of the
+// process looks healthy, and the one thing that would repair it is unreachable.
+//
+// It panics rather than exiting so the failure cannot be lost in a log: the
+// stack trace goes to stderr and the exit status is non-zero, so a supervisor
+// restarts the process and startup recovery trims the partial tail.
+func defaultFatalHandler(channel string, err error) {
+	panic(fmt.Sprintf("keyop-messenger: channel %q can no longer be written: %v", channel, err))
+}
+
 // channelState holds all writers, subscribers, and compaction state for one
 // channel. It is created on first access (Publish or Subscribe).
 type channelState struct {
@@ -252,6 +270,10 @@ type Messenger struct {
 	// layout owns the on-disk arrangement of dataDir; nothing outside
 	// internal/storage joins paths into it.
 	layout storage.Layout
+
+	// fatalHandler decides what happens when a channel's writer stops with an
+	// unrecoverable error. Defaults to terminating the process.
+	fatalHandler FatalHandler
 
 	reg    registry.PayloadRegistry
 	dedup  *dedup.LRUDedup
@@ -390,6 +412,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		log:                log,
 		dataDir:            cfg.Storage.DataDir,
 		layout:             storage.NewLayout(cfg.Storage.DataDir),
+		fatalHandler:       o.fatalHandler,
 		reg:                reg,
 		dedup:              dd,
 		auditL:             auditL,
@@ -1187,8 +1210,30 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 		return nil, fmt.Errorf("create channel writer for %q: %w", channel, err)
 	}
 
+	m.watchWriter(channel, cs.writer)
 	m.channels[channel] = cs
 	return cs, nil
+}
+
+// watchWriter reports a writer that stops with a fatal error. The writer
+// goroutine cannot act on it itself: it is stopping, and the policy belongs to
+// whoever owns the process.
+func (m *Messenger) watchWriter(channel string, w storage.ChannelWriter) {
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		select {
+		case <-w.Failed():
+			err := w.FatalErr()
+			if err == nil {
+				return // stopped by Close, not by a failure
+			}
+			m.log.Error("channel writer stopped with an unrecoverable error",
+				"channel", channel, "err", err)
+			m.fatalHandler(channel, err)
+		case <-m.stop:
+		}
+	}()
 }
 
 // writeLocalEnvelope is the federation localWriter callback. It is called by

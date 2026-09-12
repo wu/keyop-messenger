@@ -8,11 +8,13 @@ type messengerOptions struct {
 	dataDir      string // overrides Config.Storage.DataDir when non-empty
 	cfg          *Config
 	testIdentity string // test-only override for the TLS-derived instance name
+	fatalHandler FatalHandler
 }
 
 func defaultOptions() messengerOptions {
 	return messengerOptions{
-		logger: nopLogger{},
+		logger:       nopLogger{},
+		fatalHandler: defaultFatalHandler,
 	}
 }
 
@@ -94,5 +96,21 @@ func WithRetryBackoff(base, maxDelay time.Duration) SubscribeOption {
 		o.retryBackoffSet = true
 		o.retryBase = base
 		o.retryMax = maxDelay
+	}
+}
+
+// WithFatalHandler replaces what happens when a channel's writer stops with an
+// unrecoverable error — the active segment ends in bytes that could not be
+// rolled back, or could not be opened at all.
+//
+// The default terminates the process, because only startup recovery can clear
+// that condition: a process that stays up cannot repair it, and publishes to the
+// affected channel fail while everything else looks healthy. Supply a handler to
+// shut down gracefully instead, or to observe the failure in tests. A handler
+// that returns leaves the process running with that channel permanently
+// unwritable, so it should stop the process itself.
+func WithFatalHandler(h FatalHandler) Option {
+	return func(o *messengerOptions) {
+		o.fatalHandler = h
 	}
 }

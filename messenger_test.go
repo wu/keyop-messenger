@@ -759,3 +759,89 @@ func TestNew_ErrorPathDoesNotLeakAuditWriter(t *testing.T) {
 	assert.LessOrEqual(t, after, before,
 		"audit writer goroutine leaked after New returned an error")
 }
+
+// TestFatalWriterFailureIsReported verifies that a channel whose writer stops
+// with an unrecoverable error is surfaced to the process, and that the publisher
+// is told why rather than blocking on a goroutine that is gone. The default
+// handler terminates the process; tests supply their own.
+func TestFatalWriterFailureIsReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions, so the segment cannot be made unopenable")
+	}
+	dir := t.TempDir()
+	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
+	cfg.ApplyDefaults()
+
+	// An existing segment the writer will not be able to open.
+	channelDir := filepath.Join(dir, "channels", "wedged")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	seg := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(seg, []byte("{}\n"), 0o600))
+	require.NoError(t, os.Chmod(seg, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(seg, 0o600) })
+
+	type fatal struct {
+		channel string
+		err     error
+	}
+	fatalCh := make(chan fatal, 1)
+
+	m, err := New(cfg, WithTestIdentity("test-instance"),
+		WithFatalHandler(func(channel string, err error) {
+			select {
+			case fatalCh <- fatal{channel, err}:
+			default:
+			}
+		}))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+	registerMapTypes(t, m, "bench.Evt")
+
+	// The publish must return rather than block on the stopped writer.
+	pubErr := make(chan error, 1)
+	go func() {
+		pubErr <- m.Publish(context.Background(), "wedged", "bench.Evt", map[string]any{"k": "v"})
+	}()
+	select {
+	case err := <-pubErr:
+		require.Error(t, err, "a publish to an unwritable channel must fail, not succeed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("publish blocked on a writer goroutine that had already stopped")
+	}
+
+	select {
+	case f := <-fatalCh:
+		assert.Equal(t, "wedged", f.channel)
+		require.Error(t, f.err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the unrecoverable writer failure was never reported to the process")
+	}
+}
+
+// TestHealthyChannelReportsNoFatalError guards the other direction: a writer
+// stopped by Close must not be mistaken for one that failed.
+func TestHealthyChannelReportsNoFatalError(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
+	cfg.ApplyDefaults()
+
+	fatalCh := make(chan error, 1)
+	m, err := New(cfg, WithTestIdentity("test-instance"),
+		WithFatalHandler(func(_ string, err error) {
+			select {
+			case fatalCh <- err:
+			default:
+			}
+		}))
+	require.NoError(t, err)
+	registerMapTypes(t, m, "bench.Evt")
+
+	require.NoError(t, m.Publish(context.Background(), "healthy", "bench.Evt", map[string]any{"k": "v"}))
+	require.NoError(t, m.Close())
+
+	select {
+	case err := <-fatalCh:
+		t.Fatalf("a cleanly closed writer must not report a fatal error: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+}

@@ -45,6 +45,17 @@ type ChannelWriter interface {
 	// the channel syncs per write.
 	CommittedEnd() int64
 
+	// Failed is closed when the writer goroutine has stopped, whether from Close
+	// or from a fatal error. After it closes, FatalErr says which.
+	Failed() <-chan struct{}
+
+	// FatalErr returns the error that stopped the writer goroutine, or nil if it
+	// stopped because of Close. A non-nil value means this channel can no longer
+	// be written to for the life of the process: the segment ends in bytes that
+	// could not be rolled back, or the active segment could not be opened. Only
+	// startup recovery can clear that, so the process must be restarted.
+	FatalErr() error
+
 	Close() error
 }
 
@@ -108,6 +119,10 @@ type channelWriter struct {
 	closeOnce       sync.Once
 	log             logger
 
+	// fatalErr holds the error that stopped the writer goroutine, set before
+	// doneCh closes so any observer of doneCh sees it.
+	fatalErr atomic.Pointer[error]
+
 	// committedEnd is the offset just past the last complete record written to
 	// this channel. Seeded synchronously at construction so it is valid before
 	// the writer goroutine has started, then owned by that goroutine, which
@@ -118,6 +133,24 @@ type channelWriter struct {
 
 // CommittedEnd implements ChannelWriter.
 func (w *channelWriter) CommittedEnd() int64 { return w.committedEnd.Load() }
+
+// Failed implements ChannelWriter.
+func (w *channelWriter) Failed() <-chan struct{} { return w.doneCh }
+
+// FatalErr implements ChannelWriter.
+func (w *channelWriter) FatalErr() error {
+	if p := w.fatalErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// fail records the error that is about to stop the writer goroutine. It must be
+// called before the goroutine returns, so that doneCh closing implies the error
+// is already visible.
+func (w *channelWriter) fail(err error) {
+	w.fatalErr.CompareAndSwap(nil, &err)
+}
 
 // NewChannelWriter creates channelDir if needed and starts the writer goroutine.
 // maxSegmentBytes controls when the writer rolls to a new segment file; 0 means
@@ -175,9 +208,26 @@ func (w *channelWriter) Write(ctx context.Context, env *envelope.Envelope) error
 	}
 	data = append(data, '\n')
 
+	// Report an unrecoverable failure in preference to "closed": a caller that
+	// is told the writer is closed will retry or move on, where the truth is that
+	// this channel cannot be written again until the process restarts. Checked
+	// before the select because Close also fires there, and a closed stopCh and a
+	// closed doneCh would otherwise be chosen between at random.
+	if err := w.FatalErr(); err != nil {
+		return err
+	}
+
 	done := make(chan error, 1)
 	select {
 	case w.requests <- writeRequest{data: data, done: done, ctx: ctx}:
+	case <-w.doneCh:
+		// The writer goroutine has stopped. Without this case the send would
+		// block until the caller's context expired — a silent per-channel wedge
+		// rather than a reported failure.
+		if err := w.FatalErr(); err != nil {
+			return err
+		}
+		return ErrWriterClosed
 	case <-w.stopCh:
 		return ErrWriterClosed
 	case <-ctx.Done():
@@ -211,9 +261,26 @@ func (w *channelWriter) WriteBatch(ctx context.Context, envs []*envelope.Envelop
 		records = append(records, append(data, '\n'))
 	}
 
+	// Report an unrecoverable failure in preference to "closed": a caller that
+	// is told the writer is closed will retry or move on, where the truth is that
+	// this channel cannot be written again until the process restarts. Checked
+	// before the select because Close also fires there, and a closed stopCh and a
+	// closed doneCh would otherwise be chosen between at random.
+	if err := w.FatalErr(); err != nil {
+		return err
+	}
+
 	done := make(chan error, 1)
 	select {
 	case w.requests <- writeRequest{records: records, done: done, ctx: ctx}:
+	case <-w.doneCh:
+		// The writer goroutine has stopped. Without this case the send would
+		// block until the caller's context expired — a silent per-channel wedge
+		// rather than a reported failure.
+		if err := w.FatalErr(); err != nil {
+			return err
+		}
+		return ErrWriterClosed
 	case <-w.stopCh:
 		return ErrWriterClosed
 	case <-ctx.Done():
@@ -239,6 +306,7 @@ func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 	f, segStart, segSize, err := w.openActive()
 	if err != nil {
 		w.log.Error("open active segment on startup", "err", err)
+		w.fail(err) // openActive already names what failed
 		return
 	}
 	defer func() { _ = f.Close() }()
@@ -261,10 +329,11 @@ func (w *channelWriter) run(syncIntervalMS int, notifyFn func()) {
 			} else {
 				f, segStart, segSize, fatal = w.doWriteSingle(f, segStart, segSize, req, syncIntervalMS, notifyFn)
 			}
-			// A fatal error is an unrecoverable segment-create failure; the
-			// goroutine cannot continue writing. doWrite* has already signalled
-			// req.done with the error.
+			// A fatal error is an unrecoverable segment failure; the goroutine
+			// cannot continue writing. doWrite* has already signalled req.done
+			// with the error.
 			if fatal != nil {
+				w.fail(fatal)
 				return
 			}
 

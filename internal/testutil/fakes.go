@@ -101,6 +101,7 @@ type FakeChannelWriter struct {
 	writeErr     error // if non-nil, Write returns this error
 	closed       bool
 	committedEnd int64
+	failed       chan struct{}
 }
 
 // CommittedEnd implements storage.ChannelWriter. The fake writes nothing to
@@ -111,6 +112,13 @@ func (f *FakeChannelWriter) CommittedEnd() int64 {
 	defer f.mu.Unlock()
 	return f.committedEnd
 }
+
+// Failed implements storage.ChannelWriter. The fake never fails, so the channel
+// it returns is never closed.
+func (f *FakeChannelWriter) Failed() <-chan struct{} { return f.failed }
+
+// FatalErr implements storage.ChannelWriter; the fake has no fatal state.
+func (f *FakeChannelWriter) FatalErr() error { return nil }
 
 // SetCommittedEnd sets the value CommittedEnd reports.
 func (f *FakeChannelWriter) SetCommittedEnd(end int64) {
