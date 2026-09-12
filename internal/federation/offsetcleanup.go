@@ -33,31 +33,21 @@ func ReapOrphanedOutboundOffsets(layout storage.Layout, configuredHubAddrs []str
 		expected[storage.OffsetPrefixFedOut+sanitizeForFilename(addr)] = struct{}{}
 	}
 
-	channels, err := layout.Channels()
+	swept, err := layout.SweepOffsets(storage.OffsetPrefixFedOut, func(f storage.OffsetFile) bool {
+		_, configured := expected[f.ID]
+		return configured
+	})
 	if err != nil {
 		log.Error("federation: reap orphaned outbound offsets, list channels", "err", err)
 		return
 	}
-
-	for _, ch := range channels {
-		files, err := layout.OffsetFiles(ch)
-		if err != nil {
+	for _, r := range swept {
+		if r.Err != nil {
+			log.Error("federation: reap orphaned outbound offset, remove failed",
+				"path", r.File.Path, "err", r.Err)
 			continue
 		}
-		for _, f := range files {
-			if !f.HasPrefix(storage.OffsetPrefixFedOut) {
-				continue
-			}
-			if _, ok := expected[f.ID]; ok {
-				continue
-			}
-			if rmErr := layout.RemoveOffsetFile(f); rmErr == nil {
-				log.Info("federation: reaped orphaned outbound offset",
-					"file", f.ID, "channel", ch)
-			} else {
-				log.Error("federation: reap orphaned outbound offset, remove failed",
-					"path", f.Path, "err", rmErr)
-			}
-		}
+		log.Info("federation: reaped orphaned outbound offset",
+			"file", r.File.ID, "channel", r.File.Channel)
 	}
 }

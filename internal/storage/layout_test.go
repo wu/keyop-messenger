@@ -1,9 +1,11 @@
+//nolint:gosec // test file: G302 (deliberate directory permissions)
 package storage
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -164,4 +166,105 @@ func TestLayout_OffsetFilesSkipsDirectories(t *testing.T) {
 	files, err := l.OffsetFiles("metrics")
 	require.NoError(t, err)
 	assert.Empty(t, files)
+}
+
+// TestLayout_SweepOffsets covers the one walk both federation sweeps now share:
+// it must touch only the caller's own kind, apply the caller's policy, and carry
+// enough context back for the caller to report what it did.
+func TestLayout_SweepOffsets(t *testing.T) {
+	t.Parallel()
+	l := NewLayout(t.TempDir())
+	for _, ch := range []string{"metrics", "events"} {
+		require.NoError(t, os.MkdirAll(l.OffsetDir(ch), 0o750))
+		require.NoError(t, WriteOffset(l.OffsetPath(ch, "webui"), 1))
+		require.NoError(t, WriteOffset(l.OffsetPath(ch, OffsetPrefixFedIn+"stale"), 2))
+		require.NoError(t, WriteOffset(l.OffsetPath(ch, OffsetPrefixFedIn+"live"), 3))
+		require.NoError(t, WriteOffset(l.OffsetPath(ch, OffsetPrefixFedOut+"hub-a"), 4))
+	}
+
+	swept, err := l.SweepOffsets(OffsetPrefixFedIn, func(f OffsetFile) bool {
+		return f.TrimPrefix(OffsetPrefixFedIn) != "stale"
+	})
+	require.NoError(t, err)
+	require.Len(t, swept, 2, "one stale inbound offset per channel")
+
+	channels := make([]string, 0, len(swept))
+	for _, r := range swept {
+		require.NoError(t, r.Err)
+		assert.Equal(t, OffsetPrefixFedIn+"stale", r.File.ID)
+		channels = append(channels, r.File.Channel)
+	}
+	assert.ElementsMatch(t, []string{"metrics", "events"}, channels,
+		"the sweep covers every channel and reports which one each file came from")
+
+	for _, ch := range []string{"metrics", "events"} {
+		assert.False(t, OffsetFileExists(l.OffsetPath(ch, OffsetPrefixFedIn+"stale")))
+		assert.True(t, OffsetFileExists(l.OffsetPath(ch, OffsetPrefixFedIn+"live")),
+			"a kept file of the swept kind survives")
+		assert.True(t, OffsetFileExists(l.OffsetPath(ch, "webui")),
+			"a plain subscriber offset is never touched")
+		assert.True(t, OffsetFileExists(l.OffsetPath(ch, OffsetPrefixFedOut+"hub-a")),
+			"the other federation kind is never touched")
+	}
+}
+
+// TestLayout_SweepOffsetsKeepsUnknownAge pins the contract that stops an
+// age-based sweep from deleting a live reader's offset when its file cannot be
+// stat'ed: the zero ModTime reaches the keep predicate, which keeps it.
+func TestLayout_SweepOffsetsKeepsUnknownAge(t *testing.T) {
+	t.Parallel()
+	l := NewLayout(t.TempDir())
+	require.NoError(t, os.MkdirAll(l.OffsetDir("metrics"), 0o750))
+	require.NoError(t, WriteOffset(l.OffsetPath("metrics", OffsetPrefixFedIn+"peer"), 1))
+
+	cutoff := time.Now().Add(time.Hour) // everything with a real mtime is "expired"
+	swept, err := l.SweepOffsets(OffsetPrefixFedIn, func(f OffsetFile) bool {
+		return f.ModTime.IsZero() || !f.ModTime.Before(cutoff)
+	})
+	require.NoError(t, err)
+	assert.Len(t, swept, 1, "a stattable, expired file is swept")
+
+	// The same predicate against a zero ModTime must keep the file.
+	keep := func(f OffsetFile) bool { return f.ModTime.IsZero() || !f.ModTime.Before(cutoff) }
+	assert.True(t, keep(OffsetFile{}), "unknown age must never be treated as expired")
+}
+
+// TestLayout_SweepOffsetsReportsFailures verifies a deletion failure does not
+// abort the sweep and is reported per file rather than swallowed — one wedged
+// offset must not stop the rest of the tree from being swept.
+func TestLayout_SweepOffsetsReportsFailures(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permissions, so deletion cannot be made to fail")
+	}
+	l := NewLayout(t.TempDir())
+	require.NoError(t, os.MkdirAll(l.OffsetDir("blocked"), 0o750))
+	require.NoError(t, os.MkdirAll(l.OffsetDir("ok"), 0o750))
+	require.NoError(t, WriteOffset(l.OffsetPath("blocked", OffsetPrefixFedIn+"a"), 1))
+	require.NoError(t, WriteOffset(l.OffsetPath("ok", OffsetPrefixFedIn+"b"), 2))
+
+	// Removing a file needs write permission on its directory.
+	require.NoError(t, os.Chmod(l.OffsetDir("blocked"), 0o500))
+	t.Cleanup(func() { _ = os.Chmod(l.OffsetDir("blocked"), 0o750) })
+
+	swept, err := l.SweepOffsets(OffsetPrefixFedIn, func(OffsetFile) bool { return false })
+	require.NoError(t, err)
+	require.Len(t, swept, 2, "both files are selected even though one cannot be deleted")
+
+	byChannel := map[string]SweepResult{}
+	for _, r := range swept {
+		byChannel[r.File.Channel] = r
+	}
+	assert.Error(t, byChannel["blocked"].Err, "the failure is reported, not swallowed")
+	assert.NoError(t, byChannel["ok"].Err)
+	assert.True(t, OffsetFileExists(l.OffsetPath("blocked", OffsetPrefixFedIn+"a")))
+	assert.False(t, OffsetFileExists(l.OffsetPath("ok", OffsetPrefixFedIn+"b")),
+		"a failure in one channel must not stop the sweep")
+}
+
+func TestLayout_SweepOffsetsNoChannels(t *testing.T) {
+	t.Parallel()
+	swept, err := NewLayout(t.TempDir()).SweepOffsets(OffsetPrefixFedIn, func(OffsetFile) bool { return false })
+	require.NoError(t, err)
+	assert.Empty(t, swept)
 }

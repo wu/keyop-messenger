@@ -784,35 +784,24 @@ func (h *Hub) sweepStaleOffsets(ttl time.Duration) {
 	if h.dataDir == "" {
 		return
 	}
-	channels, err := h.layout.Channels()
+	cutoff := time.Now().Add(-ttl)
+	swept, err := h.layout.SweepOffsets(storage.OffsetPrefixFedIn, func(f storage.OffsetFile) bool {
+		// A zero ModTime means the file could not be stat'ed, not that it is
+		// infinitely old; expiring it would delete a live peer's offset.
+		return f.ModTime.IsZero() || !f.ModTime.Before(cutoff)
+	})
 	if err != nil {
 		h.log.Error("federation: TTL sweep list channels", "err", err)
 		return
 	}
-
-	cutoff := time.Now().Add(-ttl)
-	for _, ch := range channels {
-		files, err := h.layout.OffsetFiles(ch)
-		if err != nil {
+	for _, r := range swept {
+		if r.Err != nil {
+			h.log.Error("federation: TTL sweep remove failed", "path", r.File.Path, "err", r.Err)
 			continue
 		}
-		for _, f := range files {
-			if !f.HasPrefix(storage.OffsetPrefixFedIn) {
-				continue
-			}
-			// A zero ModTime means the file could not be stat'ed, not that it is
-			// infinitely old; expiring it would delete a live peer's offset.
-			if f.ModTime.IsZero() || !f.ModTime.Before(cutoff) {
-				continue
-			}
-			age := time.Since(f.ModTime).Round(time.Minute)
-			if rmErr := h.layout.RemoveOffsetFile(f); rmErr == nil {
-				h.log.Info("federation: TTL sweep removed stale offset",
-					"peer", f.TrimPrefix(storage.OffsetPrefixFedIn), "channel", ch, "age", age)
-			} else {
-				h.log.Error("federation: TTL sweep remove failed",
-					"path", f.Path, "err", rmErr)
-			}
-		}
+		h.log.Info("federation: TTL sweep removed stale offset",
+			"peer", r.File.TrimPrefix(storage.OffsetPrefixFedIn),
+			"channel", r.File.Channel,
+			"age", time.Since(r.File.ModTime).Round(time.Minute))
 	}
 }

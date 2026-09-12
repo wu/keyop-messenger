@@ -92,6 +92,9 @@ func (l Layout) OffsetPath(channel, id string) string {
 
 // OffsetFile describes one committed offset file found on disk.
 type OffsetFile struct {
+	// Channel is the channel whose offsets this file belongs to.
+	Channel string
+
 	// ID is the file's basename with its ".offset" suffix removed, including any
 	// federation prefix — the same string OffsetPath accepts.
 	ID string
@@ -164,12 +167,55 @@ func (l Layout) OffsetFiles(channel string) ([]OffsetFile, error) {
 			modTime = info.ModTime()
 		}
 		files = append(files, OffsetFile{
+			Channel: channel,
 			ID:      strings.TrimSuffix(e.Name(), offsetSuffix),
 			Path:    filepath.Join(dir, e.Name()),
 			ModTime: modTime,
 		})
 	}
 	return files, nil
+}
+
+// SweepResult is one file a sweep decided to delete, and the outcome.
+type SweepResult struct {
+	// File is the offset file that was selected for deletion.
+	File OffsetFile
+
+	// Err is the deletion error, or nil if the file was removed.
+	Err error
+}
+
+// SweepOffsets deletes every offset file with the given prefix for which keep
+// returns false, across all channels. It is the one walk of the subscriber tree;
+// callers supply only the kind they own and the policy that decides what stays.
+//
+// Sweeping continues past a failed deletion: the returned results carry one
+// entry per file selected, each with its own error, so a caller can report them
+// in its own terms. A channel whose offsets cannot be listed is skipped rather
+// than aborting the sweep. The returned error covers only the failure to
+// enumerate channels at all.
+//
+// keep must treat a zero ModTime as "age unknown" and keep the file — a file
+// that could not be stat'ed is not an infinitely old one.
+func (l Layout) SweepOffsets(prefix string, keep func(OffsetFile) bool) ([]SweepResult, error) {
+	channels, err := l.Channels()
+	if err != nil {
+		return nil, err
+	}
+	var results []SweepResult
+	for _, ch := range channels {
+		files, err := l.OffsetFiles(ch)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !f.HasPrefix(prefix) || keep(f) {
+				continue
+			}
+			results = append(results, SweepResult{File: f, Err: l.RemoveOffsetFile(f)})
+		}
+	}
+	return results, nil
 }
 
 // RemoveOffsetFile deletes an offset file that came from OffsetFiles. Use it
