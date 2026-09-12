@@ -1030,3 +1030,57 @@ func TestChannelWriter_CommittedEndAdvancesPerRecord(t *testing.T) {
 		assert.Equal(t, want, w.CommittedEnd())
 	}
 }
+
+// TestRecoverChannel covers the single entry point for making a channel's log
+// valid to read: it removes a partial record left by a crash and reports the
+// offset a reader may safely read to.
+func TestRecoverChannel(t *testing.T) {
+	log := &testutil.FakeLogger{}
+
+	t.Run("no segments", func(t *testing.T) {
+		end, err := RecoverChannel(filepath.Join(t.TempDir(), "absent"), log)
+		require.NoError(t, err)
+		assert.Equal(t, int64(0), end)
+	})
+
+	t.Run("already valid", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "ch")
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, segmentName(0)), []byte("aaaa\nbbbb\n"), 0o600))
+
+		end, err := RecoverChannel(dir, log)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), end)
+	})
+
+	t.Run("truncates a partial tail", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "ch")
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		path := filepath.Join(dir, segmentName(0))
+		require.NoError(t, os.WriteFile(path, []byte("aaaa\nbbbb\nhalf-writ"), 0o600))
+
+		end, err := RecoverChannel(dir, log)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), end)
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, int64(10), info.Size(), "the partial record is gone from disk")
+
+		// Recovery is idempotent: running it again changes nothing.
+		again, err := RecoverChannel(dir, log)
+		require.NoError(t, err)
+		assert.Equal(t, end, again)
+	})
+
+	t.Run("active segment is entirely partial", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "ch")
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, segmentName(0)), []byte("aaaa\n"), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, segmentName(5)), []byte("no-newline"), 0o600))
+
+		end, err := RecoverChannel(dir, log)
+		require.NoError(t, err)
+		assert.Equal(t, int64(5), end, "the boundary is the previous segment's end")
+	})
+}

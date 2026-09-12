@@ -458,6 +458,33 @@ func truncatePartialTrailing(path string, currentSize int64, log logger) (int64,
 	return newSize, nil
 }
 
+// RecoverChannel truncates any partial trailing record in a channel's active
+// segment and returns the channel's committed end — the offset just past its
+// last complete record.
+//
+// It is the single entry point for making a channel's log valid to read. Call it
+// for every channel at startup, before any reader exists: a reader bounded by a
+// committed end never observes a partial record, but only if something has
+// removed the one a crash left behind. Returns 0 for a channel with no segments.
+func RecoverChannel(channelDir string, log logger) (int64, error) {
+	if log == nil {
+		log = nopLogger{}
+	}
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return 0, err
+	}
+	if len(segs) == 0 {
+		return 0, nil
+	}
+	active := segs[len(segs)-1]
+	size, err := truncatePartialTrailing(active.path, active.size, log)
+	if err != nil {
+		return 0, fmt.Errorf("recover %q: %w", active.path, err)
+	}
+	return active.startOffset + size, nil
+}
+
 // rollIfNeeded rolls to a new segment when appending recLen bytes to the current
 // segment would exceed maxSegmentBytes. It fsyncs and closes the current segment
 // and creates the next one, so no record is ever split across a boundary (a

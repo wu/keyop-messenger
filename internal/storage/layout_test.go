@@ -43,7 +43,7 @@ func TestLayout_ChannelsAndOffsetFiles(t *testing.T) {
 	l := NewLayout(t.TempDir())
 
 	// Nothing on disk yet: empty, not an error.
-	channels, err := l.Channels()
+	channels, err := l.OffsetChannels()
 	require.NoError(t, err)
 	assert.Empty(t, channels)
 	files, err := l.OffsetFiles("metrics")
@@ -59,9 +59,20 @@ func TestLayout_ChannelsAndOffsetFiles(t *testing.T) {
 	require.NoError(t, os.WriteFile(
 		filepath.Join(l.OffsetDir("metrics"), "webui.offset.tmp"), []byte("99"), 0o600))
 
-	channels, err = l.Channels()
+	channels, err = l.OffsetChannels()
 	require.NoError(t, err)
-	assert.ElementsMatch(t, []string{"metrics", "events"}, channels)
+	assert.ElementsMatch(t, []string{"metrics", "events"}, channels,
+		"OffsetChannels lists channels with a subscriber directory")
+
+	// Channels lists the log directories, which is a different set: these
+	// channels have offsets tracked but no data written.
+	logged, err := l.Channels()
+	require.NoError(t, err)
+	assert.Empty(t, logged)
+	require.NoError(t, os.MkdirAll(l.ChannelDir("metrics"), 0o750))
+	logged, err = l.Channels()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"metrics"}, logged)
 
 	files, err = l.OffsetFiles("metrics")
 	require.NoError(t, err)

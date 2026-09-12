@@ -120,16 +120,27 @@ func (o OffsetFile) TrimPrefix(prefix string) string {
 	return strings.TrimPrefix(o.ID, prefix)
 }
 
-// Channels returns the names of channels that have a subscriber directory.
-// Returns nil without error when the data directory has none yet.
+// Channels returns the names of channels that have a log directory — every
+// channel this data directory holds data for. Returns nil without error when
+// there are none yet.
 func (l Layout) Channels() ([]string, error) {
-	subsDir := filepath.Join(l.dataDir, "subscribers")
-	entries, err := os.ReadDir(subsDir)
+	return l.channelsUnder(filepath.Join(l.dataDir, "channels"))
+}
+
+// OffsetChannels returns the names of channels that have a subscriber directory.
+// A channel appears here once something has tracked an offset in it, which is
+// not the same set as Channels.
+func (l Layout) OffsetChannels() ([]string, error) {
+	return l.channelsUnder(filepath.Join(l.dataDir, "subscribers"))
+}
+
+func (l Layout) channelsUnder(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read subscribers dir %q: %w", subsDir, err)
+		return nil, fmt.Errorf("read %q: %w", dir, err)
 	}
 	var names []string
 	for _, e := range entries {
@@ -198,7 +209,7 @@ type SweepResult struct {
 // keep must treat a zero ModTime as "age unknown" and keep the file — a file
 // that could not be stat'ed is not an infinitely old one.
 func (l Layout) SweepOffsets(prefix string, keep func(OffsetFile) bool) ([]SweepResult, error) {
-	channels, err := l.Channels()
+	channels, err := l.OffsetChannels()
 	if err != nil {
 		return nil, err
 	}

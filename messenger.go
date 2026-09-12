@@ -275,6 +275,18 @@ type Messenger struct {
 	// unrecoverable error. Defaults to terminating the process.
 	fatalHandler FatalHandler
 
+	// dataDirLock is this process's exclusive claim on the data directory,
+	// released on Close.
+	dataDirLock *storage.DataDirLock
+
+	// startupEnds holds each channel's committed end as of startup recovery. It
+	// is what makes a bound available for a channel that has no writer yet —
+	// writers are created lazily, and a reader must never have to guess. The
+	// value is exact while no writer exists, since nothing is appending, and is
+	// superseded by the writer's once there is one. Written once during New,
+	// read-only afterwards.
+	startupEnds map[string]int64
+
 	reg    registry.PayloadRegistry
 	dedup  *dedup.LRUDedup
 	auditL audit.AuditLogger
@@ -423,6 +435,24 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 
 	if tlsCfg != nil {
 		m.checkCertExpiry(tlsCfg, cfg)
+	}
+
+	// Claim the data directory before touching anything in it. Everything below
+	// assumes a single writer: readers trust each channel's committed end, and
+	// subscriber offsets and compaction are equally not shared-safe.
+	lock, err := storage.LockDataDir(cfg.Storage.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	m.dataDirLock = lock
+
+	// Make every channel's log valid to read before anything can read one. A
+	// crash leaves a partial record at the tail of the active segment, and until
+	// it is truncated a reader positioned there would frame it as a message.
+	// Writers are created lazily, so leaving this to the writer means a channel
+	// that sees no traffic after a restart is never cleaned.
+	if err := m.recoverChannels(); err != nil {
+		return nil, err
 	}
 
 	// Start hub listener if enabled.
@@ -900,6 +930,13 @@ func (m *Messenger) Close() error {
 		if err := m.auditL.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
+
+		// Release the data directory only once everything that writes to it has
+		// stopped, so another process cannot start while this one is still
+		// flushing.
+		if err := m.dataDirLock.Unlock(); err != nil && firstErr == nil {
+			firstErr = err
+		}
 	})
 	return firstErr
 }
@@ -1115,10 +1152,13 @@ func (m *Messenger) channelCommittedEnd(channel string) int64 {
 	m.mu.RLock()
 	cs, ok := m.channels[channel]
 	m.mu.RUnlock()
-	if !ok || cs.writer == nil {
-		return 0
+	if ok && cs.writer != nil {
+		return cs.writer.CommittedEnd()
 	}
-	return cs.writer.CommittedEnd()
+	// No writer for this channel yet. Startup recovery recorded where its last
+	// complete record ended, and nothing has appended since, so that value is
+	// exact.
+	return m.startupEnds[channel]
 }
 
 func (m *Messenger) channelDir(channel string) string {
@@ -1213,6 +1253,26 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 	m.watchWriter(channel, cs.writer)
 	m.channels[channel] = cs
 	return cs, nil
+}
+
+// recoverChannels truncates any partial trailing record in every channel and
+// records each channel's committed end, so a bound exists for every channel from
+// the moment New returns — before any subscriber or federation reader can be
+// created.
+func (m *Messenger) recoverChannels() error {
+	channels, err := m.layout.Channels()
+	if err != nil {
+		return fmt.Errorf("list channels for recovery: %w", err)
+	}
+	m.startupEnds = make(map[string]int64, len(channels))
+	for _, channel := range channels {
+		end, err := storage.RecoverChannel(m.layout.ChannelDir(channel), m.log)
+		if err != nil {
+			return fmt.Errorf("recover channel %q: %w", channel, err)
+		}
+		m.startupEnds[channel] = end
+	}
+	return nil
 }
 
 // watchWriter reports a writer that stops with a fatal error. The writer

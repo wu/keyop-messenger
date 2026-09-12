@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/envelope"
+	"github.com/wu/keyop-messenger/internal/storage"
 )
 
 // testConfig returns a minimal valid Config for a temporary data directory.
@@ -772,14 +773,6 @@ func TestFatalWriterFailureIsReported(t *testing.T) {
 	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
 	cfg.ApplyDefaults()
 
-	// An existing segment the writer will not be able to open.
-	channelDir := filepath.Join(dir, "channels", "wedged")
-	require.NoError(t, os.MkdirAll(channelDir, 0o750))
-	seg := filepath.Join(channelDir, "00000000000000000000.jsonl")
-	require.NoError(t, os.WriteFile(seg, []byte("{}\n"), 0o600))
-	require.NoError(t, os.Chmod(seg, 0o000))
-	t.Cleanup(func() { _ = os.Chmod(seg, 0o600) })
-
 	type fatal struct {
 		channel string
 		err     error
@@ -796,6 +789,15 @@ func TestFatalWriterFailureIsReported(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 	registerMapTypes(t, m, "bench.Evt")
+
+	// Make the channel's segment unopenable after startup recovery has run, so
+	// the failure happens when the writer is created rather than in New.
+	channelDir := filepath.Join(dir, "channels", "wedged")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	seg := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(seg, []byte("{}\n"), 0o600))
+	require.NoError(t, os.Chmod(seg, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(seg, 0o600) })
 
 	// The publish must return rather than block on the stopped writer.
 	pubErr := make(chan error, 1)
@@ -844,4 +846,81 @@ func TestHealthyChannelReportsNoFatalError(t *testing.T) {
 		t.Fatalf("a cleanly closed writer must not report a fatal error: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestNewRecoversChannelsBeforeReadersExist pins the invariant Phase 5 rests on:
+// a crash-leftover partial record is gone, and a bound is available, before any
+// reader can be created — including for a channel this process never writes to,
+// which gets no writer and so would otherwise never be cleaned.
+func TestNewRecoversChannelsBeforeReadersExist(t *testing.T) {
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "quiet")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	seg := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(seg, []byte(`{"v":1}`+"\n"+`{"v":1,"partia`), 0o600))
+
+	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
+	cfg.ApplyDefaults()
+	m, err := New(cfg, WithTestIdentity("test-instance"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = m.Close() })
+
+	info, err := os.Stat(seg)
+	require.NoError(t, err)
+	assert.Equal(t, int64(8), info.Size(), "the partial record must be truncated by New")
+
+	assert.Equal(t, int64(8), m.channelCommittedEnd("quiet"),
+		"a channel with no writer must still report a bound")
+	assert.Equal(t, int64(0), m.channelCommittedEnd("never-existed"))
+}
+
+// TestNewFailsWhenAChannelCannotBeRecovered verifies that unreadable channel data
+// stops the process from starting. Before startup recovery this surfaced much
+// later, as one silently unwritable channel in an otherwise healthy process.
+func TestNewFailsWhenAChannelCannotBeRecovered(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores file permissions")
+	}
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "unreadable")
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	seg := filepath.Join(channelDir, "00000000000000000000.jsonl")
+	require.NoError(t, os.WriteFile(seg, []byte(`{"v":1}`+"\npartial"), 0o600))
+	require.NoError(t, os.Chmod(seg, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(seg, 0o600) })
+
+	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
+	cfg.ApplyDefaults()
+
+	m, err := New(cfg, WithTestIdentity("test-instance"))
+	if m != nil {
+		t.Cleanup(func() { _ = m.Close() })
+	}
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "unreadable")
+}
+
+// TestNewRefusesASecondProcessOnTheSameDataDir covers the assumption the
+// committed end rests on: one writer per data directory. A second claim must
+// fail at startup rather than silently interleave writes.
+func TestNewRefusesASecondProcessOnTheSameDataDir(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{Storage: StorageConfig{DataDir: dir}}
+	cfg.ApplyDefaults()
+
+	first, err := New(cfg, WithTestIdentity("first"))
+	require.NoError(t, err)
+
+	second, err := New(cfg, WithTestIdentity("second"))
+	if second != nil {
+		t.Cleanup(func() { _ = second.Close() })
+	}
+	require.Error(t, err)
+	assert.ErrorIs(t, err, storage.ErrDataDirLocked)
+
+	// Releasing the first claim lets a new one succeed, so a clean restart works.
+	require.NoError(t, first.Close())
+	third, err := New(cfg, WithTestIdentity("third"))
+	require.NoError(t, err)
+	require.NoError(t, third.Close())
 }
