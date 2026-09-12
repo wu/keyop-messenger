@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -277,11 +278,50 @@ func (w *channelWriter) openActive() (fileWriter, int64, int64, error) {
 	return f, active.startOffset, size, nil
 }
 
-// truncatePartialTrailing inspects the last byte of path. If it's already '\n'
-// the file is intact and the function is a no-op. Otherwise it scans backward
-// in 4 KiB chunks to find the most recent '\n' and truncates the file to one
-// byte after it. If no '\n' is found anywhere, the file is truncated to zero.
-// Returns the post-truncation file size.
+// lastRecordBoundary returns the offset one byte past the last '\n' at or before
+// size — the end of the last complete record in the file. It returns size when
+// the file already ends on a record boundary, and 0 when there is no '\n' at all
+// (every byte belongs to a record that was never finished).
+//
+// This is the one definition of "where does the complete data end" in the
+// package. Recovery truncates to it; ChannelCommittedEnd positions new readers
+// at it. File size is not a substitute: it counts bytes present, including those
+// of a record the writer is mid-append on or was cut off mid-write by a crash.
+func lastRecordBoundary(r io.ReaderAt, size int64) (int64, error) {
+	if size == 0 {
+		return 0, nil
+	}
+
+	var last [1]byte
+	if _, err := r.ReadAt(last[:], size-1); err != nil {
+		return 0, fmt.Errorf("read tail byte: %w", err)
+	}
+	if last[0] == '\n' {
+		return size, nil
+	}
+
+	const chunk = 4096
+	pos := size
+	for pos > 0 {
+		n := int64(chunk)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		buf := make([]byte, n)
+		if _, err := r.ReadAt(buf, pos); err != nil {
+			return 0, fmt.Errorf("read chunk at %d: %w", pos, err)
+		}
+		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
+			return pos + int64(i) + 1, nil
+		}
+	}
+	return 0, nil
+}
+
+// truncatePartialTrailing truncates path to its last record boundary, dropping
+// a partial record left behind by a crash. It is a no-op when the file already
+// ends on a boundary. Returns the post-truncation file size.
 func truncatePartialTrailing(path string, currentSize int64, log logger) (int64, error) {
 	if currentSize == 0 {
 		return 0, nil
@@ -292,44 +332,25 @@ func truncatePartialTrailing(path string, currentSize int64, log logger) (int64,
 	}
 	defer func() { _ = f.Close() }()
 
-	var last [1]byte
-	if _, err := f.ReadAt(last[:], currentSize-1); err != nil {
-		return 0, fmt.Errorf("read tail byte: %w", err)
+	newSize, err := lastRecordBoundary(f, currentSize)
+	if err != nil {
+		return 0, err
 	}
-	if last[0] == '\n' {
-		return currentSize, nil
+	if newSize == currentSize {
+		return currentSize, nil // already ends on a record boundary
 	}
-
-	const chunk = 4096
-	pos := currentSize
-	for pos > 0 {
-		n := int64(chunk)
-		if pos < n {
-			n = pos
-		}
-		pos -= n
-		buf := make([]byte, n)
-		if _, err := f.ReadAt(buf, pos); err != nil {
-			return 0, fmt.Errorf("read chunk at %d: %w", pos, err)
-		}
-		if i := bytes.LastIndexByte(buf, '\n'); i >= 0 {
-			newSize := pos + int64(i) + 1
-			if err := f.Truncate(newSize); err != nil {
-				return 0, fmt.Errorf("truncate to %d: %w", newSize, err)
-			}
-			log.Warn("recovered partial trailing bytes after crash",
-				"path", path, "old_size", currentSize, "new_size", newSize,
-				"dropped_bytes", currentSize-newSize)
-			return newSize, nil
-		}
+	if err := f.Truncate(newSize); err != nil {
+		return 0, fmt.Errorf("truncate to %d: %w", newSize, err)
 	}
-	// No '\n' anywhere — the entire file is partial garbage.
-	if err := f.Truncate(0); err != nil {
-		return 0, fmt.Errorf("truncate to 0: %w", err)
+	if newSize == 0 {
+		log.Warn("recovered fully-corrupt segment after crash",
+			"path", path, "dropped_bytes", currentSize)
+		return 0, nil
 	}
-	log.Warn("recovered fully-corrupt segment after crash",
-		"path", path, "dropped_bytes", currentSize)
-	return 0, nil
+	log.Warn("recovered partial trailing bytes after crash",
+		"path", path, "old_size", currentSize, "new_size", newSize,
+		"dropped_bytes", currentSize-newSize)
+	return newSize, nil
 }
 
 // rollIfNeeded rolls to a new segment when appending recLen bytes to the current

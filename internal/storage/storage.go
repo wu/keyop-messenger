@@ -63,6 +63,11 @@ type segmentInfo struct {
 // stream: the start offset of the last segment plus its current byte size.
 // This value is monotonically increasing and does not shrink when compaction
 // removes consumed segments. Returns 0 if no segments exist yet.
+//
+// This is a byte count, not a record boundary: it includes the bytes of a record
+// the writer is still appending, or of a partial record left by a crash. Use it
+// for volume measures such as subscriber lag. It must not be used to position a
+// reader — see ChannelCommittedEnd.
 func ChannelStreamEnd(channelDir string) (int64, error) {
 	segs, err := listSegments(channelDir)
 	if err != nil {
@@ -73,6 +78,40 @@ func ChannelStreamEnd(channelDir string) (int64, error) {
 	}
 	last := segs[len(segs)-1]
 	return last.startOffset + last.size, nil
+}
+
+// ChannelCommittedEnd returns the offset just past the last complete record in
+// the channel: the only offset at which a new reader may start. Unlike
+// ChannelStreamEnd it never lands inside a record — neither one the writer is
+// mid-append on, nor a partial record left behind by a crash — so it is correct
+// whether or not the channel's writer (and therefore its recovery) has been
+// created yet in this process. Returns 0 if no segments exist yet.
+func ChannelCommittedEnd(channelDir string) (int64, error) {
+	segs, err := listSegments(channelDir)
+	if err != nil {
+		return 0, err
+	}
+	if len(segs) == 0 {
+		return 0, nil
+	}
+	last := segs[len(segs)-1]
+	if last.size == 0 {
+		// Freshly rolled segment: the last complete record ended where it starts.
+		return last.startOffset, nil
+	}
+	f, err := os.Open(last.path) // #nosec G304 -- trusted, library-constructed segment path
+	if err != nil {
+		return 0, fmt.Errorf("open segment %q: %w", last.path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	boundary, err := lastRecordBoundary(f, last.size)
+	if err != nil {
+		return 0, fmt.Errorf("last record boundary in %q: %w", last.path, err)
+	}
+	// A segment holding no complete record at all means the previous segment's
+	// end is the boundary, which is exactly this segment's start offset.
+	return last.startOffset + boundary, nil
 }
 
 // ChannelDiskBytes returns the channel's current on-disk footprint: the sum of

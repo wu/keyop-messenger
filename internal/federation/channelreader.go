@@ -144,14 +144,18 @@ func newChannelReader(
 			return nil, fmt.Errorf("newChannelReader %s/%s: read offset: %w", peerName, channel, err)
 		}
 	} else {
-		// New subscriber: start at the end so the peer only receives new messages.
-		segs, err := listChannelSegments(channelDir)
+		// New subscriber: start at the end so the peer only receives messages
+		// published after it connects. This must be the end of the last *complete*
+		// record, not the file size: the writer may be mid-append, or a crash may
+		// have left a partial record that this process has not recovered yet
+		// (segment recovery runs when a channel's writer is created, which is
+		// lazy). Starting at a file size that includes those bytes would put the
+		// reader inside a record, and every record it framed after that would be
+		// garbage.
+		var err error
+		offset, err = storage.ChannelCommittedEnd(channelDir)
 		if err != nil {
-			return nil, fmt.Errorf("newChannelReader %s/%s: list segments: %w", peerName, channel, err)
-		}
-		if len(segs) > 0 {
-			last := segs[len(segs)-1]
-			offset = last.startOffset + last.size
+			return nil, fmt.Errorf("newChannelReader %s/%s: committed end: %w", peerName, channel, err)
 		}
 		if err := storage.WriteOffset(offsetPath, offset); err != nil {
 			return nil, fmt.Errorf("newChannelReader %s/%s: write initial offset: %w", peerName, channel, err)

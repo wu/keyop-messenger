@@ -777,3 +777,74 @@ func TestChannelReader_CorruptRecordLogsDiagnostics(t *testing.T) {
 		assert.Contains(t, entry, want, "corrupt-record log must carry %q", want)
 	}
 }
+
+// TestChannelReader_NewSubscriberStartsAtCommittedEnd covers the positioning
+// half of the partial-write problem. A first-time peer starts at the end of the
+// channel, and the end must be the last complete record, not the file size: the
+// writer may be mid-append, or a crash may have left a partial record that this
+// process has not recovered yet (recovery runs when a channel's writer is
+// created, which is lazy, so a peer can attach first).
+//
+// Starting at the file size puts the reader inside a record. Nothing downstream
+// can recover from that — the complete-line rule cannot help, because the offset
+// was never on a boundary — so the reader frames the tail of that record as a
+// message and every record after it is garbage.
+func TestChannelReader_NewSubscriberStartsAtCommittedEnd(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	channelDir := filepath.Join(dir, "channels", "metrics")
+	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	log := &testutil.FakeLogger{}
+
+	// A complete record, then a partial one the writer never finished.
+	complete := makeEnvelope(t, "metrics", "complete")
+	completeBytes, err := envelope.Marshal(complete)
+	require.NoError(t, err)
+	partial := []byte(`{"v":1,"id":"unfinis`)
+
+	require.NoError(t, os.MkdirAll(channelDir, 0o750))
+	segPath := filepath.Join(channelDir, fmt.Sprintf("%020d.jsonl", 0))
+	var buf []byte
+	buf = append(buf, completeBytes...)
+	buf = append(buf, '\n')
+	buf = append(buf, partial...)
+	require.NoError(t, os.WriteFile(segPath, buf, 0o600))
+	boundary := int64(len(completeBytes) + 1)
+
+	requestCh := make(chan sendReq, 4)
+	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, log)
+	require.NoError(t, err)
+
+	assert.Equal(t, boundary, cr.offset,
+		"new reader must start at the last complete record, not at %d (file size)", len(buf))
+	persisted, err := storage.ReadOffset(filepath.Join(offsetDir, "fed-peer1.offset"))
+	require.NoError(t, err)
+	assert.Equal(t, boundary, persisted, "the persisted initial offset must be a record boundary")
+
+	// The writer recovers the segment (truncating the partial record) and appends
+	// a new one. The reader is sitting exactly at the truncation point, so it must
+	// deliver that record intact.
+	require.NoError(t, os.Truncate(segPath, boundary))
+	next := makeEnvelope(t, "metrics", "after-recovery")
+	nextBytes, err := envelope.Marshal(next)
+	require.NoError(t, err)
+	f, err := os.OpenFile(segPath, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test-constructed temp path
+	require.NoError(t, err)
+	_, err = f.Write(append(nextBytes, '\n'))
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	cr.start()
+	t.Cleanup(cr.close)
+	cr.notify()
+
+	select {
+	case req := <-requestCh:
+		require.Len(t, req.rawLines, 1)
+		assert.Equal(t, nextBytes, req.rawLines[0], "record after recovery is delivered intact")
+		close(req.doneCh)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the post-recovery record")
+	}
+	assert.False(t, log.HasError("unmarshal corrupt record"))
+}
