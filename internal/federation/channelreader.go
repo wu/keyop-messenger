@@ -134,22 +134,24 @@ type channelReader struct {
 // If it does not exist (first connection) the reader starts at the current end
 // of the channel so the peer only receives messages published after it connects.
 func newChannelReader(
-	peerName, channel, channelDir, offsetDir, offsetPrefix string,
+	layout storage.Layout,
+	peerName, channel, offsetPrefix string,
 	maxBatchBytes int,
 	requestCh chan<- sendReq,
 	destInstanceFn func() string,
 	committedEndFn func() int64,
 	log logger,
 ) (*channelReader, error) {
+	channelDir := layout.ChannelDir(channel)
+	offsetDir := layout.OffsetDir(channel)
 	// #nosec G301 -- shared data directory; 0755 is appropriate
 	if err := os.MkdirAll(offsetDir, 0o755); err != nil {
 		return nil, fmt.Errorf("newChannelReader: mkdir %q: %w", offsetDir, err)
 	}
-	// peerName is caller-controlled: on the hub side it is the peer's certificate
-	// CN, joined straight into a filesystem path. Sanitize it so a CN containing
-	// path separators cannot write/remove offset files outside offsetDir. The
-	// client outbound path already sanitizes hubAddr; re-sanitizing is a no-op.
-	offsetPath := filepath.Join(offsetDir, offsetPrefix+storage.SanitizeForFilename(peerName)+".offset")
+	// peerName is caller-controlled — on the hub side it is the peer's
+	// certificate CN — so it reaches the filesystem only through OffsetPath,
+	// which sanitizes it.
+	offsetPath := layout.OffsetPath(channel, offsetPrefix+peerName)
 
 	var offset int64
 	if storage.OffsetFileExists(offsetPath) {

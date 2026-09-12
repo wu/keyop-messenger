@@ -1,9 +1,7 @@
 package federation
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
+	"github.com/wu/keyop-messenger/internal/storage"
 )
 
 // ReapOrphanedOutboundOffsets deletes client-side outbound publish offset files
@@ -25,48 +23,40 @@ import (
 //
 // It is intended to run once at startup, before clients are dialed — which is
 // when a configuration change takes effect, since clients are built at New().
-func ReapOrphanedOutboundOffsets(dataDir string, configuredHubAddrs []string, log logger) {
-	if dataDir == "" {
+func ReapOrphanedOutboundOffsets(layout storage.Layout, configuredHubAddrs []string, log logger) {
+	if layout.DataDir() == "" {
 		return
 	}
 
 	expected := make(map[string]struct{}, len(configuredHubAddrs))
 	for _, addr := range configuredHubAddrs {
-		expected["fedout-"+sanitizeForFilename(addr)+".offset"] = struct{}{}
+		expected[storage.OffsetPrefixFedOut+sanitizeForFilename(addr)] = struct{}{}
 	}
 
-	subsDir := filepath.Join(dataDir, "subscribers")
-	entries, err := os.ReadDir(subsDir)
+	channels, err := layout.Channels()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Error("federation: reap orphaned outbound offsets, read subscribers dir", "err", err)
-		}
+		log.Error("federation: reap orphaned outbound offsets, list channels", "err", err)
 		return
 	}
 
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		channelDir := filepath.Join(subsDir, e.Name())
-		files, err := os.ReadDir(channelDir)
+	for _, ch := range channels {
+		files, err := layout.OffsetFiles(ch)
 		if err != nil {
 			continue
 		}
 		for _, f := range files {
-			if f.IsDir() || !strings.HasPrefix(f.Name(), "fedout-") || !strings.HasSuffix(f.Name(), ".offset") {
+			if !f.HasPrefix(storage.OffsetPrefixFedOut) {
 				continue
 			}
-			if _, ok := expected[f.Name()]; ok {
+			if _, ok := expected[f.ID]; ok {
 				continue
 			}
-			path := filepath.Join(channelDir, f.Name())
-			if rmErr := os.Remove(path); rmErr == nil {
+			if rmErr := layout.RemoveOffsetFile(f); rmErr == nil {
 				log.Info("federation: reaped orphaned outbound offset",
-					"file", f.Name(), "channel", e.Name())
+					"file", f.ID, "channel", ch)
 			} else {
 				log.Error("federation: reap orphaned outbound offset, remove failed",
-					"path", path, "err", rmErr)
+					"path", f.Path, "err", rmErr)
 			}
 		}
 	}

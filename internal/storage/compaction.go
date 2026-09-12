@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 )
@@ -21,7 +19,8 @@ import (
 // lagging subscribers. The active (newest) segment is never deleted.
 type Compactor struct {
 	mu          sync.Mutex
-	offsetDir   string
+	layout      Layout
+	channel     string
 	subscribers map[string]struct{}
 	maxFiles    int           // 0 = no file cap; >0 = max total segment files (incl. active) retained
 	retention   time.Duration // 0 = no age cap
@@ -29,7 +28,8 @@ type Compactor struct {
 	log         logger
 }
 
-// NewCompactor returns a Compactor that reads subscriber offsets from offsetDir.
+// NewCompactor returns a Compactor that reads the subscriber offsets of one
+// channel.
 //
 //   - maxFiles: max number of segment files retained per channel, counting the
 //     active segment; when the total exceeds it, the oldest sealed segments are
@@ -39,12 +39,13 @@ type Compactor struct {
 //     force-deleted regardless of consumption. 0 disables.
 //
 // log may be nil.
-func NewCompactor(offsetDir string, maxFiles int, retention time.Duration, log logger) *Compactor {
+func NewCompactor(layout Layout, channel string, maxFiles int, retention time.Duration, log logger) *Compactor {
 	if log == nil {
 		log = nopLogger{}
 	}
 	return &Compactor{
-		offsetDir:   offsetDir,
+		layout:      layout,
+		channel:     channel,
 		subscribers: make(map[string]struct{}),
 		maxFiles:    maxFiles,
 		retention:   retention,
@@ -66,7 +67,7 @@ func (c *Compactor) DeregisterSubscriber(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.subscribers, id)
-	offsetPath := filepath.Join(c.offsetDir, id+".offset")
+	offsetPath := c.layout.OffsetPath(c.channel, id)
 	if err := os.Remove(offsetPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove offset file for subscriber %q: %w", id, err)
 	}
@@ -89,7 +90,7 @@ func (c *Compactor) MinOffset() (int64, error) {
 
 	var minOffset int64 = math.MaxInt64
 	for _, id := range ids {
-		off, err := ReadOffset(filepath.Join(c.offsetDir, id+".offset"))
+		off, err := ReadOffset(c.layout.OffsetPath(c.channel, id))
 		if err != nil {
 			return 0, fmt.Errorf("read offset for subscriber %q: %w", id, err)
 		}
@@ -106,8 +107,8 @@ func (c *Compactor) MinOffset() (int64, error) {
 	return minOffset, nil
 }
 
-// persistedMinOffset returns the minimum byte offset across every *.offset file
-// in c.offsetDir. This deliberately covers all offset-file kinds:
+// persistedMinOffset returns the minimum byte offset across every offset file of
+// the channel. This deliberately covers all offset-file kinds:
 //
 //   - plain subscriber offsets ("{subscriber-id}.offset", written by the
 //     subscriber goroutine)
@@ -127,23 +128,16 @@ func (c *Compactor) MinOffset() (int64, error) {
 // as "cannot lower the minimum from disk" and skip the result rather than
 // aborting compaction.
 func (c *Compactor) persistedMinOffset() (int64, error) {
-	entries, err := os.ReadDir(c.offsetDir)
-	if os.IsNotExist(err) {
-		return math.MaxInt64, nil
-	}
+	// OffsetFiles lists every kind and skips in-flight ".offset.tmp" writes.
+	files, err := c.layout.OffsetFiles(c.channel)
 	if err != nil {
-		return 0, fmt.Errorf("read offset dir: %w", err)
+		return 0, err
 	}
 	minOffset := int64(math.MaxInt64)
-	for _, e := range entries {
-		// The ".offset" suffix check excludes in-flight ".offset.tmp" files
-		// written by WriteOffset's atomic rename.
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".offset") {
-			continue
-		}
-		off, err := ReadOffset(filepath.Join(c.offsetDir, e.Name()))
+	for _, f := range files {
+		off, err := ReadOffset(f.Path)
 		if err != nil {
-			return 0, fmt.Errorf("read offset %q: %w", e.Name(), err)
+			return 0, fmt.Errorf("read offset %q: %w", f.ID, err)
 		}
 		if off < minOffset {
 			minOffset = off
@@ -176,7 +170,7 @@ func (c *Compactor) MaybeCompact(channelDir string) error {
 
 	var minOffset int64 = math.MaxInt64
 	for _, id := range ids {
-		off, err := ReadOffset(filepath.Join(c.offsetDir, id+".offset"))
+		off, err := ReadOffset(c.layout.OffsetPath(c.channel, id))
 		if err != nil {
 			return fmt.Errorf("read offset for subscriber %q: %w", id, err)
 		}

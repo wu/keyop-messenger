@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,6 +50,8 @@ type Client struct {
 	log              logger
 	maxBatchBytes    int
 	dataDir          string
+	// layout owns the on-disk arrangement of dataDir; see Hub.layout.
+	layout storage.Layout
 
 	// committedEndFn reports a channel's committed end, supplied by the owning
 	// messenger via SetCommittedEndFn. See Hub.committedEndFn.
@@ -138,6 +139,7 @@ func NewClient(
 		log:               log,
 		maxBatchBytes:     maxBatchBytes,
 		dataDir:           dataDir,
+		layout:            storage.NewLayout(dataDir),
 		reconnectBase:     reconnectBase,
 		reconnectMax:      reconnectMax,
 		reconnectJitter:   reconnectJitter,
@@ -250,10 +252,8 @@ func (c *Client) buildOutboundReaders(hubAddr string) ([]*channelReader, map[str
 	readers := make([]*channelReader, 0, len(c.publishChannels))
 	byChannel := make(map[string]*channelReader, len(c.publishChannels))
 	for _, ch := range c.publishChannels {
-		channelDir := filepath.Join(c.dataDir, "channels", ch)
-		offsetDir := filepath.Join(c.dataDir, "subscribers", ch)
 		placeholder := make(chan sendReq, 1)
-		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fedout-",
+		r, err := newChannelReader(c.layout, peerName, ch, storage.OffsetPrefixFedOut,
 			c.maxBatchBytes, placeholder, c.hubInstanceName,
 			c.channelCommittedEndFn(ch), c.log)
 		if err != nil {
@@ -500,9 +500,8 @@ func (c *Client) UnackedBytes() int64 {
 	peerName := sanitizeForFilename(c.hubAddr)
 	var total int64
 	for _, ch := range c.publishChannels {
-		channelDir := filepath.Join(c.dataDir, "channels", ch)
-		offsetPath := filepath.Join(c.dataDir, "subscribers", ch, "fedout-"+peerName+".offset")
-		end, err := storage.ChannelStreamEnd(channelDir)
+		offsetPath := c.layout.OffsetPath(ch, storage.OffsetPrefixFedOut+peerName)
+		end, err := storage.ChannelStreamEnd(c.layout.ChannelDir(ch))
 		if err != nil {
 			continue
 		}

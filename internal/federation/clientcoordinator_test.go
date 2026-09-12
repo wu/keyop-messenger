@@ -357,14 +357,15 @@ func TestClientCoordinator_WithReaders(t *testing.T) {
 	dir := t.TempDir()
 	log := &testutil.FakeLogger{}
 
-	channelDir := dir + "/channels/feed"
-	offsetDir := dir + "/subscribers/feed"
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("feed")
+	offsetDir := layout.OffsetDir("feed")
 
 	stream := newMockSubServerStream()
 	ackCh := make(chan struct{}, 4)
 
 	placeholder := make(chan sendReq, 1)
-	reader, err := newChannelReader("peer1", "feed", channelDir, offsetDir, "fed-", 65536, placeholder, nil, nil, log)
+	reader, err := newChannelReader(layout, "peer1", "feed", storage.OffsetPrefixFedIn, 65536, placeholder, nil, nil, log)
 	require.NoError(t, err)
 
 	cc := newClientCoordinator(stream, ackCh, 65536, log, []*channelReader{reader}, nil, nil, nil, "")

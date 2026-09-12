@@ -34,13 +34,24 @@ func writeSegment(t *testing.T, channelDir string, startOffset int64, n int) int
 	return info.Size()
 }
 
+// testCompactorDirs returns a Layout-derived channel and offset directory for
+// the test channel, so tests exercise the real on-disk convention rather than
+// arbitrary paths.
+func testCompactorDirs(t *testing.T) (Layout, string, string) {
+	t.Helper()
+	layout := NewLayout(t.TempDir())
+	channelDir := layout.ChannelDir(testCompactorChannel)
+	offsetDir := layout.OffsetDir(testCompactorChannel)
+	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	return layout, channelDir, offsetDir
+}
+
+const testCompactorChannel = "orders"
+
 func newTestCompactor(t *testing.T) (*Compactor, string, string) {
 	t.Helper()
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
-	return NewCompactor(offsetDir, 0, 0, &testutil.FakeLogger{}), channelDir, offsetDir
+	layout, channelDir, offsetDir := testCompactorDirs(t)
+	return NewCompactor(layout, testCompactorChannel, 0, 0, &testutil.FakeLogger{}), channelDir, offsetDir
 }
 
 // TestCompactor_NoSegmentsToDelete verifies MaybeCompact is a no-op when only
@@ -164,10 +175,7 @@ func TestCompactor_DeregisterRemovesOffsetFile(t *testing.T) {
 // segment and compaction of sealed segments do not interfere — the writer keeps
 // appending to the active segment while old ones are deleted.
 func TestCompactor_NoPauseNeeded(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	layout, channelDir, offsetDir := testCompactorDirs(t)
 
 	// Create two sealed segments and one active via a real writer with rolling.
 	const maxSeg = 300
@@ -187,7 +195,7 @@ func TestCompactor_NoPauseNeeded(t *testing.T) {
 	// Mark subscriber as having consumed all sealed segments.
 	active := segs[len(segs)-1]
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), active.startOffset))
-	c := NewCompactor(offsetDir, 0, 0, nil)
+	c := NewCompactor(layout, testCompactorChannel, 0, 0, nil)
 	c.RegisterSubscriber("sub1")
 
 	// Compact while the writer is still running.
@@ -417,11 +425,11 @@ func TestMinOffset_FedOffsetAboveLocal(t *testing.T) {
 // the offset directory does not exist; persistedMinOffset must treat a
 // non-existent directory as having no offsets and return MaxInt64 without error.
 func TestMaybeCompact_OffsetDirNotExist(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	// offsetDir intentionally absent — covers the os.IsNotExist branch in persistedMinOffset.
-	offsetDir := filepath.Join(base, "nonexistent-offsets")
-	c := NewCompactor(offsetDir, 0, 0, nil)
+	// The channel's offset directory is intentionally never created — covers the
+	// os.IsNotExist branch in persistedMinOffset.
+	layout := NewLayout(t.TempDir())
+	channelDir := layout.ChannelDir(testCompactorChannel)
+	c := NewCompactor(layout, testCompactorChannel, 0, 0, nil)
 
 	seg0Size := writeSegment(t, channelDir, 0, 5)
 	seg1Size := writeSegment(t, channelDir, seg0Size, 5)
@@ -462,10 +470,7 @@ func TestMaybeCompact_CorruptFedOffset(t *testing.T) {
 // sealed + active), the two oldest sealed segments are force-evicted, leaving one
 // sealed plus the active segment.
 func TestCompactor_MaxFilesForceEvictsUnconsumed(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	layout, channelDir, offsetDir := testCompactorDirs(t)
 
 	s0 := writeSegment(t, channelDir, 0, 10)
 	s1 := writeSegment(t, channelDir, s0, 10)
@@ -477,7 +482,7 @@ func TestCompactor_MaxFilesForceEvictsUnconsumed(t *testing.T) {
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
 
 	// Keep at most two log files total (one sealed + the active).
-	c := NewCompactor(offsetDir, 2, 0, &testutil.FakeLogger{})
+	c := NewCompactor(layout, testCompactorChannel, 2, 0, &testutil.FakeLogger{})
 	c.RegisterSubscriber("sub1")
 
 	require.NoError(t, c.MaybeCompact(channelDir))
@@ -491,17 +496,14 @@ func TestCompactor_MaxFilesForceEvictsUnconsumed(t *testing.T) {
 // TestCompactor_MaxFilesKeepsOnlyActive verifies that maxFiles=1 evicts every
 // sealed segment, leaving only the active one (the floor).
 func TestCompactor_MaxFilesKeepsOnlyActive(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	layout, channelDir, offsetDir := testCompactorDirs(t)
 
 	s0 := writeSegment(t, channelDir, 0, 10)
 	s1 := writeSegment(t, channelDir, s0, 10)
 	_ = writeSegment(t, channelDir, s0+s1, 5) // active segment
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
 
-	c := NewCompactor(offsetDir, 1, 0, &testutil.FakeLogger{})
+	c := NewCompactor(layout, testCompactorChannel, 1, 0, &testutil.FakeLogger{})
 	c.RegisterSubscriber("sub1")
 
 	require.NoError(t, c.MaybeCompact(channelDir))
@@ -515,17 +517,14 @@ func TestCompactor_MaxFilesKeepsOnlyActive(t *testing.T) {
 // TestCompactor_MaxFilesDisabledByZero verifies that maxFiles=0 disables the
 // cap: nothing is force-evicted when a subscriber has consumed nothing.
 func TestCompactor_MaxFilesDisabledByZero(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	layout, channelDir, offsetDir := testCompactorDirs(t)
 
 	s0 := writeSegment(t, channelDir, 0, 10)
 	s1 := writeSegment(t, channelDir, s0, 10)
 	_ = writeSegment(t, channelDir, s0+s1, 5) // active segment
 	require.NoError(t, WriteOffset(filepath.Join(offsetDir, "sub1.offset"), 0))
 
-	c := NewCompactor(offsetDir, 0, 0, &testutil.FakeLogger{})
+	c := NewCompactor(layout, testCompactorChannel, 0, 0, &testutil.FakeLogger{})
 	c.RegisterSubscriber("sub1")
 
 	require.NoError(t, c.MaybeCompact(channelDir))
@@ -538,10 +537,7 @@ func TestCompactor_MaxFilesDisabledByZero(t *testing.T) {
 // TestCompactor_RetentionAgeForceEvicts verifies that sealed segments older than
 // the retention window are deleted even when unconsumed.
 func TestCompactor_RetentionAgeForceEvicts(t *testing.T) {
-	base := t.TempDir()
-	channelDir := filepath.Join(base, "orders")
-	offsetDir := filepath.Join(base, "offsets")
-	require.NoError(t, os.MkdirAll(offsetDir, 0o755))
+	layout, channelDir, offsetDir := testCompactorDirs(t)
 
 	s0 := writeSegment(t, channelDir, 0, 10)
 	s1 := writeSegment(t, channelDir, s0, 10)
@@ -557,7 +553,7 @@ func TestCompactor_RetentionAgeForceEvicts(t *testing.T) {
 	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(0)), old, old))
 	require.NoError(t, os.Chtimes(filepath.Join(channelDir, segmentName(s0)), old, old))
 
-	c := NewCompactor(offsetDir, 0, time.Hour, &testutil.FakeLogger{})
+	c := NewCompactor(layout, testCompactorChannel, 0, time.Hour, &testutil.FakeLogger{})
 	c.now = func() time.Time { return now }
 	c.RegisterSubscriber("sub1")
 

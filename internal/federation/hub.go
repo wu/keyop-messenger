@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +24,7 @@ import (
 	"github.com/wu/keyop-messenger/internal/audit"
 	"github.com/wu/keyop-messenger/internal/envelope"
 	"github.com/wu/keyop-messenger/internal/latencyhist"
+	"github.com/wu/keyop-messenger/internal/storage"
 	"github.com/wu/keyop-messenger/internal/tlsutil"
 )
 
@@ -95,15 +94,18 @@ func publishChannelsFromContext(ctx context.Context) []string {
 type Hub struct {
 	federationv1.UnimplementedFederationServiceServer
 
-	tlsCfg             *tls.Config
-	instanceName       string // this hub's identity; appended to Route and used for loop detection
-	localBatchWriter   func([]*envelope.Envelope) error
-	dedup              Deduplicator
-	auditL             audit.AuditLogger
-	log                logger
-	sendBufSize        int
-	maxBatchBytes      int
-	dataDir            string
+	tlsCfg           *tls.Config
+	instanceName     string // this hub's identity; appended to Route and used for loop detection
+	localBatchWriter func([]*envelope.Envelope) error
+	dedup            Deduplicator
+	auditL           audit.AuditLogger
+	log              logger
+	sendBufSize      int
+	maxBatchBytes    int
+	dataDir          string
+	// layout owns the on-disk arrangement of dataDir. Federation names a channel
+	// and a peer; storage decides which files that means.
+	layout             storage.Layout
 	fedClientOffsetTTL time.Duration
 
 	mu      sync.RWMutex
@@ -196,6 +198,7 @@ func NewHub(
 		sendBufSize:      sendBufSize,
 		maxBatchBytes:    maxBatchBytes,
 		dataDir:          dataDir,
+		layout:           storage.NewLayout(dataDir),
 		notifyRegistry:   make(map[string][]*channelReader),
 		conns:            make(map[int64]*hubConn),
 		stop:             make(chan struct{}),
@@ -636,15 +639,12 @@ func (h *Hub) buildChannelReaders(
 ) (*clientCoordinator, error) {
 	var readers []*channelReader
 	for _, ch := range subChannels {
-		channelDir := filepath.Join(h.dataDir, "channels", ch)
-		offsetDir := filepath.Join(h.dataDir, "subscribers", ch)
-
 		placeholder := make(chan sendReq, 1)
 		// The subscriber's authenticated identity (its cert CN) is peerName; a
 		// record whose path vector already contains it is an echo and is filtered
 		// send-side by the reader.
 		destInstance := peerName
-		r, err := newChannelReader(peerName, ch, channelDir, offsetDir, "fed-",
+		r, err := newChannelReader(h.layout, peerName, ch, storage.OffsetPrefixFedIn,
 			h.maxBatchBytes, placeholder, func() string { return destInstance },
 			h.channelCommittedEndFn(ch), h.log)
 		if err != nil {
@@ -784,44 +784,34 @@ func (h *Hub) sweepStaleOffsets(ttl time.Duration) {
 	if h.dataDir == "" {
 		return
 	}
-	subsDir := filepath.Join(h.dataDir, "subscribers")
-	entries, err := os.ReadDir(subsDir)
+	channels, err := h.layout.Channels()
 	if err != nil {
-		if !os.IsNotExist(err) {
-			h.log.Error("federation: TTL sweep read subscribers dir", "err", err)
-		}
+		h.log.Error("federation: TTL sweep list channels", "err", err)
 		return
 	}
 
 	cutoff := time.Now().Add(-ttl)
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		channelDir := filepath.Join(subsDir, e.Name())
-		files, err := os.ReadDir(channelDir)
+	for _, ch := range channels {
+		files, err := h.layout.OffsetFiles(ch)
 		if err != nil {
 			continue
 		}
 		for _, f := range files {
-			if f.IsDir() || !strings.HasPrefix(f.Name(), "fed-") || !strings.HasSuffix(f.Name(), ".offset") {
+			if !f.HasPrefix(storage.OffsetPrefixFedIn) {
 				continue
 			}
-			info, err := f.Info()
-			if err != nil {
+			// A zero ModTime means the file could not be stat'ed, not that it is
+			// infinitely old; expiring it would delete a live peer's offset.
+			if f.ModTime.IsZero() || !f.ModTime.Before(cutoff) {
 				continue
 			}
-			if info.ModTime().Before(cutoff) {
-				path := filepath.Join(channelDir, f.Name())
-				peerName := strings.TrimSuffix(strings.TrimPrefix(f.Name(), "fed-"), ".offset")
-				age := time.Since(info.ModTime()).Round(time.Minute)
-				if rmErr := os.Remove(path); rmErr == nil {
-					h.log.Info("federation: TTL sweep removed stale offset",
-						"peer", peerName, "channel", e.Name(), "age", age)
-				} else {
-					h.log.Error("federation: TTL sweep remove failed",
-						"path", path, "err", rmErr)
-				}
+			age := time.Since(f.ModTime).Round(time.Minute)
+			if rmErr := h.layout.RemoveOffsetFile(f); rmErr == nil {
+				h.log.Info("federation: TTL sweep removed stale offset",
+					"peer", f.TrimPrefix(storage.OffsetPrefixFedIn), "channel", ch, "age", age)
+			} else {
+				h.log.Error("federation: TTL sweep remove failed",
+					"path", f.Path, "err", rmErr)
 			}
 		}
 	}

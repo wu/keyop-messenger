@@ -262,6 +262,9 @@ type Messenger struct {
 	name    string // derived from local TLS cert CN (or test override)
 	log     Logger
 	dataDir string
+	// layout owns the on-disk arrangement of dataDir; nothing outside
+	// internal/storage joins paths into it.
+	layout storage.Layout
 
 	reg    registry.PayloadRegistry
 	dedup  *dedup.LRUDedup
@@ -399,6 +402,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		name:               name,
 		log:                log,
 		dataDir:            cfg.Storage.DataDir,
+		layout:             storage.NewLayout(cfg.Storage.DataDir),
 		reg:                reg,
 		dedup:              dd,
 		auditL:             auditL,
@@ -444,7 +448,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				configuredHubAddrs = append(configuredHubAddrs, ref.Addr)
 			}
 		}
-		federation.ReapOrphanedOutboundOffsets(cfg.Storage.DataDir, configuredHubAddrs, log)
+		federation.ReapOrphanedOutboundOffsets(m.layout, configuredHubAddrs, log)
 	}
 
 	// Dial configured client hubs.
@@ -1108,7 +1112,7 @@ func (m *Messenger) channelCommittedEnd(channel string) int64 {
 }
 
 func (m *Messenger) channelDir(channel string) string {
-	return filepath.Join(m.dataDir, "channels", channel)
+	return m.layout.ChannelDir(channel)
 }
 
 // channelRetention returns the retention age the compactor should enforce for
@@ -1149,7 +1153,7 @@ func (m *Messenger) channelRollThreshold(channel string) int64 {
 }
 
 func (m *Messenger) offsetDir(channel string) string {
-	return filepath.Join(m.dataDir, "subscribers", channel)
+	return m.layout.OffsetDir(channel)
 }
 
 // getOrCreateChannelState returns the existing channelState for channel or
@@ -1172,7 +1176,8 @@ func (m *Messenger) getOrCreateChannelState(channel string) (*channelState, erro
 	cs = &channelState{
 		subs: make(map[string]*subscriberEntry),
 		compactor: storage.NewCompactor(
-			m.offsetDir(channel),
+			m.layout,
+			channel,
 			m.maxLogFiles(),
 			m.channelRetention(channel),
 			m.log,

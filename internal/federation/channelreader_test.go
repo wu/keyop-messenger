@@ -40,15 +40,15 @@ func writeTestSegment(t *testing.T, channelDir string, startOffset int64, envs [
 // write its offset file outside offsetDir.
 func TestNewChannelReader_SanitizesPeerNameForOffsetPath(t *testing.T) {
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "ch")
-	offsetDir := filepath.Join(dir, "subscribers", "ch")
+	layout := storage.NewLayout(dir)
+	offsetDir := layout.OffsetDir("ch")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 1)
 	// "../../evil" would otherwise escape offsetDir entirely. The reader is not
 	// started (close() would block waiting on a goroutine that never ran); the
 	// offset file is written during construction, which is all this test checks.
-	_, err := newChannelReader("../../evil", "ch", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	_, err := newChannelReader(layout, "../../evil", "ch", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// No offset file may appear outside offsetDir.
@@ -108,12 +108,13 @@ func drainUntilOffset(t *testing.T, requestCh <-chan sendReq, wantOffset int64) 
 func TestChannelReader_SkipsOversizedRecord(t *testing.T) {
 	setTestLimits(t, 2*1024, 4*1024) // cap 2 KiB, frame limit 6 KiB
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "big")
-	offsetDir := filepath.Join(dir, "subscribers", "big")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("big")
+	offsetDir := layout.OffsetDir("big")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 2*1024, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "big", "fed-", 2*1024, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	small1 := makeEnvelope(t, "big", "small1")
@@ -142,13 +143,14 @@ func TestChannelReader_SkipsOversizedRecord(t *testing.T) {
 func TestChannelReader_SkipsUnscannableRecord(t *testing.T) {
 	setTestLimits(t, 2*1024, 512) // frame limit 2.5 KiB → scan buffer 2.5 KiB
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "huge")
-	offsetDir := filepath.Join(dir, "subscribers", "huge")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("huge")
+	offsetDir := layout.OffsetDir("huge")
 	log := &testutil.FakeLogger{}
 
 	const maxBatch = 2 * 1024
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "huge", channelDir, offsetDir, "fed-", maxBatch, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "huge", "fed-", maxBatch, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	small1 := makeEnvelope(t, "huge", "small1")
@@ -178,12 +180,13 @@ func TestChannelReader_SkipsUnscannableRecord(t *testing.T) {
 func TestChannelReader_SkipsLoneOversizedRecord(t *testing.T) {
 	setTestLimits(t, 2*1024, 4*1024)
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "lone")
-	offsetDir := filepath.Join(dir, "subscribers", "lone")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("lone")
+	offsetDir := layout.OffsetDir("lone")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "lone", channelDir, offsetDir, "fed-", 2*1024, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "lone", "fed-", 2*1024, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// A single oversized record, nothing else.
@@ -216,8 +219,9 @@ func TestChannelReader_SkipsLoneOversizedRecord(t *testing.T) {
 func TestChannelReader_NewSubscriber_StartsAtEnd(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "test-ch")
-	offsetDir := filepath.Join(dir, "subscribers", "test-ch")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("test-ch")
+	offsetDir := layout.OffsetDir("test-ch")
 	log := &testutil.FakeLogger{}
 
 	// Write some messages before the reader is created.
@@ -226,7 +230,7 @@ func TestChannelReader_NewSubscriber_StartsAtEnd(t *testing.T) {
 	writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1, env2})
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "test-ch", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "test-ch", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// Offset file must exist and point to the end of the channel.
@@ -255,13 +259,13 @@ func TestChannelReader_NewSubscriber_StartsAtEnd(t *testing.T) {
 func TestChannelReader_DropsEchoSendSide(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
 	// Destination is "hub-a": a record already routed through hub-a is an echo.
-	cr, err := newChannelReader("peer-hub-a", "metrics", channelDir, offsetDir, "fedout-",
+	cr, err := newChannelReader(layout, "peer-hub-a", "metrics", storage.OffsetPrefixFedOut,
 		65536, requestCh, func() string { return "hub-a" }, nil, log)
 	require.NoError(t, err)
 
@@ -295,13 +299,14 @@ func TestChannelReader_DropsEchoSendSide(t *testing.T) {
 func TestChannelReader_DeliveryAndOffsetPersistence(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "events")
-	offsetDir := filepath.Join(dir, "subscribers", "events")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("events")
+	offsetDir := layout.OffsetDir("events")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
 	// Create reader before writing any data → starts at offset 0.
-	cr, err := newChannelReader("peer1", "events", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "events", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// Write messages after the reader is created.
@@ -347,14 +352,14 @@ func TestChannelReader_DeliveryAndOffsetPersistence(t *testing.T) {
 func TestChannelReader_BatchSizeLimit(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "big")
-	offsetDir := filepath.Join(dir, "subscribers", "big")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("big")
 	log := &testutil.FakeLogger{}
 
 	// Create reader BEFORE writing data so it starts at offset 0.
 	// (channelDir does not exist yet → listChannelSegments returns nil → offset=0)
 	requestCh := make(chan sendReq, 10)
-	cr, err := newChannelReader("peer1", "big", channelDir, offsetDir, "fed-", 0 /* placeholder */, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "big", "fed-", 0 /* placeholder */, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// Write 5 messages. Compute the per-line byte size from the actual output.
@@ -399,12 +404,12 @@ func TestChannelReader_BatchSizeLimit(t *testing.T) {
 func TestChannelReader_NotificationWakeup(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "wake")
-	offsetDir := filepath.Join(dir, "subscribers", "wake")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("wake")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "wake", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "wake", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -436,8 +441,9 @@ func TestChannelReader_NotificationWakeup(t *testing.T) {
 func TestChannelReader_ResumeFromOffset(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "resume")
-	offsetDir := filepath.Join(dir, "subscribers", "resume")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("resume")
+	offsetDir := layout.OffsetDir("resume")
 	log := &testutil.FakeLogger{}
 	require.NoError(t, os.MkdirAll(offsetDir, 0o750))
 	require.NoError(t, os.MkdirAll(channelDir, 0o750))
@@ -458,7 +464,7 @@ func TestChannelReader_ResumeFromOffset(t *testing.T) {
 	require.NoError(t, storage.WriteOffset(offsetPath, offsetAfterMsg1))
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "resume", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "resume", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -484,8 +490,9 @@ func TestChannelReader_ResumeFromOffset(t *testing.T) {
 func TestChannelReader_UndercutResumesAtOldestAvailable(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "undercut")
-	offsetDir := filepath.Join(dir, "subscribers", "undercut")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("undercut")
+	offsetDir := layout.OffsetDir("undercut")
 	log := &testutil.FakeLogger{}
 	require.NoError(t, os.MkdirAll(offsetDir, 0o750))
 	require.NoError(t, os.MkdirAll(channelDir, 0o750))
@@ -503,7 +510,7 @@ func TestChannelReader_UndercutResumesAtOldestAvailable(t *testing.T) {
 	require.NoError(t, storage.WriteOffset(offsetPath, 100))
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "undercut", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "undercut", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -525,12 +532,12 @@ func TestChannelReader_UndercutResumesAtOldestAvailable(t *testing.T) {
 func TestChannelReader_MultipleNotificationsCoalesced(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "coalesce")
-	offsetDir := filepath.Join(dir, "subscribers", "coalesce")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("coalesce")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "coalesce", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "coalesce", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	env1 := makeEnvelope(t, "coalesce", "m1")
@@ -570,13 +577,13 @@ func TestChannelReader_MultipleNotificationsCoalesced(t *testing.T) {
 func TestChannelReader_Close_StopsGoroutine(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "stopchan")
-	offsetDir := filepath.Join(dir, "subscribers", "stopchan")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("stopchan")
 	log := &testutil.FakeLogger{}
 
 	// Use an unbuffered requestCh that no one reads from; the reader will block.
 	requestCh := make(chan sendReq)
-	cr, err := newChannelReader("peer1", "stopchan", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "stopchan", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	env1 := makeEnvelope(t, "stopchan", "m1")
@@ -618,15 +625,15 @@ func TestListChannelSegments_IgnoresNonSegmentFiles(t *testing.T) {
 func TestChannelReader_ConcurrentNotify(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "concurrent")
-	offsetDir := filepath.Join(dir, "subscribers", "concurrent")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("concurrent")
 	log := &testutil.FakeLogger{}
 
 	env1 := makeEnvelope(t, "concurrent", "m1")
 	writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1})
 
 	requestCh := make(chan sendReq, 8)
-	cr, err := newChannelReader("peer1", "concurrent", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "concurrent", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 	cr.start()
 	t.Cleanup(cr.close)
@@ -667,12 +674,12 @@ func TestChannelReader_ConcurrentNotify(t *testing.T) {
 func TestChannelReader_PartialTailNotConsumed(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "metrics", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	// One complete record followed by an in-flight partial write (no newline).
@@ -738,12 +745,12 @@ func TestChannelReader_PartialTailNotConsumed(t *testing.T) {
 func TestChannelReader_CorruptRecordLogsDiagnostics(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "metrics", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	good := makeEnvelope(t, "metrics", "good")
@@ -793,8 +800,9 @@ func TestChannelReader_CorruptRecordLogsDiagnostics(t *testing.T) {
 func TestChannelReader_NewSubscriberStartsAtCommittedEnd(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
+	offsetDir := layout.OffsetDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	// A complete record, then a partial one the writer never finished.
@@ -813,7 +821,7 @@ func TestChannelReader_NewSubscriberStartsAtCommittedEnd(t *testing.T) {
 	boundary := int64(len(completeBytes) + 1)
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536, requestCh, nil, nil, log)
+	cr, err := newChannelReader(layout, "peer1", "metrics", "fed-", 65536, requestCh, nil, nil, log)
 	require.NoError(t, err)
 
 	assert.Equal(t, boundary, cr.offset,
@@ -857,8 +865,8 @@ func TestChannelReader_NewSubscriberStartsAtCommittedEnd(t *testing.T) {
 func TestChannelReader_BoundedByCommittedEnd(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	first := makeEnvelope(t, "metrics", "first")
@@ -875,7 +883,7 @@ func TestChannelReader_BoundedByCommittedEnd(t *testing.T) {
 	end.Store(committed)
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536,
+	cr, err := newChannelReader(layout, "peer1", "metrics", "fed-", 65536,
 		requestCh, nil, end.Load, log)
 	require.NoError(t, err)
 	cr.offset = 0 // a new reader would start at the end; rewind to read the backlog
@@ -916,8 +924,8 @@ func TestChannelReader_BoundedByCommittedEnd(t *testing.T) {
 func TestChannelReader_UnknownCommittedEndReadsToEOF(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	channelDir := filepath.Join(dir, "channels", "metrics")
-	offsetDir := filepath.Join(dir, "subscribers", "metrics")
+	layout := storage.NewLayout(dir)
+	channelDir := layout.ChannelDir("metrics")
 	log := &testutil.FakeLogger{}
 
 	env1 := makeEnvelope(t, "metrics", "one")
@@ -925,7 +933,7 @@ func TestChannelReader_UnknownCommittedEndReadsToEOF(t *testing.T) {
 	data := writeTestSegment(t, channelDir, 0, []envelope.Envelope{env1, env2})
 
 	requestCh := make(chan sendReq, 4)
-	cr, err := newChannelReader("peer1", "metrics", channelDir, offsetDir, "fed-", 65536,
+	cr, err := newChannelReader(layout, "peer1", "metrics", "fed-", 65536,
 		requestCh, nil, func() int64 { return 0 }, log)
 	require.NoError(t, err)
 	cr.offset = 0
