@@ -39,33 +39,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # Resolved rather than hardcoded: golang:1.26 sets GOPATH=/go, so
-      # ~/go/pkg/mod does not exist in that container and a literal path would
-      # silently cache nothing.
-      - name: Locate Go module download cache
-        id: gomod
-        run: echo "dir=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
-
-      # Only the module download cache — deliberately not the whole module cache,
-      # and not the build cache. The build cache has no size cap, is multiplied
-      # by every build configuration (-race and -tags integration each produce
-      # distinct build IDs), and restore-keys turns it into a ratchet: each run
-      # restores its predecessor and only adds. That is what pushed the restore
-      # step to ~10min for a module set of barely twenty dependencies. The
-      # download cache is immutable and content-addressed; re-extracting from it
-      # takes seconds and recompiling the dependencies is cheap here.
-      #
-      # The -v1- segment is a manual epoch. Bump it to -v2- to reset accumulation
-      # (module versions dropped by a Renovate bump are never evicted) without
-      # giving up restore-keys' warm starts.
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.gomod.outputs.dir }}
-          key: ${{ runner.os }}-${{ matrix.arch }}-gomod-v1-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.arch }}-gomod-v1-
-
+      # No actions/cache in any job of this workflow, deliberately. The module
+      # set is barely twenty dependencies: a cold `go mod download` measured 7s,
+      # while restoring even a download-cache-only entry of those same few MB
+      # measured 1m20s, plus a post-job save. The cache action's own overhead
+      # outweighs anything it could save at this size. The build cache is not
+      # worth carrying either — uncapped, multiplied by -race and -tags
+      # integration, and ratcheted by restore-keys, it had pushed the restore to
+      # ~10min. Revisit only if the dependency set grows substantially.
       - name: Download dependencies
         run: go mod download
 
@@ -92,12 +73,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      # No actions/cache here, deliberately. This job runs on the host, so the
-      # module and build caches are the same directories from run to run and
-      # already persist. The cache action would only restore and re-save state
-      # that never left the disk, paying tar+compress+upload on a single ARM
-      # core. Do not re-add it unless this label moves to a container executor
-      # or an ephemeral runner.
+      # No actions/cache — see the ci job. This job also runs on the host, so its
+      # module and build caches persist between runs regardless.
 
       - name: Download dependencies
         run: go mod download
@@ -121,25 +98,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Locate Go module download cache
-        id: gomod
-        run: echo "dir=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
-
-      # Download cache only, and a manually bumped epoch in the key — see the ci
-      # job for why the extracted modules and the build cache are excluded.
-      #
-      # This job runs on the host with no container, so the module and build
-      # caches already survive between runs on their own, the same situation
-      # that led the armv6 job to drop actions/cache entirely. If that runner is
-      # confirmed non-ephemeral, this step can go away too.
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.gomod.outputs.dir }}
-          key: ${{ runner.os }}-darwin-arm64-gomod-v1-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-darwin-arm64-gomod-v1-
-
+      # No actions/cache — see the ci job. This job also runs on the host, so its
+      # module and build caches persist between runs regardless.
       - name: Download dependencies
         run: go mod download
 
@@ -168,26 +128,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Locate Go module download cache
-        id: gomod
-        run: echo "dir=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
-
-      # Download cache only — see the ci job. The zips are independent of the
-      # toolchain, so every amd64 job shares one key regardless of image.
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.gomod.outputs.dir }}
-          key: ${{ runner.os }}-amd64-gomod-v1-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-amd64-gomod-v1-
-
-      # Explicit, although golangci-lint would fetch on demand: the amd64 key is
-      # shared, and whichever job saves it first must save the complete module
-      # set, not just the subset one tool happened to load.
-      - name: Download dependencies
-        run: go mod download
-
+      # No actions/cache — see the ci job.
       - name: Run golangci-lint
         run: golangci-lint run ./...
 
@@ -209,23 +150,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Locate Go module download cache
-        id: gomod
-        run: echo "dir=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
-
-      # Download cache only, on the shared amd64 key — see the ci and lint jobs.
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.gomod.outputs.dir }}
-          key: ${{ runner.os }}-amd64-gomod-v1-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-amd64-gomod-v1-
-
-      # Complete module set before saving the shared key — see the lint job.
-      - name: Download dependencies
-        run: go mod download
-
+      # No actions/cache — see the ci job.
       - name: Run security scanners
         run: make security
 
@@ -247,19 +172,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Locate Go module download cache
-        id: gomod
-        run: echo "dir=$(go env GOMODCACHE)/cache/download" >> "$GITHUB_OUTPUT"
-
-      # Download cache only, on the shared amd64 key — see the ci and lint jobs.
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.gomod.outputs.dir }}
-          key: ${{ runner.os }}-amd64-gomod-v1-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-amd64-gomod-v1-
-
+      # No actions/cache — see the ci job.
       - name: Download dependencies
         run: go mod download
 
