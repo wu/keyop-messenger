@@ -56,7 +56,9 @@ Relay chains and **cyclic** peerings (an instance that both subscribes to and pu
 - Direct client-to-client connections
 - Automatic channel discovery or subscription propagation between hubs
 - Wildcard channel patterns in forwarding policy (exact channel names only)
-- **Multiple processes sharing a single `data_dir`.** Each data directory must be owned by exactly one running messenger process. The storage layer relies on a single in-process writer goroutine per channel and an in-process notifier to wake subscribers; it does not coordinate writers or wake subscribers across process boundaries. Running two processes against the same `data_dir` would interleave appends to the same segment files and leave cross-process subscribers dependent on the safety poll alone. To run multiple instances on one host, give each its own `data_dir` and connect them via federation.
+- **Multiple processes sharing a single `data_dir`.** Each data directory must be owned by exactly one running messenger process. The storage layer relies on a single in-process writer goroutine per channel and an in-process notifier to wake subscribers; it does not coordinate writers or wake subscribers across process boundaries. Running two processes against the same `data_dir` would interleave appends to the same segment files, invalidate every channel's committed end (§5.9), and leave cross-process subscribers dependent on the safety poll alone.
+
+  This is **enforced**: `New()` takes an exclusive `flock` on `{data_dir}/.lock` and returns `ErrDataDirLocked` if another process holds it. The lock belongs to the open file description, so the kernel releases it when the process dies by any means — there is no PID to record and no staleness check to get wrong, and a machine crash leaves nothing to clean up. To run multiple instances on one host, give each its own `data_dir` and connect them via federation.
 
 ---
 
@@ -138,6 +140,7 @@ Each channel is a directory containing one or more segment files:
     audit.jsonl
     audit.jsonl.1                  # rotated (most recent)
     audit.jsonl.2                  # rotated (older)
+  .lock                            # exclusive claim held by the running process
 ```
 
 Each channel is a directory containing one or more segment files. Segment filenames encode the global byte offset at which that segment begins, zero-padded to 20 digits so lexicographic order equals offset order. The active segment is always the file with the highest start offset; all others are sealed. Dead-letter channels follow the same directory layout as regular channels.
@@ -148,7 +151,7 @@ All writes to a `.jsonl` file are serialized through a single writer goroutine p
 
 Multiple goroutines calling `Publish()` concurrently on the same channel serialize through the writer goroutine; each blocks on the rendezvous until its own write is confirmed before returning.
 
-The writer appends with `O_APPEND` and issues a single `write()` syscall per record. Because each `data_dir` is owned by a single process (§3.2) and every append to a channel is serialized through this one writer goroutine, no cross-writer locking is needed regardless of record size — there is never a second writer to interleave with.
+The writer appends with `O_APPEND` and issues a single `write()` syscall per record. Because each `data_dir` is owned by a single process — enforced by the data-directory lock (§3.2) — and every append to a channel is serialized through this one writer goroutine, no cross-writer locking is needed regardless of record size: there is never a second writer to interleave with.
 
 What "write confirmed" means depends on `sync_interval_ms`:
 
@@ -177,11 +180,15 @@ If the channel writer goroutine encounters a write error (disk full, I/O error),
 
 This guarantees that a full disk causes the entire affected write path to stall rather than silently lose messages. The operator must resolve the disk condition; no messages are dropped.
 
+**Unrecoverable write failures.** A transient error is retried forever as above, but two conditions are not transient: a partial write that could not be rolled back by truncation (leaving the active segment ending in bytes that are not a record), and an active segment that cannot be opened at all. Either stops that channel's writer goroutine, and the channel cannot be written again for the life of the process — only startup recovery (§5.9) removes a partial tail.
+
+`Publish()` on such a channel returns that cause rather than blocking on a goroutine that is gone, and the failure is reported to the process. The default is to **terminate**: a process that stays up cannot repair the condition, so it would carry one permanently unwritable channel while appearing healthy, and the one thing that would fix it — a restart — never happens. Terminating with a non-zero exit lets a supervisor restart the process, at which point recovery trims the partial tail and the channel works again. `WithFatalHandler` replaces this for a graceful shutdown, or to observe the condition in tests.
+
 ### 5.4 Subscriber Offset Tracking
 
 Each subscriber has a durable offset file recording the **global byte offset** of the next unread record in the channel's logical stream. The offset is written **after** the subscriber's handler returns successfully — this is the at-least-once contract.
 
-A new subscriber starts at the global offset of the stream end (last segment's start offset + last segment's size), skipping pre-existing history. A restarting subscriber resumes from the persisted offset.
+A new subscriber starts at the channel's committed end (§5.9), skipping pre-existing history. A restarting subscriber resumes from the persisted offset. The committed end, rather than the stream end, is what makes this safe: the file size can include a record still being appended, and starting inside a record mis-frames every record after it.
 
 **Startup freshness filtering:** A subscription may set a maximum message age (`WithMaxAge`). On its first run such a subscriber fast-forwards its offset past any buffered messages older than the cutoff, so it begins delivery near real time instead of replaying a stale backlog after a restart or reconnect. The fast-forward skips whole sealed segments whose last write predates the cutoff without reading them — a record's timestamp is at most its write time, so an old-mtime sealed segment cannot contain a fresh record — then scans only the single boundary segment by envelope timestamp to land on the first fresh record. Filtering happens **only at startup**: once delivery begins no message is ever skipped for age, so a subscriber that falls behind at runtime still receives every message (preserving state-dependent processing). New subscribers, which already start at the stream end, are unaffected; this matters for resuming subscribers. Bytes skipped are reported via the `StartupSkippedBytes` subscriber stat.
 
@@ -259,6 +266,36 @@ Eviction fires when **either** bound is exceeded. Sealed segments are evaluated 
 Subscribers must be explicitly registered before consuming. Registration writes an initial offset file (at the current end-of-file for new subscribers, or reads the existing offset for resuming subscribers). The compaction process uses the registered subscriber list to determine the safe deletion boundary.
 
 Deregistering a subscriber removes its offset file and allows compaction to proceed past that subscriber's last position.
+
+### 5.9 The Committed End: What Is Valid to Read
+
+A reader must never see the bytes of a record that is still being written. Two things could otherwise expose them: a writer mid-append, and a partial record left at the tail of a segment by a crash. The rule that prevents both is that **the writer alone decides what is valid to read, and readers read nothing else**.
+
+Each channel has a **committed end**: the byte offset just past its last *complete* record. It is a fact about records, where the file size is a fact about bytes; the two are equal except during a write, which is exactly when a reader would be hurt by the difference.
+
+**Established at startup.** `New()` recovers every channel before it returns — for each channel directory it finds the last `'\n'` in the active segment, truncates anything after it (the signature of a crash mid-write), and records the resulting offset as that channel's committed end. Because no reader can exist before `New()` returns, every channel has a bound from the first moment one could be read. Recovery is idempotent, and a channel whose data cannot be read fails startup rather than surfacing later as one silently unusable channel.
+
+**Advanced by the writer.** After each record is written — and fsynced, when `sync_interval_ms=0` — the channel's writer stores the new committed end and only then notifies subscribers. The order matters: the notifier coalesces on a capacity-1 channel, so a reader woken by a notification must be guaranteed to observe the store that preceded it. Publishing the value after signalling would let a reader wake, read a stale bound, deliver nothing, and find the notification already consumed.
+
+**Consulted by every reader.** Readers do not wait to be told; they read the channel's current committed end when they wake. A value delivered only with notifications would be absent for a reader that attaches between writes — a federation peer connecting mid-stream, or any reader on a quiet channel — so the value is per channel and shared, not per reader.
+
+Every read is bounded by it: a scan reads `[offset, committedEnd)` and no further. Both ends are record boundaries — an offset only ever advances by whole records, and the committed end is only ever set one byte past a `'\n'` — so a reader cannot observe a partial record at all. There is no unbounded mode to fall back to: a channel with nothing committed reports 0 and yields nothing, which is the correct answer rather than a special case.
+
+This also fixes positioning. A first-time reader starts at the committed end, not at the file size; starting at a size that includes an in-flight or crash-leftover record would place it *inside* a record, and every record it framed afterwards would be garbage.
+
+### 5.10 Reading: One Cursor
+
+All reading of segment files goes through a single cursor type in the storage layer. It owns where records begin and end, how far it is safe to read, and what to do with a record it cannot carry; its consumers — the subscriber and the federation reader — supply an offset and receive framed records, and decide only what to do with them.
+
+The cursor:
+
+- yields only complete records, bounded by the committed end (§5.9);
+- steps over a record too large for the consumer to carry, and over one too large to hold in its scan buffer, so a single poison message cannot wedge a channel — reporting each skip to the consumer, which logs it in its own terms;
+- distinguishes a record that is too large from one that is merely unfinished: a giant record with no terminating newline yet is an in-flight write, and the cursor holds rather than skipping it;
+- steps over the gap between a sealed segment's end and the next segment's start, which compaction and rolling can produce;
+- returns record bytes that point into its own scan buffer, valid only until the next call, so iterating costs no allocation per record.
+
+A cursor is owned by its reader and reused across wake-ups rather than created per pass: it holds the scan buffer, and allocating one per wake-up dominated the allocation on both delivery paths.
 
 ---
 
@@ -459,7 +496,7 @@ Both hub-side and client-side federation delivery use a unified **file-reader pu
 
 Operation in both directions:
 
-- For each `(peer-or-hub, channel)` pair, a `channelReader` goroutine watches the local segment files at `{dataDir}/channels/{channel}/`.
+- For each `(peer-or-hub, channel)` pair, a `channelReader` goroutine watches the local segment files at `{dataDir}/channels/{channel}/`. It reads them through the storage cursor (§5.10), bounded by the channel's committed end (§5.9), like every other reader — the federation layer names a channel and an offset and never touches a segment file itself.
 - When a message is written to a channel (via local `Publish` or `writeLocalEnvelope` from inbound federation), the messenger calls `NotifyChannel(channel)` on every registered notify target — the hub's notify registry for inbound peers, and each client's reader map for outbound channels.
 - Each `channelReader` reads from the segment files starting at its current byte offset, accumulates envelopes up to the configured batch size, and delivers them to the coordinator as one `sendReq`.
 - The coordinator serialises sends across all readers for one connection: one batch is in-flight at a time; the next batch is not sent until the peer acknowledges the current one.
@@ -596,6 +633,7 @@ writer goroutine (one per channel)
   └─ single write() syscall
   └─ retry on I/O error until success (see §5.3)
   └─ fsync if sync_interval_ms = 0
+  └─ publish the new committed end (see §5.9) — before notifying, never after
   └─ signal publisher: write confirmed
   └─ signal waiting subscribers via the in-process LocalNotifier (see §5.6)
 ```
@@ -610,6 +648,7 @@ writer goroutine (batch request)
        └─ roll to a new segment first if it would exceed the size limit (§5.2)
        └─ single write() syscall  (retry on I/O error until success, §5.3)
   └─ fsync once if sync_interval_ms = 0          ← amortised across the batch
+  └─ publish the new committed end (§5.9)        ← once, covering the batch
   └─ signal caller: whole batch confirmed
   └─ signal waiting subscribers once             ← one notification per batch
 ```
@@ -621,16 +660,19 @@ See §5.2 for the batch durability contract and segment-boundary handling.
 ```
 in-process LocalNotifier signal (or 1s safety-poll tick)
   └─ subscriber goroutine wakes
-  └─ list segment files in channel directory (sorted by start offset)
-  └─ for each segment starting at or after subscriber's global offset:
-       └─ open segment, seek to (globalOffset - segmentStartOffset)
-       └─ scan lines to EOF; dispatch each with retry + backoff
-       └─ advance to next segment's start offset when current segment EOF reached
+  └─ read the channel's committed end (§5.9) — how far it may read
+  └─ reset its cursor (§5.10) to the subscriber's global offset
+  └─ for each record the cursor yields, up to the committed end:
+       └─ dispatch with retry + backoff
   └─ write global offset file after each successful dispatch or dead-letter
        → on write failure: log error, leave in-memory offset unchanged
 ```
 
-Subscribers are woken by the in-process `LocalNotifier` (see §5.6), backstopped by a 1-second safety poll. The per-line scanner buffer is capped at `maxLineSize` (10 MiB). A record larger than this cannot be returned by the scanner, so it is skipped rather than wedging delivery: an error is logged, the offset is advanced past it (its end located by reading to the record's terminating newline), and the `OversizedSkipped` subscriber stat is incremented. An oversized record not yet terminated by a newline is treated as an in-flight write and left in place until it completes, so a message mid-flight is never skipped.
+Subscribers are woken by the in-process `LocalNotifier` (see §5.6), backstopped by a 1-second safety poll. Locating segments, seeking, framing records and bounding the read all belong to the cursor; the subscriber decides only what to do with each record.
+
+The scan buffer is capped at `maxLineSize` (10 MiB). A record larger than this cannot be held by the scanner, so it is skipped rather than wedging delivery: an error is logged, the offset is advanced past it (its end located by reading to the record's terminating newline), and the `OversizedSkipped` subscriber stat is incremented. An oversized record not yet terminated by a newline is an in-flight write, not a poison record, and is left in place until it completes.
+
+The buffer is allocated once per subscriber and reused across wake-ups. It was previously allocated per segment per wake-up, which accounted for roughly 90% of the bytes allocated on the delivery path.
 
 ### 9.3 Serialization
 

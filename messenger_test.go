@@ -14,7 +14,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wu/keyop-messenger/internal/envelope"
-	"github.com/wu/keyop-messenger/internal/storage"
 )
 
 // testConfig returns a minimal valid Config for a temporary data directory.
@@ -916,7 +915,7 @@ func TestNewRefusesASecondProcessOnTheSameDataDir(t *testing.T) {
 		t.Cleanup(func() { _ = second.Close() })
 	}
 	require.Error(t, err)
-	assert.ErrorIs(t, err, storage.ErrDataDirLocked)
+	assert.ErrorIs(t, err, ErrDataDirLocked)
 
 	// Releasing the first claim lets a new one succeed, so a clean restart works.
 	require.NoError(t, first.Close())

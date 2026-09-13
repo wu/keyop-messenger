@@ -36,6 +36,11 @@ var (
 	// 255 bytes, or contains characters outside [a-zA-Z0-9._-].
 	ErrInvalidChannelName = storage.ErrInvalidChannelName
 
+	// ErrDataDirLocked is returned by New when another process already owns the
+	// data directory. One running process owns a data_dir; a second would
+	// interleave appends to the same segment files.
+	ErrDataDirLocked = storage.ErrDataDirLocked
+
 	// ErrReservedChannelName is returned by Publish and PublishBatch when the
 	// target channel uses the reserved ".dead-letter" suffix. Dead-letter
 	// channels are written only by the messenger itself when a handler exhausts
