@@ -217,9 +217,16 @@ func TestStats_HubRejectsUnknownPeer(t *testing.T) {
 	)
 	hubAddr := hubLocalAddr(t, hubM)
 
+	hubFatal := make(chan error, 1)
 	intruder := newClientMessengerWithPolicy(t, "intruder", dir, caFile,
 		certFor("intruder"), keyFor("intruder"), hubAddr,
 		nil, []string{"events"},
+		WithHubFatalHandler(func(_ string, err error) {
+			select {
+			case hubFatal <- err:
+			default:
+			}
+		}),
 	)
 	// The publish stream will be refused by the allowlist; the error surfaces
 	// asynchronously, so drive traffic and poll the reject counter.
@@ -231,4 +238,12 @@ func TestStats_HubRejectsUnknownPeer(t *testing.T) {
 	}, 3*time.Second, 50*time.Millisecond, "hub did not record a rejected connection")
 
 	assert.Zero(t, hubM.Stats().Federation.Hub.PublishConns)
+
+	// The rejection is non-retryable, so it reaches the hub fatal handler.
+	select {
+	case err := <-hubFatal:
+		assert.ErrorContains(t, err, "not in allowlist")
+	case <-time.After(3 * time.Second):
+		t.Fatal("hub fatal handler was not called for the allowlist rejection")
+	}
 }

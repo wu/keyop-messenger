@@ -3,6 +3,7 @@ package federation
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -104,6 +105,10 @@ type Client struct {
 	// transports so dial errors can be classified by isFatalConnErr.
 	tlsFailures tlsFailureRecorder
 
+	// onFatal, when set, is invoked once when the reconnect loop stops on a
+	// non-retryable error. See SetOnFatal.
+	onFatal func(error)
+
 	stop       chan struct{}
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -193,7 +198,7 @@ func (c *Client) dial(hubAddr string) error {
 	readers, readersByChannel, err := c.buildOutboundReaders(hubAddr)
 	if err != nil {
 		pubCancel()
-		return fmt.Errorf("federation: client build outbound readers: %w", err)
+		return &localSetupError{err: fmt.Errorf("federation: client build outbound readers: %w", err)}
 	}
 	coordinator := newPubCoordinator(pubStream, pubCancel, c.log, readers, c.recordAckRTT, c.recordPublishSendFailure, c.auditL, hubAddr)
 	coordinator.start()
@@ -306,95 +311,174 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// SetOnFatal supplies the callback invoked when the reconnect loop stops on a
+// non-retryable error: the hub rejected this instance, a certificate failed
+// verification (see isFatalConnErr), or this instance's outbound state could
+// not be built. It is called at most once, on its own goroutine, so it may
+// close the owning messenger. Call before ConnectWithReconnect.
+func (c *Client) SetOnFatal(fn func(error)) { c.onFatal = fn }
+
 // ConnectWithReconnect dials hubAddr and reconnects automatically on disconnect.
-// It returns after the first successful connection.
+//
+// A non-retryable first-dial failure is returned. Any other failure — the hub
+// is down or unreachable — is logged and the client starts disconnected: it
+// returns nil and keeps dialing in the background with exponential backoff.
+// Messages published meanwhile stay in the local channel files and are
+// delivered once a connection is established.
 func (c *Client) ConnectWithReconnect(hubAddr string) error {
 	c.hubAddr = hubAddr
-	if err := c.dial(hubAddr); err != nil {
-		return err
+	err := c.dial(hubAddr)
+	if err != nil {
+		if isFatalDialErr(err) {
+			return err
+		}
+		c.log.Warn("federation: hub unreachable, starting disconnected", "hub", hubAddr, "err", err)
 	}
 
 	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		backoff := c.reconnectBase
-		attempt := 0
-		for {
-			c.mu.Lock()
-			coord := c.coordinator
-			c.mu.Unlock()
-
-			select {
-			case <-c.stop:
-				return
-			case <-coord.Done():
-			}
-
-			// Tear down the current connection's readers and coordinator.
-			// Offset files persist; they will be reused by the next dial.
-			coord.close()
-
-			unacked := c.UnackedBytes()
-			_ = c.auditL.Log(audit.Event{
-				Event:    audit.EventPeerDisconnected,
-				PeerAddr: hubAddr,
-				Detail:   fmt.Sprintf("unacked_bytes=%d", unacked),
-			})
-			c.log.Warn("federation: client disconnected, reconnecting",
-				"hub", hubAddr, "unacked_bytes", unacked)
-
-			// #nosec G404 -- math/rand is appropriate for non-cryptographic jitter
-			jitter := time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
-			sleep := backoff + jitter
-			if sleep < 0 {
-				sleep = 0
-			}
-			select {
-			case <-c.stop:
-				return
-			case <-time.After(sleep):
-			}
-
-			for {
-				select {
-				case <-c.stop:
-					return
-				default:
-				}
-				attempt++
-				dErr := c.dial(hubAddr)
-				if dErr == nil {
-					break
-				}
-				if c.stopCtx.Err() != nil {
-					return
-				}
-				c.log.Error("federation: client reconnect failed", "err", dErr, "attempt", attempt)
-				_ = c.auditL.Log(audit.Event{
-					Event:    audit.EventPeerConnected,
-					PeerAddr: hubAddr,
-					Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, dErr.Error()),
-				})
-				backoff = minDuration(backoff*2, c.reconnectMax)
-				// #nosec G404 -- math/rand is appropriate for non-cryptographic jitter
-				jitter = time.Duration(float64(backoff) * c.reconnectJitter * (rand.Float64()*2 - 1))
-				sleep = backoff + jitter
-				if sleep < 0 {
-					sleep = c.reconnectBase
-				}
-				select {
-				case <-c.stop:
-					return
-				case <-time.After(sleep):
-				}
-			}
-
-			c.reconnectCount.Add(1)
-			backoff = c.reconnectBase
-			attempt = 0
-		}
-	}()
+	go c.reconnectLoop(hubAddr, err == nil)
 	return nil
+}
+
+// reconnectLoop keeps the client connected to hubAddr. When connected is true
+// it starts by waiting for the current connection to drop; otherwise it starts
+// dialing. It returns when the client is closed or a connection attempt ends
+// with a non-retryable error, in which case onFatal is invoked.
+func (c *Client) reconnectLoop(hubAddr string, connected bool) {
+	defer c.wg.Done()
+	backoff := c.reconnectBase
+	for {
+		if connected {
+			stopped, termErr := c.awaitDisconnect(hubAddr)
+			if stopped {
+				return
+			}
+			if isFatalConnErr(termErr) {
+				c.fatal(hubAddr, termErr)
+				return
+			}
+			c.log.Warn("federation: client disconnected, reconnecting", "hub", hubAddr, "err", termErr)
+		}
+		if !c.dialWithBackoff(hubAddr, &backoff) {
+			return
+		}
+		// The first connection of a client that started disconnected is not a
+		// reconnect.
+		if connected {
+			c.reconnectCount.Add(1)
+		}
+		connected = true
+		backoff = c.reconnectBase
+	}
+}
+
+// awaitDisconnect blocks until the current connection drops or the client is
+// closed. On a drop it tears the connection down and returns the error that
+// ended it, annotated with any recorded TLS failure.
+func (c *Client) awaitDisconnect(hubAddr string) (stopped bool, termErr error) {
+	c.mu.Lock()
+	coord, receiver := c.coordinator, c.receiver
+	c.mu.Unlock()
+
+	select {
+	case <-c.stop:
+		return true, nil
+	case <-coord.Done():
+	}
+
+	// Tear down the current connection's readers and coordinator.
+	// Offset files persist; they will be reused by the next dial.
+	coord.close()
+	termErr = c.tlsFailures.annotate(coord.Err())
+	if receiver != nil && !isFatalConnErr(termErr) {
+		select {
+		case <-receiver.Done():
+			if rErr := c.tlsFailures.annotate(receiver.Err()); isFatalConnErr(rErr) {
+				termErr = rErr
+			}
+		default:
+		}
+	}
+
+	unacked := c.UnackedBytes()
+	_ = c.auditL.Log(audit.Event{
+		Event:    audit.EventPeerDisconnected,
+		PeerAddr: hubAddr,
+		Detail:   fmt.Sprintf("unacked_bytes=%d", unacked),
+	})
+	return false, termErr
+}
+
+// dialWithBackoff waits out the current backoff and redials hubAddr until a
+// dial succeeds, returning true. It returns false if the client is closed or a
+// dial fails with a non-retryable error, in which case onFatal is invoked.
+// backoff doubles after each failed attempt, up to reconnectMax.
+func (c *Client) dialWithBackoff(hubAddr string, backoff *time.Duration) bool {
+	for attempt := 1; ; attempt++ {
+		if !c.sleepBackoff(*backoff) {
+			return false
+		}
+		err := c.dial(hubAddr)
+		if err == nil {
+			return true
+		}
+		if c.stopCtx.Err() != nil {
+			return false
+		}
+		if isFatalDialErr(err) {
+			c.fatal(hubAddr, err)
+			return false
+		}
+		c.log.Error("federation: client reconnect failed", "err", err, "attempt", attempt)
+		_ = c.auditL.Log(audit.Event{
+			Event:    audit.EventPeerConnected,
+			PeerAddr: hubAddr,
+			Detail:   fmt.Sprintf("attempt=%d err=%s", attempt, err.Error()),
+		})
+		*backoff = minDuration(*backoff*2, c.reconnectMax)
+	}
+}
+
+// sleepBackoff waits d with jitter applied, returning false if the client is
+// closed first.
+func (c *Client) sleepBackoff(d time.Duration) bool {
+	// #nosec G404 -- math/rand is appropriate for non-cryptographic jitter
+	jitter := time.Duration(float64(d) * c.reconnectJitter * (rand.Float64()*2 - 1))
+	sleep := d + jitter
+	if sleep < 0 {
+		sleep = 0
+	}
+	select {
+	case <-c.stop:
+		return false
+	case <-time.After(sleep):
+		return true
+	}
+}
+
+// fatal reports a non-retryable connection failure and invokes onFatal on its
+// own goroutine, so a callback that closes the owning messenger does not
+// deadlock waiting for this client's reconnect loop to exit.
+func (c *Client) fatal(hubAddr string, err error) {
+	c.log.Error("federation: fatal hub connection error, not reconnecting", "hub", hubAddr, "err", err)
+	if c.onFatal != nil {
+		go c.onFatal(err)
+	}
+}
+
+// localSetupError marks a dial failure caused by this instance's own state (its
+// outbound offset files) rather than by the hub or the network. Redialing
+// cannot fix it.
+type localSetupError struct{ err error }
+
+func (e *localSetupError) Error() string { return e.err.Error() }
+
+func (e *localSetupError) Unwrap() error { return e.err }
+
+// isFatalDialErr reports whether a dial error should stop connection attempts.
+func isFatalDialErr(err error) bool {
+	var local *localSetupError
+	return isFatalConnErr(err) || errors.As(err, &local)
 }
 
 // SetCommittedEndFn supplies the accessor readers use to bound their scans to

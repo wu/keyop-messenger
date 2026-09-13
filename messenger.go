@@ -215,6 +215,22 @@ func defaultFatalHandler(channel string, err error) {
 	panic(fmt.Sprintf("keyop-messenger: channel %q can no longer be written: %v", channel, err))
 }
 
+// HubFatalHandler is called when the connection to a configured hub fails with
+// a non-retryable error after New has returned. See WithHubFatalHandler.
+type HubFatalHandler func(hubAddr string, err error)
+
+// defaultHubFatalHandler terminates the process. A hub connection fails
+// fatally only when retrying cannot succeed without operator action — the hub
+// rejected this instance's identity, or a certificate failed verification — so
+// the client has stopped reconnecting. Staying up would leave the instance
+// running without federation while looking healthy.
+//
+// It panics rather than exiting for the same reason as defaultFatalHandler: the
+// failure cannot be lost in a log.
+func defaultHubFatalHandler(hubAddr string, err error) {
+	panic(fmt.Sprintf("keyop-messenger: connection to hub %q failed permanently: %v", hubAddr, err))
+}
+
 // channelState holds all writers, subscribers, and compaction state for one
 // channel. It is created on first access (Publish or Subscribe).
 type channelState struct {
@@ -279,6 +295,10 @@ type Messenger struct {
 	// fatalHandler decides what happens when a channel's writer stops with an
 	// unrecoverable error. Defaults to terminating the process.
 	fatalHandler FatalHandler
+
+	// hubFatalHandler decides what happens when a hub connection fails with a
+	// non-retryable error after New returns. Defaults to terminating the process.
+	hubFatalHandler HubFatalHandler
 
 	// dataDirLock is this process's exclusive claim on the data directory,
 	// released on Close.
@@ -430,6 +450,7 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 		dataDir:            cfg.Storage.DataDir,
 		layout:             storage.NewLayout(cfg.Storage.DataDir),
 		fatalHandler:       o.fatalHandler,
+		hubFatalHandler:    o.hubFatalHandler,
 		reg:                reg,
 		dedup:              dd,
 		auditL:             auditL,
@@ -520,6 +541,9 @@ func New(cfg *Config, opts ...Option) (*Messenger, error) {
 				cfg.Storage.DataDir,
 			)
 			c.SetCommittedEndFn(m.channelCommittedEnd)
+			c.SetOnFatal(func(err error) { m.hubFatalHandler(ref.Addr, err) })
+			// Only a non-retryable failure is returned; an unreachable hub starts
+			// the client disconnected and it keeps dialing in the background.
 			if err := c.ConnectWithReconnect(ref.Addr); err != nil {
 				c.Close()
 				return nil, fmt.Errorf("connect to hub %q: %w", ref.Addr, err)

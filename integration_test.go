@@ -387,6 +387,7 @@ func newClientMessengerWithPolicy(
 	t *testing.T,
 	name, dir, caFile, certFile, keyFile, hubAddr string,
 	subscribe, publish []string,
+	opts ...Option,
 ) *Messenger {
 	t.Helper()
 	cfg := &Config{
@@ -400,7 +401,7 @@ func newClientMessengerWithPolicy(
 		TLS: TLSConfig{Cert: certFile, Key: keyFile, CA: caFile},
 	}
 	cfg.ApplyDefaults()
-	m, err := New(cfg)
+	m, err := New(cfg, opts...)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 	registerTestTypes(t, m)

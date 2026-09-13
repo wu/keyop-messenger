@@ -9,12 +9,15 @@ type messengerOptions struct {
 	cfg          *Config
 	testIdentity string // test-only override for the TLS-derived instance name
 	fatalHandler FatalHandler
+
+	hubFatalHandler HubFatalHandler
 }
 
 func defaultOptions() messengerOptions {
 	return messengerOptions{
-		logger:       nopLogger{},
-		fatalHandler: defaultFatalHandler,
+		logger:          nopLogger{},
+		fatalHandler:    defaultFatalHandler,
+		hubFatalHandler: defaultHubFatalHandler,
 	}
 }
 
@@ -112,5 +115,23 @@ func WithRetryBackoff(base, maxDelay time.Duration) SubscribeOption {
 func WithFatalHandler(h FatalHandler) Option {
 	return func(o *messengerOptions) {
 		o.fatalHandler = h
+	}
+}
+
+// WithHubFatalHandler replaces what happens when the connection to a configured
+// hub fails with a non-retryable error after New has returned — the hub rejected
+// this instance's identity, or a certificate failed verification. The client
+// stops reconnecting to that hub before the handler is called.
+//
+// A hub that is merely unreachable is not fatal: New succeeds and the client
+// keeps dialing in the background. A non-retryable failure on the first dial is
+// returned by New instead of reaching this handler.
+//
+// The default terminates the process. Supply a handler to shut down gracefully
+// instead, or to observe the failure in tests. The handler runs on its own
+// goroutine and may call Close.
+func WithHubFatalHandler(h HubFatalHandler) Option {
+	return func(o *messengerOptions) {
+		o.hubFatalHandler = h
 	}
 }

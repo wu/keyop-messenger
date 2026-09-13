@@ -47,6 +47,9 @@ type pubCoordinator struct {
 
 	ackCh   chan struct{}
 	ackDone chan struct{}
+	// recvErr is the error that ended the ack-reader's Recv loop. Written only
+	// by ackReader before ackDone closes; read via Err after close returns.
+	recvErr error
 
 	stop chan struct{}
 	done chan struct{}
@@ -122,6 +125,11 @@ func (pc *pubCoordinator) close() {
 // because of a stream error or because Close() was called. The Client's
 // reconnect loop selects on this.
 func (pc *pubCoordinator) Done() <-chan struct{} { return pc.done }
+
+// Err returns the error that ended the Publish stream — the hub's status, such
+// as PermissionDenied for an allowlist rejection — or nil if the coordinator
+// was stopped before the stream ended. Valid only after close has returned.
+func (pc *pubCoordinator) Err() error { return pc.recvErr }
 
 // run dequeues sendReqs from channelReaders and dispatches them sequentially.
 func (pc *pubCoordinator) run() {
@@ -200,6 +208,7 @@ func (pc *pubCoordinator) ackReader() {
 	for {
 		_, err := pc.stream.Recv()
 		if err != nil {
+			pc.recvErr = err
 			return
 		}
 		select {
