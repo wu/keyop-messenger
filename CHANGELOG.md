@@ -1,3 +1,25 @@
+## [1.26.0](https://github.com/wu/keyop-messenger/compare/v1.25.1...v1.26.0) (2026-09-13)
+
+### Features
+
+* **storage:** publish each channel's committed end and bound readers by it ([52aa9d9](https://github.com/wu/keyop-messenger/commit/52aa9d9cfe524c2dac3bf7bd26c57c21166b9736))
+* **storage:** recover every channel at startup and claim the data directory ([a4a928d](https://github.com/wu/keyop-messenger/commit/a4a928dba1878800ca7af69ffeb91cde71d0ade6))
+
+### Bug Fixes
+
+* **federation:** reject channel names that cannot be a directory component ([3061362](https://github.com/wu/keyop-messenger/commit/30613626943824005ccc6e83964b94fd46532244))
+* stop channelReader consuming in-flight partial writes ([c2ded78](https://github.com/wu/keyop-messenger/commit/c2ded7877073ea9b7749a3640783d2b79532f570))
+* **storage:** fail the process when a channel can no longer be written ([02c7042](https://github.com/wu/keyop-messenger/commit/02c7042715276b28d51e81e5632c39160c5396f5))
+* **storage:** position new readers at the last complete record ([4ea6ca7](https://github.com/wu/keyop-messenger/commit/4ea6ca7c3639665140eb49b4cc592bc5bfb57031))
+
+### Refactoring
+
+* **storage:** bound every read by the channel's committed end ([2316670](https://github.com/wu/keyop-messenger/commit/231667067b662ea9f07afff549e05a59fab2710f))
+* **storage:** collapse the two federation offset sweeps into one walk ([55dea0f](https://github.com/wu/keyop-messenger/commit/55dea0f13532b2c0c4a7e9a40e91b248bff2b7b6))
+* **storage:** frame records in one cursor, owned by storage ([c0eed24](https://github.com/wu/keyop-messenger/commit/c0eed244a0fb41e94a26f985ca11d1091827779c))
+* **storage:** give storage.Layout ownership of the on-disk arrangement ([ea3a4ce](https://github.com/wu/keyop-messenger/commit/ea3a4cea3f02058ac464b9b8b62fdc36b6bd88b1))
+* **storage:** remove the reader-side partial-record guard ([730470a](https://github.com/wu/keyop-messenger/commit/730470a80c4df6823720b8cc3ab5c6f6039bce90))
+
 ## [1.25.1](https://github.com/wu/keyop-messenger/compare/v1.25.0...v1.25.1) (2026-09-04)
 
 ### Bug Fixes
