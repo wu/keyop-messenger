@@ -9,9 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 
 	federationv1 "github.com/wu/keyop-messenger/gen/federation/v1"
 	"github.com/wu/keyop-messenger/internal/audit"
@@ -54,18 +52,6 @@ func (b *connErrBox) get() error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.err
-}
-
-// isFatalConnErr reports whether err is a non-retryable connection failure —
-// one where reconnecting cannot succeed without operator action. The hub
-// rejects a client whose certificate CN is not in its allowlist with
-// PermissionDenied; a malformed/expired identity surfaces as Unauthenticated.
-func isFatalConnErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	code := status.Code(err)
-	return code == codes.PermissionDenied || code == codes.Unauthenticated
 }
 
 // EphemeralClientConfig holds construction-time settings for EphemeralClient.
@@ -238,7 +224,8 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 
 	// Ephemeral clients dispatch received messages in-memory and never re-forward
 	// them, so they need no send-side loop filtering and do not capture the hub CN.
-	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, nil)
+	failures := &tlsFailureRecorder{}
+	grpcConn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, nil, failures)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ephemeral: grpc connect %s: %w", hubAddr, err)
 	}
@@ -266,7 +253,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 	if err != nil {
 		connCancel()
 		_ = grpcConn.Close()
-		return nil, nil, fmt.Errorf("ephemeral: open publish stream %s: %w", hubAddr, err)
+		return nil, nil, fmt.Errorf("ephemeral: open publish stream %s: %w", hubAddr, failures.annotate(err))
 	}
 
 	// ackCh carries PublishAck messages from the Publish stream to writeLoop.
@@ -288,7 +275,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 			if recvErr != nil {
 				// Record the terminal error (e.g. PermissionDenied when the hub
 				// rejects this client) so the reconnect loop can classify it.
-				errBox.set(recvErr)
+				errBox.set(failures.annotate(recvErr))
 				return
 			}
 			select {
@@ -328,7 +315,7 @@ func (c *EphemeralClient) startConn(ctx context.Context, hubAddr string) (<-chan
 				case <-recv.Done():
 					// Capture a subscribe-stream rejection (e.g. PermissionDenied)
 					// so a subscribe-only client still surfaces a fatal error.
-					errBox.set(recv.Err())
+					errBox.set(failures.annotate(recv.Err()))
 				case <-c.stop:
 					recv.Close()
 				}

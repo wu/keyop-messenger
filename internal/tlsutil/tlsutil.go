@@ -25,6 +25,18 @@ type FileWatcher interface {
 	Close() error
 }
 
+// PeerVerificationError is returned by the VerifyPeerCertificate callback of a
+// BuildTLSConfig config when the peer's certificate is rejected. It gives
+// callers a typed signal that a connection failed on identity rather than on
+// the network; several of the underlying failures carry no x509 error type.
+type PeerVerificationError struct {
+	Err error
+}
+
+func (e *PeerVerificationError) Error() string { return e.Err.Error() }
+
+func (e *PeerVerificationError) Unwrap() error { return e.Err }
+
 // BuildTLSConfig loads a certificate key-pair and CA pool from disk and returns
 // a *tls.Config suitable for mTLS federation connections.
 //
@@ -55,7 +67,7 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		return nil, fmt.Errorf("tlsutil: no valid certificates in CA file %s", caFile)
 	}
 
-	verifyChainOnly := func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	verifyChain := func(rawCerts [][]byte) error {
 		if len(rawCerts) == 0 {
 			return fmt.Errorf("tlsutil: peer presented no certificate")
 		}
@@ -91,6 +103,12 @@ func BuildTLSConfig(certFile, keyFile, caFile string, _ Logger) (*tls.Config, er
 		// as a peer with whatever CN it carries.
 		if leaf.IsCA {
 			return fmt.Errorf("tlsutil: peer presented a CA certificate as its leaf")
+		}
+		return nil
+	}
+	verifyChainOnly := func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		if err := verifyChain(rawCerts); err != nil {
+			return &PeerVerificationError{Err: err}
 		}
 		return nil
 	}

@@ -100,6 +100,10 @@ type Client struct {
 	grpcConnMu sync.Mutex
 	grpcConn   *grpc.ClientConn
 
+	// tlsFailures captures the typed cause of TLS failures on grpcConn's
+	// transports so dial errors can be classified by isFatalConnErr.
+	tlsFailures tlsFailureRecorder
+
 	stop       chan struct{}
 	stopCtx    context.Context
 	stopCancel context.CancelFunc
@@ -182,7 +186,7 @@ func (c *Client) dial(hubAddr string) error {
 	pubStream, err := stub.Publish(metadata.NewOutgoingContext(pubCtx, pubMD))
 	if err != nil {
 		pubCancel()
-		return fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, err)
+		return fmt.Errorf("federation: client open publish stream %s: %w", hubAddr, c.tlsFailures.annotate(err))
 	}
 
 	// Build per-channel readers feeding a coordinator on the Publish stream.
@@ -202,7 +206,7 @@ func (c *Client) dial(hubAddr string) error {
 		if sErr != nil {
 			subCancel()
 			coordinator.close()
-			return fmt.Errorf("federation: client open subscribe stream %s: %w", hubAddr, sErr)
+			return fmt.Errorf("federation: client open subscribe stream %s: %w", hubAddr, c.tlsFailures.annotate(sErr))
 		}
 
 		// Send the SubscribeRequest as the first frame on the Subscribe stream.
@@ -216,7 +220,7 @@ func (c *Client) dial(hubAddr string) error {
 		}); sErr != nil {
 			subCancel()
 			coordinator.close()
-			return fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, sErr)
+			return fmt.Errorf("federation: client send subscribe request %s: %w", hubAddr, c.tlsFailures.annotate(sErr))
 		}
 
 		receiver = NewPeerReceiver(subStream, subCancel, c.policy, c.dedup, c.localWriter,
@@ -294,7 +298,7 @@ func (c *Client) getOrCreateGRPCConn(hubAddr string) (*grpc.ClientConn, error) {
 	if c.grpcConn != nil {
 		return c.grpcConn, nil
 	}
-	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, c.setHubInstance)
+	conn, err := newGRPCClientConn(hubAddr, c.tlsCfg, c.maxBatchBytes, c.setHubInstance, &c.tlsFailures)
 	if err != nil {
 		return nil, err
 	}
@@ -568,36 +572,51 @@ func minDuration(a, b time.Duration) time.Duration {
 // truth the hub uses for peers — the TLS certificate — for send-side loop
 // filtering. Clone is overridden so gRPC's internal credential cloning does not
 // strip the wrapper.
+//
+// When failures is non-nil it also records TLS failures for classification:
+// handshake errors directly, and alerts received after the handshake through a
+// failureCapturingConn wrapped around the returned connection.
 type cnCapturingCreds struct {
 	credentials.TransportCredentials
-	onCN func(string)
+	onCN     func(string)
+	failures *tlsFailureRecorder
 }
 
 func (c cnCapturingCreds) ClientHandshake(ctx context.Context, authority string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
 	conn, authInfo, err := c.TransportCredentials.ClientHandshake(ctx, authority, rawConn)
-	if err == nil && c.onCN != nil {
+	if err != nil {
+		if c.failures != nil {
+			c.failures.observe(err)
+		}
+		return conn, authInfo, err
+	}
+	if c.onCN != nil {
 		if tlsInfo, ok := authInfo.(credentials.TLSInfo); ok && len(tlsInfo.State.PeerCertificates) > 0 {
 			if cn := tlsutil.ExtractCN(tlsInfo.State.PeerCertificates[0]); cn != "" {
 				c.onCN(cn)
 			}
 		}
 	}
-	return conn, authInfo, err
+	if c.failures != nil {
+		conn = &failureCapturingConn{Conn: conn, failures: c.failures}
+	}
+	return conn, authInfo, nil
 }
 
 func (c cnCapturingCreds) Clone() credentials.TransportCredentials {
-	return cnCapturingCreds{TransportCredentials: c.TransportCredentials.Clone(), onCN: c.onCN}
+	return cnCapturingCreds{TransportCredentials: c.TransportCredentials.Clone(), onCN: c.onCN, failures: c.failures}
 }
 
 // newGRPCClientConn creates a gRPC client connection to target. Uses TLS when
 // tlsCfg is non-nil, otherwise uses insecure (plaintext) credentials.
 // The connection is created with lazy dialing; the actual TCP connection is
 // established on the first RPC call. onCN, when non-nil, is invoked with the
-// hub's certificate CN after each successful TLS handshake.
-func newGRPCClientConn(target string, tlsCfg *tls.Config, maxBatchBytes int, onCN func(string)) (*grpc.ClientConn, error) {
+// hub's certificate CN after each successful TLS handshake. failures, when
+// non-nil, records TLS failures so stream errors can be annotated with them.
+func newGRPCClientConn(target string, tlsCfg *tls.Config, maxBatchBytes int, onCN func(string), failures *tlsFailureRecorder) (*grpc.ClientConn, error) {
 	var creds credentials.TransportCredentials
 	if tlsCfg != nil {
-		creds = cnCapturingCreds{TransportCredentials: credentials.NewTLS(tlsCfg), onCN: onCN}
+		creds = cnCapturingCreds{TransportCredentials: credentials.NewTLS(tlsCfg), onCN: onCN, failures: failures}
 	} else {
 		creds = insecure.NewCredentials()
 	}
