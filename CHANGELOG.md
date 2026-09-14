@@ -1,3 +1,10 @@
+## [1.27.0](https://github.com/wu/keyop-messenger/compare/v1.26.0...v1.27.0) (2026-09-14)
+
+### Features
+
+* **federation:** classify hub connection failures as fatal or transient ([e92ffaa](https://github.com/wu/keyop-messenger/commit/e92ffaa1fa93ea509eb0b513ce69419dad48614b))
+* **federation:** start disconnected when the hub is unreachable ([d90f2de](https://github.com/wu/keyop-messenger/commit/d90f2de6268b8c6ca219b139d558193d3d18f755))
+
 ## [1.26.0](https://github.com/wu/keyop-messenger/compare/v1.25.1...v1.26.0) (2026-09-13)
 
 ### Features
