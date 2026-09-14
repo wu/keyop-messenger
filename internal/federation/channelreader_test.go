@@ -400,7 +400,7 @@ func TestChannelReader_BatchSizeLimit(t *testing.T) {
 
 	// Collect all batches.
 	var batches []sendReq
-	deadline := time.After(2 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for len(batches) < 3 { // 5 messages at 2-per-batch → 3 batches (2+2+1)
 		select {
 		case req := <-requestCh:

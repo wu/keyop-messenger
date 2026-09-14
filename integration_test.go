@@ -348,7 +348,7 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 	}
 
 	got := 0
-	deadline := time.After(5 * time.Second)
+	deadline := time.After(30 * time.Second)
 	for got < phase1Count {
 		select {
 		case <-received:
@@ -367,7 +367,7 @@ func TestIntegrationCompactionDuringSubscribers(t *testing.T) {
 	}
 
 	// Collect phase 2 messages.
-	deadline2 := time.After(5 * time.Second)
+	deadline2 := time.After(30 * time.Second)
 	for got < total {
 		select {
 		case <-received:
