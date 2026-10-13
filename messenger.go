@@ -119,6 +119,10 @@ type Message struct {
 	CorrelationID string
 	// ServiceName is the name of the service that published this message.
 	ServiceName string
+	// Headers are the application-defined key/value pairs the publisher set
+	// with WithHeader, or nil if it set none. They are not put on the handler's
+	// context; see WithHeader.
+	Headers map[string]string
 	// Payload is the decoded payload. Its concrete type is always the prototype
 	// registered via RegisterPayloadType, as a value (never a pointer, even when a
 	// pointer was registered). An unregistered payload type is not delivered at
@@ -641,9 +645,10 @@ func (m *Messenger) Publish(ctx context.Context, channel, payloadType string, pa
 		return fmt.Errorf("publish %q: create envelope: %w", channel, err)
 	}
 
-	// Stamp correlation ID and service name from context if present
+	// Stamp correlation ID, service name and headers from context if present
 	env.CorrelationID = CorrelationIDFromContext(ctx)
 	env.ServiceName = ServiceNameFromContext(ctx)
+	env.Headers = HeadersFromContext(ctx)
 
 	// Mark in dedup so that if this message returns via federation it is
 	// recognised as already seen and not re-delivered locally.
@@ -719,10 +724,11 @@ func (m *Messenger) PublishBatch(ctx context.Context, channel string, msgs []Bat
 		return fmt.Errorf("publish batch %q: %w", channel, err)
 	}
 
-	// Correlation ID and service name are stamped once from the context and
-	// shared by every envelope in the batch.
+	// Correlation ID, service name and headers are stamped once from the
+	// context and shared by every envelope in the batch.
 	correlationID := CorrelationIDFromContext(ctx)
 	serviceName := ServiceNameFromContext(ctx)
+	headers := HeadersFromContext(ctx)
 
 	envs := make([]*envelope.Envelope, 0, len(msgs))
 	for _, msg := range msgs {
@@ -732,6 +738,7 @@ func (m *Messenger) PublishBatch(ctx context.Context, channel string, msgs []Bat
 		}
 		env.CorrelationID = correlationID
 		env.ServiceName = serviceName
+		env.Headers = headers
 		// Mark in dedup so that if this message returns via federation it is
 		// recognised as already seen and not re-delivered locally.
 		m.dedup.SeenOrAdd(env.ID)
@@ -844,6 +851,7 @@ func (m *Messenger) Subscribe(ctx context.Context, channel, subscriberID string,
 			PayloadType:   env.PayloadType,
 			CorrelationID: env.CorrelationID,
 			ServiceName:   env.ServiceName,
+			Headers:       env.Headers,
 			Payload:       payload,
 			Timestamp:     env.Ts,
 		})

@@ -475,7 +475,7 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	// ClientA publishes a message to "forward-test".
 	// This should be forwarded from hub to ClientB even though ClientB
 	// didn't explicitly subscribe to channels from the hub.
-	require.NoError(t, clientA.Publish(context.Background(), "forward-test", "test.ForwardMsg",
+	require.NoError(t, clientA.Publish(WithHeader(context.Background(), "tags", "temp"), "forward-test", "test.ForwardMsg",
 		map[string]any{"from": "client-a", "id": "forward-001"}))
 
 	// Wait for ClientB to receive the message.
@@ -493,6 +493,7 @@ func TestIntegrationClientToClientForwarding(t *testing.T) {
 	assert.Equal(t, "forward-test", msg.Channel)
 	assert.Equal(t, "client-a", msg.Origin, "message should originate from client-a")
 	assert.Equal(t, "test.ForwardMsg", msg.PayloadType)
+	assert.Equal(t, map[string]string{"tags": "temp"}, msg.Headers, "headers must survive hub forwarding")
 
 	payload, ok := msg.Payload.(map[string]any)
 	require.True(t, ok, "payload should be a map")

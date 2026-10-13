@@ -191,6 +191,7 @@ func (m *EphemeralMessenger) Subscribe(channel string, handler func(msg Message)
 			PayloadType:   env.PayloadType,
 			CorrelationID: env.CorrelationID,
 			ServiceName:   env.ServiceName,
+			Headers:       env.Headers,
 			Payload:       payload,
 			Timestamp:     env.Ts,
 		})
@@ -225,9 +226,10 @@ func (m *EphemeralMessenger) Publish(ctx context.Context, channel, payloadType s
 	if err != nil {
 		return fmt.Errorf("ephemeral publish: create envelope: %w", err)
 	}
-	// Stamp correlation ID and service name from context if present
+	// Stamp correlation ID, service name and headers from context if present
 	env.CorrelationID = CorrelationIDFromContext(ctx)
 	env.ServiceName = ServiceNameFromContext(ctx)
+	env.Headers = HeadersFromContext(ctx)
 	return m.client.Publish(ctx, &env)
 }
 

@@ -143,6 +143,24 @@ ctx = messenger.WithCorrelationID(ctx, sourceMsg.CorrelationID)
 m.Publish(ctx, "heater", "com.example.SwitchEvent", &switchEvent)
 ```
 
+### Headers
+
+Headers are application-defined key/value pairs. Set them via context before publishing, and they are stamped on the envelope, preserved across hub forwarding, and delivered to subscribers in `msg.Headers`. The messenger gives them no meaning. An empty value removes a header.
+
+```go
+ctx := messenger.WithHeader(context.Background(), "tags", "temp")
+m.Publish(ctx, "metrics", "com.example.Metric", &metric)
+```
+
+A handler's context does **not** carry the received message's headers, so a message published from a handler doesn't inherit them. To pass a header on to the next message, copy it yourself:
+
+```go
+m.Subscribe(ctx, "metrics", "monitor", func(ctx context.Context, msg messenger.Message) error {
+    ctx = messenger.WithHeader(ctx, "tags", msg.Headers["tags"]+",monitor")
+    return m.Publish(ctx, "status", "com.example.Status", &status)
+})
+```
+
 ## Ephemeral Client
 
 `EphemeralMessenger` connects to a hub without maintaining any local storage. Use it when:

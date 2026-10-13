@@ -54,6 +54,11 @@ type Envelope struct {
 	// Preserved across hub forwarding. Omitted from JSON if empty.
 	ServiceName string `json:"service_name,omitempty"`
 
+	// Headers are application-defined key/value pairs stamped from the
+	// publisher's context. The messenger carries them but gives them no
+	// meaning. Preserved across hub forwarding. Omitted from JSON if empty.
+	Headers map[string]string `json:"headers,omitempty"`
+
 	// Route is the ordered set of instance identities (TLS cert CNs) that have
 	// durably committed this message: the original publisher followed by every
 	// hub/peer that forwarded it. It is a path vector used to prevent routing
