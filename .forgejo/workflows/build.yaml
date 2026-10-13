@@ -122,7 +122,7 @@ jobs:
       # geekfarm-ci ships golangci-lint prebuilt against its own Go toolchain,
       # plus the nodejs the JS-based actions need. Built from geekfarm-ci/ in
       # the geektank-k8s repo; re-pin with bin/pin-geekfarm-ci.sh.
-      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.08.14.0752
+      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.10.13.0408
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Checkout
@@ -144,7 +144,7 @@ jobs:
       # geekfarm-ci ships govulncheck and gosec prebuilt against its own Go
       # toolchain, plus the nodejs and make this job needs. Built from
       # geekfarm-ci/ in the geektank-k8s repo; re-pin with bin/pin-geekfarm-ci.sh.
-      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.08.14.0752
+      image: registry.digitalocean.com/geekfarm/geekfarm-ci:2026.10.13.0408
       options: "--init --tmpfs /tmp:exec,size=2g"
     steps:
       - name: Checkout
